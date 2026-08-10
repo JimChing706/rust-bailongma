@@ -6,6 +6,8 @@
 //! - WebSocket `/scene`：授权（authorize_ws_upgrade_with_credential）后建立连接
 //! - 启动时补发粘性事件（agent_name_updated，对齐 api.js）
 //! - `POST /message` 专属防护（第 1 轮审计修复）：来源限流 + token 强制校验
+//! - LAN 读路径强制 token（第 4 轮审计修复）：token 配置后所有远端请求
+//!   （/events/history、/events SSE、/status、静态资源）必须携带 Bearer token，对齐 WS /scene
 //!
 //! SSE 流：connected → 粘性事件 → 实时广播；axum KeepAlive 保活（15s 注释帧，
 //! 对齐 Node 的 `: ping\n\n`）。
@@ -166,12 +168,26 @@ async fn guard_request(
             .map(|b| timing_safe_token_equal(&b, &guard.token))
             .unwrap_or(false)
     };
-    let is_lan = guard.lan_enabled && is_private_lan_address(&remote_addr);
-    if !is_loopback && !has_token && !is_lan {
-        return json_response(
-            StatusCode::FORBIDDEN,
-            json!({ "ok": false, "error": "forbidden" }),
-        );
+    if !is_loopback {
+        // 第 4 轮审计修复：LAN 读路径强制 token——token 已配置时，任何远端
+        // （含 LAN）访问 /events/history、/events SSE、/status、静态资源都
+        // 必须携带有效 Bearer token（对齐 WS /scene 已强制行为）。此前仅
+        // /message 与 WS 强制，事件历史（含 LLM 调用日志）可被网内裸读。
+        if !guard.token.is_empty() {
+            if !has_token {
+                return json_response(
+                    StatusCode::FORBIDDEN,
+                    json!({ "ok": false, "error": "forbidden" }),
+                );
+            }
+        } else if !(guard.lan_enabled && is_private_lan_address(&remote_addr)) {
+            // token 未配置：仅回环或已开 LAN 的私有地址（该暴露态已被启动时
+            // lan_exposure_check 拦截，此分支仅兜底测试/旧语义）
+            return json_response(
+                StatusCode::FORBIDDEN,
+                json!({ "ok": false, "error": "forbidden" }),
+            );
+        }
     }
 
     // 2.5 POST /message 专属防护（第 1 轮审计修复）：
@@ -567,4 +583,101 @@ mod tests {
             .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))));
         req
     }
+
+    // ── 第 4 轮审计修复：LAN 读路径强制 token（/events/history、/events SSE、/status、静态资源）──
+
+    fn lan_request(uri: &str, token: Option<&str>) -> HttpRequest<Body> {
+        let mut builder = HttpRequest::builder().uri(uri);
+        if let Some(t) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let mut req = builder.body(Body::empty()).unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 5], 9999))));
+        req
+    }
+
+    #[tokio::test]
+    async fn lan_read_routes_require_token_when_configured() {
+        // token 配置后，LAN 来源读 /events/history 必须带 token（此前可裸读——事件历史含 LLM 调用日志）
+        let state = test_state();
+        let guard = Guard {
+            lan_enabled: true,
+            token: "secret".into(),
+            message_rate: Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
+        };
+        let server = server_with_guard(state, guard);
+        let router = server.router();
+
+        let no_token = router
+            .clone()
+            .oneshot(lan_request("/events/history", None))
+            .await
+            .unwrap();
+        assert_eq!(no_token.status(), StatusCode::FORBIDDEN, "LAN 无 token 读事件历史应 403");
+        let with_token = router
+            .clone()
+            .oneshot(lan_request("/events/history", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(with_token.status(), StatusCode::OK, "LAN 带 token 读事件历史应放行");
+        let wrong = router
+            .oneshot(lan_request("/events/history", Some("wrong")))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::FORBIDDEN, "LAN 错 token 应 403");
+    }
+
+    #[tokio::test]
+    async fn lan_sse_requires_token_when_configured() {
+        let state = test_state();
+        let guard = Guard {
+            lan_enabled: true,
+            token: "secret".into(),
+            message_rate: Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
+        };
+        let server = server_with_guard(state, guard);
+        let router = server.router();
+
+        let no_token = router
+            .clone()
+            .oneshot(lan_request("/events", None))
+            .await
+            .unwrap();
+        assert_eq!(no_token.status(), StatusCode::FORBIDDEN, "LAN 无 token 的 SSE 流应 403");
+        let with_token = router
+            .oneshot(lan_request("/events", Some("secret")))
+            .await
+            .unwrap();
+        assert_eq!(with_token.status(), StatusCode::OK, "LAN 带 token 的 SSE 流应放行");
+    }
+
+    #[tokio::test]
+    async fn loopback_read_routes_stay_free_with_token() {
+        // 回环来源不受影响（本机 brain-ui / 本地进程无 token 继续可用）
+        let state = test_state();
+        let guard = Guard {
+            lan_enabled: true,
+            token: "secret".into(),
+            message_rate: Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
+        };
+        let server = server_with_guard(state, guard);
+        let router = server.router();
+
+        let status = router
+            .clone()
+            .oneshot(local_req("/status"))
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK, "回环 /status 无 token 应放行");
+        let history = router
+            .clone()
+            .oneshot(local_req("/events/history"))
+            .await
+            .unwrap();
+        assert_eq!(history.status(), StatusCode::OK, "回环 /events/history 无 token 应放行");
+        let sse = router.oneshot(local_req("/events")).await.unwrap();
+        assert_eq!(sse.status(), StatusCode::OK, "回环 SSE 无 token 应放行");
+    }
+
 }
