@@ -290,6 +290,11 @@ async fn run_conscious_turn(
 }
 
 pub async fn run_api_server() -> Result<()> {
+    run_api_server_on(compat::DEFAULT_API_PORT).await
+}
+
+/// 第 2 轮审计验证：支持自定义端口侧跑（不与运行中的桌面实例冲突）。
+pub async fn run_api_server_on(port: u16) -> Result<()> {
     if let Err(e) = init_logging(&LogConfig::default()) {
         eprintln!("[fatal] 日志初始化失败: {e}");
         std::process::exit(1);
@@ -394,6 +399,6 @@ pub async fn run_api_server() -> Result<()> {
     let server = ApiServer::new(state, lan, token);
 
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
-    server.serve(host, compat::DEFAULT_API_PORT).await?;
+    server.serve(host, port).await?;
     Ok(())
 }
