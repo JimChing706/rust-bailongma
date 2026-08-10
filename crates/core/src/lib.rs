@@ -41,6 +41,7 @@ pub mod capability;
 pub mod config;
 pub mod db;
 pub mod embedding;
+pub mod evolution;
 pub mod error;
 pub mod llm;
 pub mod logging;

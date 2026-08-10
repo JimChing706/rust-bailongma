@@ -183,3 +183,17 @@
 - `metrics.rs`：新增 `relocate_sections(history)` 数据驱动排序——按「静态稳定级 + 历史字节波动率」重排 section，波动率低者前置；无历史时退化为静态分级；NaN 波动安全处理；未知 section 置尾。
 - 新增 4 条测试：顺序集合一致性、渲染顺序稳定段前置、历史波动率排序、NaN 安全。
 - 全量回归 469 passed / 0 failed（core 470 running：469 passed + 1 ignored）。
+
+
+## P4 自动迭代三件套 + 语料蒸馏（2026-08-10）
+- **自动迭代三件套**（新增 `crates/core/src/evolution/`，评审 §5.1 P4 / R8「三件套缺一不启动」）：
+  - `snapshot.rs` 快照回滚：rusqlite backup API **在线整库快照**（源库不锁）→ 独立快照文件；变更失败整库恢复（评审修订 4「任何自动动作可一键回滚」）；verify（表数校验）/ cleanup。
+  - `convergence.rs` 收敛判据：收益分单度量——持续改进继续 / 连续 `stable_rounds` 轮无有效改进 → Converged / 达到 `max_rounds` → MaxRounds 防失控硬停（上限优先于收敛）。
+  - `mod.rs` 迭代编排：`run_iteration` = 快照 → 人工批准（approval 硬通道闭包接线，复用 P0 预置 120s fail-closed mpsc 门）→ 应用变更 → 评分 → 收敛判定；变更失败整库回滚；**三件套缺一拒绝启动**（TrioReadiness 显式报缺失项）。
+- **语料蒸馏**（`evolution/distill.rs`，评审 §5.1 P4 / R9「只蒸馏确定性子问题，规则层 ground truth 冷启动」）：
+  - `rule_intent`：reminder / plan / query / command / chat 五类**确定性**判定（规则层标注 = ground truth）；
+  - `detect_sensitive`：7 组保守敏感形态（sk-* / AKIA / ghp_* / PEM / JWT / 大陆手机号 / 18 位身份证）→ 敏感内容不进入嵌入候选；
+  - 蒸馏管线：`distill_from_conversations`（长度过滤 + embed 判定 20~2000 字符非敏感）→ `export_jsonl`（逐行 JSON）→ `write_labels_back`（标注写回 `conversations.label`，只填空 label 不覆盖，零成本积累闭环；label 列 M1 已预留）。
+  - **回归门槛**：规则标注 ground truth 单测锁定（改规则必须同步改测试，防标注漂移）。
+- 新增测试 17 条（快照 3 + 收敛 4 + 迭代流程 5 + 蒸馏 5）；全量回归 **529 passed / 0 failed**（core 491 + api_e2e 8 + db_compat 1 + sandbox 12 + escape 17）。
+- 路线：**P4 ✅（多Agent增强四阶段 P0→P4 全部收官）**；接线日回访项（真实调用 SQL 检查）待 LLM 轮接线时执行。
