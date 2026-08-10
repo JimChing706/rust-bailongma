@@ -414,6 +414,15 @@ impl WeeklyReport {
             self.duration_sum_ms as f64 / self.total_calls as f64
         }
     }
+
+    /// 平均单次调用 tokens（cost/turn 观测：周报环比指标）
+    pub fn avg_tokens_per_call(&self) -> f64 {
+        if self.total_calls == 0 {
+            0.0
+        } else {
+            self.total_tokens as f64 / self.total_calls as f64
+        }
+    }
 }
 
 /// 生成最近 N 天周报（M4）。
@@ -421,6 +430,38 @@ impl WeeklyReport {
 /// cache_rate < 30% → 建议查 injector 命中计数（M3 context_bytes）
 /// error_rate > 10% / retry_rate > 20% / aborted > 5% → 可靠性告警
 /// avg_ttft > 3000ms → 延迟告警
+/// P3-3 token 预算闸门决策。
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenGateDecision {
+    /// 放行：周窗口已用 tokens + 剩余额度
+    Allow { used_tokens: i64, remaining_tokens: i64 },
+    /// 拦截：周窗口总 tokens 已超预算
+    Blocked { used_tokens: i64, budget_tokens: i64 },
+}
+
+/// P3-3 基于周报的 token 预算闸门：按周窗口总 tokens（llm_metrics_daily 聚合，含所有 stage）判断是否超预算。
+/// budget_tokens <= 0 表示闸门关闭（纯观测不拦截，默认安全形态）。
+pub fn token_budget_gate(db: &Db, days: i64, budget_tokens: i64) -> Result<TokenGateDecision> {
+    let report = weekly_report(db, days)?;
+    let used = report.total_tokens;
+    if budget_tokens > 0 && used >= budget_tokens {
+        Ok(TokenGateDecision::Blocked {
+            used_tokens: used,
+            budget_tokens,
+        })
+    } else {
+        let remaining = if budget_tokens > 0 {
+            budget_tokens - used
+        } else {
+            i64::MAX
+        };
+        Ok(TokenGateDecision::Allow {
+            used_tokens: used,
+            remaining_tokens: remaining,
+        })
+    }
+}
+
 pub fn weekly_report(db: &Db, days: i64) -> Result<WeeklyReport> {
     let window = format!("-{days} days");
     let (total_calls, error_count, retry_count, fallback_count, aborted_count, total_tokens, cached_tokens, ttft_sum_ms, ttft_count, duration_sum_ms) = db
@@ -748,6 +789,86 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM llm_tool_calls", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2, "attempt 维度下重试路径不误伤，重放仍去重");
+    }
+
+    #[test]
+    fn token_budget_gate_allows_within_budget() {
+        let db = test_db();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        upsert_daily(
+            &db,
+            &today,
+            &DailyDelta {
+                total_calls: 100,
+                error_count: 0,
+                retry_count: 0,
+                fallback_count: 0,
+                aborted_count: 0,
+                total_tokens: 200_000,
+                cached_tokens: 40_000,
+                ttft_sum_ms: 0,
+                ttft_count: 0,
+                duration_sum_ms: 0,
+            },
+        )
+        .unwrap();
+        let d = token_budget_gate(&db, 7, 250_000).unwrap();
+        match d {
+            TokenGateDecision::Allow {
+                used_tokens,
+                remaining_tokens,
+            } => {
+                assert_eq!(used_tokens, 200_000);
+                assert_eq!(remaining_tokens, 50_000);
+            }
+            _ => panic!("应放行"),
+        }
+    }
+
+    #[test]
+    fn token_budget_gate_blocks_when_over_budget() {
+        let db = test_db();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        upsert_daily(
+            &db,
+            &today,
+            &DailyDelta {
+                total_calls: 100,
+                error_count: 0,
+                retry_count: 0,
+                fallback_count: 0,
+                aborted_count: 0,
+                total_tokens: 200_000,
+                cached_tokens: 40_000,
+                ttft_sum_ms: 0,
+                ttft_count: 0,
+                duration_sum_ms: 0,
+            },
+        )
+        .unwrap();
+        let d = token_budget_gate(&db, 7, 150_000).unwrap();
+        match d {
+            TokenGateDecision::Blocked {
+                used_tokens,
+                budget_tokens,
+            } => {
+                assert_eq!(used_tokens, 200_000);
+                assert_eq!(budget_tokens, 150_000);
+            }
+            _ => panic!("应拦截"),
+        }
+    }
+
+    #[test]
+    fn token_budget_gate_zero_budget_disabled() {
+        let db = test_db();
+        let d = token_budget_gate(&db, 7, 0).unwrap();
+        match d {
+            TokenGateDecision::Allow { remaining_tokens, .. } => {
+                assert_eq!(remaining_tokens, i64::MAX);
+            }
+            _ => panic!("预算=0 闸门关闭，应放行"),
+        }
     }
 
     #[test]
