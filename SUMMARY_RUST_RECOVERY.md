@@ -164,3 +164,10 @@
   - TrustTier/CallerTrust：工具维度由能力声明自动推导（Trusted/Approval/Denied，未知工具恒拒）；来源维度 System 可放行需确认工具、User/Agent 仍需人工确认；check_tool_call 旧签名兼容委托，13 处既有调用零改动。
 - **P2-3 收尾打包**：全量回归 **504 passed / 0 failed**（core 466 + api_e2e 8 + db_compat 1 + sandbox 12 + escape 17）；release 构建 5 个产物（bailongma / serve / bailongma-sandbox / chat / scan_agents）打包至 `_dist/bin` + `_dist/bailongma-rust-20260810.zip`（12.1MB）。
 - ✅ 至此 Phase 2 整体收官（提交 `a1ef95a` 起，含 Modify 闭环 fail-closed + trace 可观测性）。
+
+## P3-1 缓存友好化（2026-08-10）
+
+- `injector_format.rs`：`format_context_block` 双区渲染——稳定段（self-evolution/self-perception/constraints/active-policies/person/user-profile/task/thread/threads-background/task-knowledge）前置，变动段（self-snapshot/temporal/memories/directions/extra）后置。prompt 前缀多轮稳定 → provider prompt cache 命中率提升。新增 `NODE_CONTEXT_ORDER`（Node 对齐基线，对照用）与 `CACHE_FRIENDLY_ORDER` 常量。
+- `metrics.rs`：新增 `relocate_sections(history)` 数据驱动排序——按「静态稳定级 + 历史字节波动率」重排 section，波动率低者前置；无历史时退化为静态分级；NaN 波动安全处理；未知 section 置尾。
+- 新增 4 条测试：顺序集合一致性、渲染顺序稳定段前置、历史波动率排序、NaN 安全。
+- 全量回归 469 passed / 0 failed（core 470 running：469 passed + 1 ignored）。

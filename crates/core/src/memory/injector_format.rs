@@ -564,26 +564,48 @@ fn humanize_thread_age(thread: &Thread, now: i64) -> String {
 /// 渲染完整 `<context>` 块（对齐 `buildContextBlock`；section 顺序同 Node：
 /// self → constraints → active-policies → person → task → thread →
 /// task-knowledge → temporal → memories → directions → extra）。
+/// P3-1 缓存友好化：上下文 section 渲染顺序对照。
+/// - `NODE_CONTEXT_ORDER`：Node 对齐顺序（历史基线，仅作对照，不再使用）。
+/// - `CACHE_FRIENDLY_ORDER`：稳定段前置（低频变动段在前、高频变动段在后），
+///   让 prompt 前缀在多轮间保持稳定 → 提升 provider prompt cache 命中率。
+///   稳定度分级依据：S 级=几乎不变（约束/人/策略/任务/线程），
+///   A 级=低频变（自进化/自感知/任务知识），B 级=中频变（快照/方向），
+///   C 级=高频变（记忆/时间召回/额外运行时信息）。
+pub const NODE_CONTEXT_ORDER: &[&str] = &[
+    "self_snapshot", "self_evolution", "self_perception", "constraints",
+    "active_policies", "person", "user_profile", "task", "thread",
+    "threads_background", "task_knowledge", "temporal", "memories",
+    "directions", "extra",
+];
+
+pub const CACHE_FRIENDLY_ORDER: &[&str] = &[
+    "self_evolution", "self_perception", "constraints", "active_policies",
+    "person", "user_profile", "task", "thread", "threads_background",
+    "task_knowledge", "self_snapshot", "temporal", "memories", "directions",
+    "extra",
+];
+
 pub fn format_context_block(render: &ContextRender<'_>) -> String {
     let inj = render.injection;
     let now = now_ms();
-    let mut sections: Vec<String> = Vec::new();
+    let mut stable: Vec<String> = Vec::new();
+    let mut volatile: Vec<String> = Vec::new();
 
     // <self-snapshot> / <self-evolution> / <self-perception>
     if let Some(snapshot) = &inj.self_snapshot {
         if !snapshot.trim().is_empty() {
-            sections.push(format!("<self-snapshot>\n{snapshot}\n</self-snapshot>"));
+            volatile.push(format!("<self-snapshot>\n{snapshot}\n</self-snapshot>"));
         }
     }
     if !inj.self_evolution.trim().is_empty() {
-        sections.push(format!(
+        stable.push(format!(
             "<self-evolution>\n{}\n</self-evolution>",
             inj.self_evolution.trim()
         ));
     }
     if let Some(perception) = &inj.self_perception {
         if !perception.trim().is_empty() {
-            sections.push(format!(
+            stable.push(format!(
                 "<self-perception>\n{perception}\n</self-perception>"
             ));
         }
@@ -592,7 +614,7 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
     // <constraints>
     if !inj.constraints.is_empty() {
         let lines: Vec<String> = inj.constraints.iter().map(|c| format!("- {c}")).collect();
-        sections.push(format!(
+        stable.push(format!(
             "<constraints>\n{}\n</constraints>",
             lines.join("\n")
         ));
@@ -605,7 +627,7 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
             .iter()
             .map(|sm| format!("- {}", sm.memory.content))
             .collect();
-        sections.push(format!(
+        stable.push(format!(
             "<active-policies>\n(These policies are active for the current situation; follow them in this turn.)\n{}\n</active-policies>",
             lines.join("\n")
         ));
@@ -622,11 +644,11 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
         if !person.detail.trim().is_empty() {
             body.push_str(&format!("\n\n{}\n", sanitize_untrusted(person.detail.trim())));
         }
-        sections.push(format!("<person>\n{body}</person>"));
+        stable.push(format!("<person>\n{body}</person>"));
     }
     if let Some(profile) = &inj.user_profile {
         if !profile.trim().is_empty() {
-            sections.push(format!(
+            stable.push(format!(
                 "<user-profile>\n{}\n</user-profile>",
                 sanitize_untrusted(profile.trim())
             ));
@@ -636,11 +658,11 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
     // <task active=...>
     if render.has_active_task {
         let task_text = render.task.unwrap_or_default();
-        sections.push(format!(
+        stable.push(format!(
             "<task active=\"true\">\n{task_text}\n\nUpdate task state only in these cases:\n- A new phase begins.\n- A new blocker or key conclusion appears.\n- The user changes the goal.\n- The task is complete and [CLEAR_TASK] is needed.\n</task>"
         ));
     } else {
-        sections.push(
+        stable.push(
             "<task active=\"false\">\nThere is no active current_task. This removes a task obligation; it does not prescribe silence, activity, or communication. Judge the heartbeat from the rest of the current context.\n</task>"
                 .to_string(),
         );
@@ -688,7 +710,7 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
                             .join("\n")
                     ));
                 }
-                sections.push(format!(
+                stable.push(format!(
                     "<thread topic=\"{}\" age=\"{}\">\n{body}\n</thread>",
                     topic_attr, age
                 ));
@@ -734,7 +756,7 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
                 });
             }
             if !lines.is_empty() {
-                sections.push(format!(
+                stable.push(format!(
                     "<threads-background>\nOther recent threads you and the user have open — parallel matters, neither tasks to resume on your own nor closed history. The first-person \"我\" in each line is you yourself; anyone else referred to is the user, so do not absorb the user's words or feelings as your own. Pick one up only when the user brings it back or its commitment calls for action.\n{}\n</threads-background>",
                     lines.join("\n")
                 ));
@@ -745,7 +767,7 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
     // <task-knowledge>
     let task_knowledge_text = format_task_knowledge(&inj.task_knowledge);
     if !task_knowledge_text.is_empty() {
-        sections.push(format!(
+        stable.push(format!(
             "<task-knowledge>\n(Artifacts already built during the current task. Use as needed; do not reread files unnecessarily.)\n{task_knowledge_text}\n</task-knowledge>"
         ));
     }
@@ -754,7 +776,7 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
     if let Some(buckets) = &inj.temporal_recall {
         let temporal_text = sanitize_untrusted(&format_temporal_recall(buckets));
         if !temporal_text.is_empty() {
-            sections.push(format!(
+            volatile.push(format!(
                 "{temporal_text}\n\nAbove is what surfaces from your memory because the user mentioned a relative time word. Treat it as background recall: only weave it in if the user is actually asking about that day. Do not list it back to the user verbatim."
             ));
         }
@@ -764,14 +786,14 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
     let memories: Vec<Memory> = inj.memories.iter().map(|sm| sm.memory.clone()).collect();
     let memories_text = sanitize_untrusted(&format_memories_for_prompt(&memories, &inj.recall_memories));
     if !memories_text.is_empty() {
-        sections.push(format!(
+        volatile.push(format!(
             "<memories>\n{memories_text}\n\nUse these memories only when truly relevant. If you need a specific detail, pull the full memory with <memory-recall> rather than guessing.\n</memories>"
         ));
     }
 
     // <directions>
     if !inj.directions.is_empty() {
-        sections.push(format!(
+        volatile.push(format!(
             "<directions>\n{}\n</directions>",
             sanitize_untrusted(&inj.directions.join("\n"))
         ));
@@ -799,10 +821,12 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
         }
     }
     if !extra_lines.is_empty() {
-        sections.push(format!("<extra>\n{}\n</extra>", sanitize_untrusted(&extra_lines.join("\n"))));
+        volatile.push(format!("<extra>\n{}\n</extra>", sanitize_untrusted(&extra_lines.join("\n"))));
     }
 
-    let tagged: Vec<String> = sections
+    let mut all_sections = stable;
+    all_sections.extend(volatile);
+    let tagged: Vec<String> = all_sections
         .into_iter()
         .map(|s| match section_kind(&s) {
             Some(t) => format!("{}\n{}", t.render_header(), s),
@@ -819,6 +843,56 @@ pub fn format_context_block(render: &ContextRender<'_>) -> String {
 mod tests {
     use super::*;
     use crate::db::repositories::memories::ScoredMemory;
+
+    #[test]
+    fn cache_friendly_order_covers_same_sections_reordered() {
+        let mut cf: Vec<&str> = CACHE_FRIENDLY_ORDER.to_vec();
+        let mut node: Vec<&str> = NODE_CONTEXT_ORDER.to_vec();
+        cf.sort_unstable();
+        node.sort_unstable();
+        assert_eq!(cf, node, "两个顺序必须覆盖同一组 section");
+        assert_ne!(NODE_CONTEXT_ORDER, CACHE_FRIENDLY_ORDER, "缓存友好顺序必须与 Node 基线不同");
+        // 稳定段整体前置、变动段后置
+        let idx = |n: &str| CACHE_FRIENDLY_ORDER.iter().position(|s| *s == n).unwrap();
+        for stable_name in ["constraints", "active_policies", "person", "user_profile", "task", "thread", "task_knowledge"] {
+            assert!(idx(stable_name) < idx("memories"), "{stable_name} 应排在 memories 之前");
+        }
+        assert!(idx("memories") > idx("self_evolution"), "memories 应靠后");
+        assert!(idx("extra") > idx("memories"), "extra 应最后");
+    }
+
+    #[test]
+    fn context_block_renders_stable_sections_before_volatile() {
+        let inj = crate::memory::injector::InjectorOutput {
+            memories: vec![ScoredMemory {
+                memory: mem("fact", "一条高变动记忆", "", 1),
+                fts_score: None,
+                vec_score: None,
+            }],
+            active_policies: vec![ScoredMemory {
+                memory: mem("procedure", "一条稳定策略", "", 1),
+                fts_score: None,
+                vec_score: None,
+            }],
+            constraints: vec!["稳定约束".into()],
+            directions: vec!["本轮方向".into()],
+            ..Default::default()
+        };
+        let render = ContextRender {
+            thread_view: None,
+            injection: &inj,
+            has_active_task: false,
+            task: None,
+        };
+        let block = format_context_block(&render);
+        let pos_c = block.find("<constraints>").expect("constraints 渲染");
+        let pos_a = block.find("<active-policies>").expect("active-policies 渲染");
+        let pos_m = block.find("<memories>").expect("memories 渲染");
+        let pos_d = block.find("<directions>").expect("directions 渲染");
+        assert!(pos_c < pos_m, "稳定段 constraints 应渲染在 memories 之前");
+        assert!(pos_a < pos_m, "稳定段 active-policies 应渲染在 memories 之前");
+        assert!(pos_m < pos_d, "memories 应渲染在 directions 之前（同为变动段保持相对顺序）");
+    }
 
     /// 构造测试记忆（其余字段取空默认）。
     fn mem(event_type: &str, content: &str, title: &str, salience: i64) -> Memory {

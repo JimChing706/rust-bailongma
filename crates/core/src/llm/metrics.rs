@@ -775,6 +775,39 @@ pub fn compute_context_stats(out: &crate::memory::injector::InjectorOutput) -> C
     }
 }
 
+
+/// P3-1 数据驱动缓存友好化：基于历史命中统计重排上下文 section 顺序。
+/// `history`：(section 名, 字节波动率 std/mean)。波动率低 → 内容稳定 → 应前置；
+/// 波动率高 → 内容常变 → 应后置（避免打断 prompt 前缀命中）。
+/// 无历史数据（接线前）时退化为静态分级（对齐 CACHE_FRIENDLY_ORDER）。
+/// 返回按「稳定优先」排列的 section 名列表；未知 section 按稳定级 9 置尾。
+pub fn relocate_sections(history: &[(String, f64)]) -> Vec<String> {
+    // 静态稳定级（0 = 最稳定；与 injector_format::CACHE_FRIENDLY_ORDER 一致）
+    let level = |name: &str| -> u32 {
+        match name {
+            "self_evolution" | "self_perception" | "constraints" | "active_policies"
+            | "person" | "user_profile" | "task" | "thread" | "threads_background"
+            | "task_knowledge" => 0,
+            "self_snapshot" => 1,
+            "temporal" | "memories" | "directions" | "extra" => 2,
+            _ => 9,
+        }
+    };
+    let mut items: Vec<(u32, f64, String)> = history
+        .iter()
+        .map(|(name, vol)| (level(name), if vol.is_finite() { vol.abs() } else { f64::MAX }, name.clone()))
+        .collect();
+    // 补上静态表中未出现在历史里的 section（波动率按最大 → 排同级别末尾）
+    let known: std::collections::HashSet<&str> = history.iter().map(|(n, _)| n.as_str()).collect();
+    for name in crate::memory::injector_format::CACHE_FRIENDLY_ORDER {
+        if !known.contains(*name) {
+            items.push((level(name), f64::MAX, (*name).to_string()));
+        }
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)));
+    items.into_iter().map(|(_, _, n)| n).collect()
+}
+
 /// M3：一次 turn 的观测会话（意识循环接线后用）：
 /// 用法：begin → record_context_stats(&injection) → 调 LLM（StreamContext.request_id
 /// 用 TurnSession::request_id）→ finish(attribution, is_tick, calls)；
@@ -1159,6 +1192,38 @@ mod tests {
     }
 
     #[test]
+    fn relocate_sections_orders_by_stability_then_volatility() {
+        // 无历史 → 静态分级顺序（constraints 等稳定段前置）
+        let no_hist = relocate_sections(&[]);
+        let idx = |n: &str| no_hist.iter().position(|s| s == n).unwrap();
+        assert!(idx("constraints") < idx("memories"));
+        assert!(idx("extra") > idx("memories"));
+
+        // 有历史 → 同级别内波动率低者前置
+        let hist = vec![
+            ("memories".to_string(), 3.0),
+            ("directions".to_string(), 1.0),
+            ("constraints".to_string(), 0.1),
+            ("extra".to_string(), 5.0),
+        ];
+        let ordered = relocate_sections(&hist);
+        let i = |n: &str| ordered.iter().position(|s| s == n).unwrap();
+        assert!(i("constraints") < i("memories"), "低波动 constraints 前置");
+        assert!(i("directions") < i("memories"), "directions 波动低于 memories 应前置");
+        assert!(i("extra") > i("memories"), "extra 波动最高应最后");
+
+        // 未知 section 置尾
+        let with_unknown = relocate_sections(&[("mystery_section".to_string(), 0.0)]);
+        let last = with_unknown.last().unwrap();
+        assert_eq!(last, "mystery_section");
+    }
+
+    #[test]
+    fn relocate_sections_handles_nan_volatility() {
+        let ordered = relocate_sections(&[("memories".to_string(), f64::NAN)]);
+        assert!(ordered.iter().any(|s| s == "memories"));
+    }
+
     fn context_stats_counts_nonempty_sections() {
         use crate::memory::injector::InjectorOutput;
         let empty = InjectorOutput::default();
