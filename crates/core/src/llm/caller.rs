@@ -36,6 +36,7 @@ pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 pub struct LlmConfig {
     pub provider: String,
     pub model: String,
+    pub fast_model: String,
     pub api_key: String,
     pub base_url: String,
 }
@@ -59,9 +60,16 @@ impl LlmConfig {
                 .to_string()
         });
         let model = super::providers::normalize_model(cfg.model.as_deref(), &provider);
+        let fast_model = cfg
+            .fast_model
+            .as_deref()
+            .filter(|m| !m.trim().is_empty())
+            .map(|m| super::providers::normalize_model(Some(m), &provider))
+            .unwrap_or_else(|| model.clone());
         Ok(Self {
             provider,
             model,
+            fast_model,
             api_key,
             base_url,
         })
@@ -70,6 +78,21 @@ impl LlmConfig {
     /// 聊天补全端点 URL
     pub fn chat_completions_url(&self) -> String {
         format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
+    }
+
+    /// P3-2 模型路由：后台/低强度场景（tick、wakeup、startup）走 fast_model（若配置），
+    /// 其余场景（交互、工具循环等）走主模型。fast_model 未配置时回退主模型。
+    pub fn route_model(&self, scenario: &str) -> String {
+        match scenario {
+            "tick" | "wakeup" | "startup" => {
+                if self.fast_model.is_empty() {
+                    self.model.clone()
+                } else {
+                    self.fast_model.clone()
+                }
+            }
+            _ => self.model.clone(),
+        }
     }
 }
 
@@ -732,6 +755,31 @@ mod tests {
     }
 
     #[test]
+    fn route_model_selects_fast_for_background_scenarios() {
+        let fast = LlmConfig {
+            provider: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+            fast_model: "deepseek-chat".into(),
+            api_key: "k".into(),
+            base_url: "http://x".into(),
+        };
+        assert_eq!(fast.route_model("tick"), "deepseek-chat");
+        assert_eq!(fast.route_model("wakeup"), "deepseek-chat");
+        assert_eq!(fast.route_model("startup"), "deepseek-chat");
+        assert_eq!(fast.route_model("interactive"), "deepseek-v4-pro");
+        assert_eq!(fast.route_model(""), "deepseek-v4-pro");
+
+        let no_fast = LlmConfig {
+            provider: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+            fast_model: String::new(),
+            api_key: "k".into(),
+            base_url: "http://x".into(),
+        };
+        assert_eq!(no_fast.route_model("tick"), "deepseek-v4-pro", "无 fast_model 时回退主模型");
+    }
+
+    #[test]
     fn openai_default_sampling_model_omits_temperature() {
         let r = req(
             OPENAI,
@@ -831,6 +879,7 @@ mod tests {
             provider: "deepseek".into(),
             model: "deepseek-v4-pro".into(),
             api_key: "test-key".into(),
+            fast_model: String::new(),
             base_url: format!("http://{addr}"),
         };
         let request = build_chat_completion_request(
@@ -931,6 +980,7 @@ mod tests {
             provider: "deepseek".into(),
             model: "deepseek-v4-pro".into(),
             api_key: "test-key".into(),
+            fast_model: String::new(),
             base_url: format!("http://{addr}"),
         };
         let request = build_chat_completion_request(

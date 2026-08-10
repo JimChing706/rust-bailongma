@@ -953,6 +953,7 @@ mod tests {
         LlmConfig {
             provider: "deepseek".into(),
             model: "deepseek-v4-pro".into(),
+            fast_model: String::new(),
             api_key: "test-key".into(),
             base_url: "https://api.deepseek.com".into(),
         }

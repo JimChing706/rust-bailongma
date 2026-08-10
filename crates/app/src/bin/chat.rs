@@ -141,12 +141,16 @@ fn build_llm_config(
         .clone()
         .unwrap_or_else(|| get_provider_config(&provider).base_url.to_string());
     let model = normalize_model(cfg.model.as_deref(), &provider);
-    Ok(LlmConfig {
+    let mut llm = LlmConfig {
         provider,
         model,
         api_key,
+        fast_model: cfg.fast_model.clone().unwrap_or_default(),
         base_url,
-    })
+    };
+    // P3-2 模型路由：交互轮走主模型；后台轮接入时改场景字符串即走 fast_model
+    llm.model = llm.route_model("interactive");
+    Ok(llm)
 }
 
 /// 跑一轮对话（非交互）

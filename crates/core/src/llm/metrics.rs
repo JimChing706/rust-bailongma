@@ -1224,6 +1224,7 @@ mod tests {
         assert!(ordered.iter().any(|s| s == "memories"));
     }
 
+    #[test]
     fn context_stats_counts_nonempty_sections() {
         use crate::memory::injector::InjectorOutput;
         let empty = InjectorOutput::default();

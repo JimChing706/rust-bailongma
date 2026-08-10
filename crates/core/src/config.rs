@@ -31,6 +31,7 @@ pub struct Config {
     // ── 模型 ──
     pub provider: String,
     pub model: Option<String>,
+    pub fast_model: Option<String>,
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub thinking: bool,
@@ -118,6 +119,7 @@ impl Default for Config {
         Self {
             provider: String::new(),
             model: None,
+            fast_model: None,
             api_key: None,
             base_url: None,
             thinking: true,

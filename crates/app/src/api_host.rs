@@ -144,7 +144,11 @@ async fn run_conscious_turn(
 
     // 1) LLM 激活检查（未激活 → 降级回复，不空转）
     let llm_cfg = match LlmConfig::from_config(&cfg) {
-        Ok(c) => c,
+        Ok(mut c) => {
+            // P3-2 模型路由：交互轮走主模型；后台 tick/wakeup/startup 接入时改场景字符串即走 fast_model
+            c.model = c.route_model("interactive");
+            c
+        }
         Err(e) => {
             let reply = format!("（LLM 未激活，本轮无法生成回复：{e}）");
             let _ = conversations::insert(&db, "agent", &msg.from_id, &reply);

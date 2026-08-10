@@ -419,7 +419,6 @@ fn redact_long_tokens(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     /// 信任分层：System 可放行需确认工具；User/Agent 未确认则挂起；未知工具恒拒。
     #[test]
