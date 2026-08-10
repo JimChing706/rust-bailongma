@@ -66,3 +66,19 @@ LLM 工具循环
       → 120s 超时按拒绝处理（fail-closed）
   → 放行 → 真实执行 → llm_tool_calls 台账落库（含 attempt 幂等键）
 ```
+
+
+## P2-2：信任分层（TrustTier / CallerTrust）
+
+- **TrustTier**（工具维度，`capability::trust_tier`）：由能力声明自动推导——
+  `Trusted`（纯查询 / 沙箱内读写 / Medium 可控副作用）直接放行；
+  `Approval`（`needs_approval()`，即 risk ≥ High 或 requires_approval）需人工确认；
+  `Denied`（未知工具 / 未声明能力）恒拒。fail-closed：查不到声明即 Denied。
+- **CallerTrust**（来源维度）：`System`（内部自动化）可放行 Approval 工具；
+  `User` / `Agent` 需已获人工确认（`check_tool_call_with_caller`）。
+  默认入口 `check_tool_call(name, approved)` 按 User 语义委托，保持旧行为兼容。
+- **全工具参数 schema 校验**（`tools::validate`）：`execute` 分发前统一校验，
+  未知参数 / 必填缺失 / null 必填 / 类型不符 / enum 越界 / 数组元素类型不符
+  一律拒绝，替代各工具内部静默兜底（如 get_timestamp 的 format 越界原走 iso）。
+  校验纯决策、无副作用，可重放。落地时实锤一处 schema 与实现不一致：
+  `remind` 的 `now`（测试/调试时间注入）漏声明，已补入 schema。

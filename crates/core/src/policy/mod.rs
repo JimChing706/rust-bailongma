@@ -19,7 +19,7 @@
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::capability::{builtin, is_path_denied};
+use crate::capability::{builtin, is_path_denied, trust_tier, CallerTrust, TrustTier};
 
 /// 决策结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,15 +153,40 @@ impl PolicyEngine {
     /// 检查工具调用：未知工具一律拒绝（fail-closed）；能力声明需要确认且未授权 → 挂起。
     /// `approved` = 该工具本轮是否已获得用户确认（人工确认机制回传后置 true）。
     pub fn check_tool_call(&mut self, name: &str, approved: bool) -> PolicyDecision {
+        // 默认按终端用户来源评估（保持旧行为语义）
+        self.check_tool_call_with_caller(name, CallerTrust::User, approved)
+    }
+
+    /// 检查工具调用（P2-2 信任分层版）：未知工具一律拒绝（fail-closed）；
+    /// 需确认工具按来源分层——System 内部自动化直接放行，User/Agent
+    /// 必须已获人工确认；已确认一律放行。
+    pub fn check_tool_call_with_caller(
+        &mut self,
+        name: &str,
+        caller: CallerTrust,
+        approved: bool,
+    ) -> PolicyDecision {
         let decision = match builtin(name) {
             None => PolicyDecision::Deny(format!("未知工具: {name}")),
-            Some(cap) if cap.needs_approval() && !approved => PolicyDecision::RequireApproval(
-                format!("工具 {name}（风险 {}）需人工确认", cap.risk_level.as_str()),
-            ),
+            Some(cap) if cap.needs_approval() => {
+                if caller == CallerTrust::System || approved {
+                    PolicyDecision::Allow
+                } else {
+                    PolicyDecision::RequireApproval(format!(
+                        "工具 {name}（风险 {}）需人工确认",
+                        cap.risk_level.as_str()
+                    ))
+                }
+            }
             Some(_) => PolicyDecision::Allow,
         };
         self.record(&format!("tool_call:{name}"), &decision);
         decision
+    }
+
+    /// 工具信任等级查询（供上层展示 / 决策前分级）。
+    pub fn tool_trust_tier(&self, name: &str) -> TrustTier {
+        trust_tier(name)
     }
 
     // ── 文件访问 ──
@@ -394,6 +419,43 @@ fn redact_long_tokens(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// 信任分层：System 可放行需确认工具；User/Agent 未确认则挂起；未知工具恒拒。
+    #[test]
+    fn caller_trust_tiers() {
+        let mut e = PolicyEngine::new("C:/ws");
+        // System 放行 exec_command（不要求 approved）
+        assert_eq!(
+            e.check_tool_call_with_caller("exec_command", CallerTrust::System, false),
+            PolicyDecision::Allow
+        );
+        // Agent 未确认 → 挂起
+        assert!(matches!(
+            e.check_tool_call_with_caller("exec_command", CallerTrust::Agent, false),
+            PolicyDecision::RequireApproval(_)
+        ));
+        // User 已确认 → 放行
+        assert_eq!(
+            e.check_tool_call_with_caller("exec_command", CallerTrust::User, true),
+            PolicyDecision::Allow
+        );
+        // 低风险工具任何来源都放行
+        assert_eq!(
+            e.check_tool_call_with_caller("get_timestamp", CallerTrust::Agent, false),
+            PolicyDecision::Allow
+        );
+        // 未知工具恒拒（即使 System + approved）
+        assert!(matches!(
+            e.check_tool_call_with_caller("format_c:", CallerTrust::System, true),
+            PolicyDecision::Deny(_)
+        ));
+        // tier 查询
+        assert_eq!(e.tool_trust_tier("exec_command"), TrustTier::Approval);
+        assert_eq!(e.tool_trust_tier("read_file"), TrustTier::Trusted);
+        assert_eq!(e.tool_trust_tier("nope"), TrustTier::Denied);
+    }
+
     use super::*;
 
     fn engine() -> PolicyEngine {

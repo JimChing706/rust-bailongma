@@ -137,7 +137,8 @@ pub fn extra_tool_schemas() -> Vec<crate::llm::tools::ToolSchema> {
             "查询到期待触发的提醒（reminders 表 pending 且已到期；不消费）",
         )
         .param("action", enum_param("操作", &["list"]))
-        .param("limit", integer_param("返回条数，默认 10，最大 50")),
+        .param("limit", integer_param("返回条数，默认 10，最大 50"))
+        .param("now", crate::llm::tools::string_param("当前时间 ISO 注入（测试/调试用，默认取系统时间）")),
     ]
 }
 

@@ -38,6 +38,7 @@ use crate::llm::tools::{
 };
 
 pub mod extra;
+pub mod validate;
 
 // ─────────────────────────────────────────────────────────────
 // 常量
@@ -504,6 +505,8 @@ impl NativeToolExecutor {
 
 impl ToolExecutor for NativeToolExecutor {
     fn execute(&self, name: &str, args: &Value) -> Result<String> {
+        // P2-2: 分发前统一参数 schema 校验（fail-closed：未知参数/类型错/enum 越界一律拒绝）
+        validate::validate_args(name, args)?;
         let result = match name {
             "get_timestamp" => self.get_timestamp(args)?,
             "read_file" => self.read_file(args)?,

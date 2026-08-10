@@ -303,6 +303,57 @@ const BUILTIN: &[ToolCapability] = &[
     },
 ];
 
+/// 工具信任分层（P2-2）：由能力声明推导，供 PolicyEngine 分层放行。
+/// 纯声明推导，fail-closed：未知工具一律 Denied。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TrustTier {
+    /// 可信：纯查询 / 低风险，无需人工确认
+    Trusted,
+    /// 需确认：副作用大，需人工确认后放行
+    Approval,
+    /// 拒绝：未知工具 / 未声明能力
+    Denied,
+}
+
+impl TrustTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TrustTier::Trusted => "trusted",
+            TrustTier::Approval => "approval",
+            TrustTier::Denied => "denied",
+        }
+    }
+}
+
+/// 调用来源信任等级（P2-2）：同一工具因来源不同获得不同放行策略。
+/// System = 系统内部自动化（可放行需确认工具）；User = 终端用户直接指令；
+/// Agent = LLM Agent 自主调用（与用户同权，需确认工具一律走人工确认）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CallerTrust {
+    System,
+    User,
+    Agent,
+}
+
+impl CallerTrust {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CallerTrust::System => "system",
+            CallerTrust::User => "user",
+            CallerTrust::Agent => "agent",
+        }
+    }
+}
+
+/// 由工具名推导信任等级（fail-closed：未知工具 → Denied）。
+pub fn trust_tier(name: &str) -> TrustTier {
+    match builtin(name) {
+        None => TrustTier::Denied,
+        Some(cap) if cap.needs_approval() => TrustTier::Approval,
+        Some(_) => TrustTier::Trusted,
+    }
+}
+
 /// 按工具名查内建能力声明。
 pub fn builtin(name: &str) -> Option<&'static ToolCapability> {
     BUILTIN.iter().find(|c| c.name == name)
@@ -330,6 +381,23 @@ pub fn is_path_denied(path: &str, deny: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 信任分层推导：11 工具分布 + 未知工具 fail-closed。
+    #[test]
+    fn trust_tier_derivation() {
+        // 需确认工具（High/Critical + requires_approval）→ Approval
+        for n in ["exec_command", "delete_file"] {
+            assert_eq!(trust_tier(n), TrustTier::Approval, "{n}");
+        }
+        // 纯查询 / 沙箱内读写 / 对外发送（Medium 可控，文档既定）→ Trusted
+        for n in ["get_timestamp", "read_file", "write_file", "list_dir", "make_dir",
+                  "search_memory", "collect_agents", "remind", "send_message"] {
+            assert_eq!(trust_tier(n), TrustTier::Trusted, "{n}");
+        }
+        // 未知工具 → Denied
+        assert_eq!(trust_tier("format_c:"), TrustTier::Denied);
+        assert_eq!(trust_tier(""), TrustTier::Denied);
+    }
 
     #[test]
     fn risk_ordering() {
