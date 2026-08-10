@@ -7,7 +7,7 @@ use bailongma_core::api::routes::{ApiState, InboundMessage, InboundQueued};
 use bailongma_core::api::server::ApiServer;
 use bailongma_core::compat;
 use bailongma_core::config::{load_config, resolve_user_dir, Config};
-use bailongma_core::db::repositories::{brain_ui_events, conversations};
+use bailongma_core::db::repositories::{brain_ui_events, conversations, turn_state};
 use bailongma_core::db::Db;
 use bailongma_core::embedding::NoopEmbedder;
 use bailongma_core::error::{CoreError, Result};
@@ -21,6 +21,7 @@ use bailongma_core::memory::injector::{ContextWindowConfig, InjectorContext};
 use bailongma_core::memory::messages::LlmRole;
 use bailongma_core::runtime::{init as runtime_init, run_user_turn, RuntimeState};
 use bailongma_core::tools::{all_tool_schemas, NativeToolExecutor, SendMessageFn};
+use bailongma_core::turn;
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -95,6 +96,10 @@ fn sandbox_root(user_dir: &Path) -> PathBuf {
 }
 
 /// R3 意识闭环：入站消息 → 归属/注入/落库 → LLM 工具循环 → 回复落库 + 广播。
+///
+/// Phase 1（显式 Turn 状态机）接线：本轮在 `turn_state` 表建行并全程落状态
+/// `received → running → completed / failed`，幂等键 = conversation_id 派生
+/// （同一入站消息重试复用同一行）；落库失败仅告警，不阻断意识闭环。
 async fn run_conscious_turn(
     db: Db,
     bus: EventBus,
@@ -105,6 +110,38 @@ async fn run_conscious_turn(
     msg: InboundMessage,
     conversation_id: i64,
 ) {
+    // 0) Phase 1：turn_state 建行（received）；失败仅告警，不阻断主流程
+    let turn_id = match turn_state::create_turn(
+        &db,
+        &now_input_ts(),
+        &format!("conv-{conversation_id}"),
+        &msg.channel,
+        &msg.from_id,
+        &msg.content,
+        Some(conversation_id),
+        "retry",
+    ) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            tracing::warn!("[P1] turn_state 建行失败（降级继续）: {e}");
+            None
+        }
+    };
+    // 终态落库闭包：turn_id 存在时写 last_error + mark_finished。
+    // 仅 &db 不可变借用（与后续 run_user_turn/call_llm 共用，无冲突）。
+    let finish_turn = |state: &str, err: String| {
+        if let Some(id) = turn_id {
+            if !err.is_empty() {
+                if let Err(e) = turn_state::set_error(&db, id, &err) {
+                    tracing::warn!("[P1] turn_state set_error 失败: {e}");
+                }
+            }
+            if let Err(e) = turn_state::mark_finished(&db, id, state, &now_input_ts()) {
+                tracing::warn!("[P1] turn_state mark_finished({state}) 失败: {e}");
+            }
+        }
+    };
+
     // 1) LLM 激活检查（未激活 → 降级回复，不空转）
     let llm_cfg = match LlmConfig::from_config(&cfg) {
         Ok(c) => c,
@@ -121,6 +158,7 @@ async fn run_conscious_turn(
                     "conversation_id": conversation_id,
                 }),
             );
+            finish_turn("failed", format!("llm not activated: {e}"));
             return;
         }
     };
@@ -139,6 +177,12 @@ async fn run_conscious_turn(
         .and_then(|v| v.as_str())
         .unwrap_or(compat::DEFAULT_AGENT_NAME)
         .to_string();
+
+    if let Some(id) = turn_id {
+        if let Err(e) = turn_state::set_state(&db, id, "running") {
+            tracing::warn!("[P1] turn_state->running 失败: {e}");
+        }
+    }
 
     let turn = {
         let mut guard = state.lock().await;
@@ -174,6 +218,7 @@ async fn run_conscious_turn(
                         "conversation_id": conversation_id,
                     }),
                 );
+                finish_turn("failed", format!("run_user_turn: {e}"));
                 return;
             }
         }
@@ -250,6 +295,10 @@ async fn run_conscious_turn(
             if content.is_empty() {
                 if r.total_calls == 0 {
                     tracing::warn!("[R3] LLM 空回复且无工具调用（{conversation_id}）");
+                    finish_turn("failed", "empty reply, no tool calls".to_string());
+                } else {
+                    // 有工具调用但无文本：工具副作用已发生，按完成记账
+                    finish_turn("completed", String::new());
                 }
                 return;
             }
@@ -270,6 +319,7 @@ async fn run_conscious_turn(
                 r.total_calls,
                 content.chars().count()
             );
+            finish_turn("completed", String::new());
         }
         Err(e) => {
             tracing::error!("[R3] call_llm 失败: {e}");
@@ -285,6 +335,7 @@ async fn run_conscious_turn(
                     "conversation_id": conversation_id,
                 }),
             );
+            finish_turn("failed", format!("call_llm: {e}"));
         }
     }
 }
@@ -307,7 +358,7 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
 
     // ── 第 3 轮审计检查项：LAN 暴露 fail-closed ──
     // 运行中桌面实例曾以 0.0.0.0:3721 监听且无 token（网内任意设备可直连 /message）。
-    // 现在：开 LAN 必须配 token，否则启动即失败；仅回环（未开 LAN）不受影响。
+    // 现在：开 LAN 必须配 token，启动即失败；仅回环（未开 LAN）不受影响。
     let token = std::env::var("BAILONGMA_API_TOKEN").ok();
     let token_configured = !token.as_deref().map(str::trim).unwrap_or("").is_empty();
     let lan = cfg.allow_lan_access();
@@ -329,6 +380,19 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
             tracing::info!("[startup] agents 扫描完成: {found}/{} 可用", results.len());
         }
         Err(_) => tracing::warn!("[startup] agents 扫描超时（15s）"),
+    }
+
+    // ── Phase 1：启动恢复未终态 turn（received/running/waiting_approval）──
+    // 按 recover_policy 决策：resume/retry → running（retry 自动 attempt+1）；
+    // mark_failed / retry 超限 → failed；waiting_approval 一律保持挂起等人确认。
+    match turn::recover_unfinished_turns(&db) {
+        Ok(s) => tracing::info!(
+            "[P1] 启动恢复: recovered={} marked_failed={} held={}",
+            s.recovered,
+            s.marked_failed,
+            s.held
+        ),
+        Err(e) => tracing::error!("[P1] 启动恢复失败: {e}"),
     }
 
     let persist_db = db.clone();

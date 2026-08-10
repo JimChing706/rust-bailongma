@@ -28,10 +28,13 @@
 //!
 //! R2 落地：`tools::NativeToolExecutor` 真实工具层（9 个工具）已接入工具循环。
 //!
-//! P1 落地：`turn` 显式状态机（状态集/转移/恢复决策）+ `turn_state` 表仓库。
+//! P1 落地：`turn` 显式状态机（状态集/转移/恢复决策）+ `turn_state` 表仓库 +
+//! `capability` 工具能力模型（风险等级/side_effect/scopes/denylist/output_policy）+
+//! `policy` PolicyEngine（五类决策入口 + 审计日志）。
 
 pub mod agents;
 pub mod api;
+pub mod capability;
 pub mod config;
 pub mod db;
 pub mod embedding;
@@ -39,6 +42,7 @@ pub mod error;
 pub mod llm;
 pub mod logging;
 pub mod memory;
+pub mod policy;
 pub mod runtime;
 pub mod scene;
 pub mod tools;

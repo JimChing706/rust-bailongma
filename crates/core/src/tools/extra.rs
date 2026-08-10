@@ -13,7 +13,6 @@ use serde_json::{json, Value};
 
 use super::NativeToolExecutor;
 use crate::error::{CoreError, Result};
-use crate::llm::tool_loop::ToolExecutor;
 
 /// collect_agents 默认返回条数
 const DEFAULT_AGENT_LIMIT: u32 = 20;
