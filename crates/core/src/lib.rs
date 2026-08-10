@@ -31,7 +31,8 @@
 //! Phase 1 安全基线落地：`turn` 显式状态机（状态集/转移/恢复决策）+ `turn_state` 表仓库 +
 //! `capability` 工具能力模型（风险等级/side_effect/scopes/denylist/output_policy）+
 //! `policy` PolicyEngine（五类决策入口 + 审计日志）+
-//! `approval` 人工确认门（高风险工具挂起等待用户抉择，WS/scene 卡片 + /approval 回传）。
+//! `approval` 人工确认门（高风险工具挂起等待用户抉择，WS/scene 卡片 + /approval 回传）+
+//! 上下文注入防护（section 安全标签 + injector_format 渲染分区隔离）。
 
 pub mod agents;
 pub mod api;
@@ -69,3 +70,7 @@ pub mod compat {
     /// 默认 Agent 名
     pub const DEFAULT_AGENT_NAME: &str = "小白龙";
 }
+
+// ── Phase 1 安全回归（步骤 7）──
+#[cfg(test)]
+mod security_regression;

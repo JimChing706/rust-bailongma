@@ -1,4 +1,4 @@
-//! ApprovalGate —— 高风险工具人工确认门（Phase 1 安全基线）。
+﻿//! ApprovalGate —— 高风险工具人工确认门（Phase 1 安全基线）。
 //!
 //! 计划（bailongma-multiagent-enhancement Phase 1「人工确认机制」）：
 //! 高风险工具调用产生 approval 请求 → WS/scene 面板推送（choice 卡片）→
@@ -127,7 +127,7 @@ impl ApprovalGate {
 
     /// 工具调用守卫：Allow → Proceed；RequireApproval → 挂起等用户抉择；
     /// Deny / 未知工具 / 超时 → Denied。
-    pub fn guard_tool_call(&self, tool: &str, detail: &str) -> Result<GuardResult> {
+    pub fn guard_tool_call(&self, tool: &str, _detail: &str) -> Result<GuardResult> {
         let session_ok = self.inner.lock().unwrap().session_approved.contains(tool);
         let decision = {
             let mut inner = self.inner.lock().unwrap();
