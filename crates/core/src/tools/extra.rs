@@ -146,6 +146,7 @@ mod tests {
     use super::*;
     use crate::db::open_database;
     use crate::db::Db;
+    use crate::llm::tool_loop::ToolExecutor;
 
     fn test_db() -> Db {
         let dir = tempfile::tempdir().unwrap();

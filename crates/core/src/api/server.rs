@@ -65,6 +65,28 @@ impl ApiServer {
             message_rate: Arc::new(RateLimiter::default()),
         };
         let state = state.with_guard(guard);
+    // Phase 1 人工确认：审批请求 → scene choice 卡片（用户抉择后由 /approval 回传闭环）
+    {
+        let scene = state.scene.clone();
+        crate::approval::set_global_on_request(Arc::new(move |req| {
+            let surface_id = format!("approval:{}", req.id);
+            let card = json!({
+                "id": surface_id.clone(),
+                "kind": "choice",
+                "intent": "confront",
+                "focus": true,
+                "data": {
+                    "prompt": format!("[审批] {}：{}", req.tool, req.detail),
+                    "options": [
+                        { "value": "allow_once", "label": "允许一次" },
+                        { "value": "allow_session", "label": "本会话允许" },
+                        { "value": "deny", "label": "拒绝" },
+                    ],
+                },
+            });
+            let _ = scene.set(&surface_id, Some(&card));
+        }));
+    }
         // 启动时补发 agent_name 粘性事件（对齐 api.js 307-310 行）
         let name = (state.agent_name)();
         state
@@ -95,6 +117,7 @@ impl ApiServer {
             .route("/message", post(routes::post_message))
             .route("/status", get(routes::get_status))
             .route("/scene", get(handle_scene_ws))
+            .route("/approval", post(routes::post_approval))
             // 静态资源 fallback（对齐 handleStaticRoutes：API 未匹配时尝试页面/资产）
             .fallback(move |req: Request| async move {
                 match super::static_assets::handle_static(&req, &resources, needs_activation) {

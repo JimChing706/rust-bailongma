@@ -245,6 +245,42 @@ impl ApiState {
 // ─────────────────────────────────────────────────────────────
 
 /// POST /message —— 入站消息（对齐 handleMessageRoutes）。
+/// POST /approval —— 人工确认抉择回传（Phase 1 安全基线）。
+/// 执行端（ApprovalGate）挂起高风险工具调用，用户在此回传抉择：
+/// allow_once / allow_session / deny（改参 Phase 2 落地）。
+#[derive(Deserialize)]
+pub struct ApprovalBody {
+    pub id: String,
+    #[serde(default)]
+    pub decision: String,
+}
+
+pub async fn post_approval(
+    State(state): State<ApiState>,
+    Json(body): Json<ApprovalBody>,
+) -> (StatusCode, Json<Value>) {
+    if body.id.is_empty() || body.decision.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "id 与 decision 必填" })),
+        );
+    }
+    match crate::approval::global().submit(&body.id, &body.decision) {
+        Ok(choice) => {
+            // 移除场景卡片
+            let _ = state.scene.set(&format!("approval:{}", body.id), None);
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "decision": choice.as_str() })),
+            )
+        }
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
 pub async fn post_message(
     State(state): State<ApiState>,
     Json(body): Json<InboundBody>,

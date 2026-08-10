@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::approval::{ApprovalGate, GuardResult};
 use crate::db::Db;
 use crate::error::{CoreError, Result};
 use crate::llm::tool_loop::ToolExecutor;
@@ -72,6 +73,8 @@ pub struct NativeToolExecutor {
     pub send_message: Option<SendMessageFn>,
     /// sandbox 子进程路径（Some 时 exec_command 走子进程委托；None 直接执行）
     pub sandbox_bin: Option<PathBuf>,
+    /// 人工确认门（Some 时 exec_command 默认先过审批；None = 不启用，保持旧行为）
+    pub approval: Option<Arc<ApprovalGate>>,
 }
 
 impl NativeToolExecutor {
@@ -81,6 +84,7 @@ impl NativeToolExecutor {
             db: None,
             send_message: None,
             sandbox_bin: None,
+            approval: None,
         }
     }
 
@@ -96,6 +100,11 @@ impl NativeToolExecutor {
 
     pub fn with_sandbox(mut self, bin: PathBuf) -> Self {
         self.sandbox_bin = Some(bin);
+        self
+    }
+
+    pub fn with_approval(mut self, gate: Arc<ApprovalGate>) -> Self {
+        self.approval = Some(gate);
         self
     }
 
@@ -248,6 +257,19 @@ impl NativeToolExecutor {
         if command.is_empty() {
             return Err(CoreError::Tool("exec_command 缺 command".into()));
         }
+        // Phase 1 人工确认：exec_command 默认 require approval（fail-closed）
+        if let Some(gate) = self.approval.as_ref() {
+            let preview: String = command.chars().take(120).collect();
+            let detail = String::from("exec_command: ") + preview.as_str();
+            let decision = gate.guard_tool_call("exec_command", detail.as_str());
+            if let Err(e) = decision.as_ref() {
+                return Err(CoreError::Other(e.to_string()));
+            }
+            if let Ok(GuardResult::Denied(r)) = decision.as_ref() {
+                return Err(CoreError::Tool(String::from("exec_command 被拒绝: ") + r.as_str()));
+            }
+        }
+
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(Value::as_u64)
