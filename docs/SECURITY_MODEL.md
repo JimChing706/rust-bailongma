@@ -1,4 +1,4 @@
-# 安全模型（SECURITY MODEL）
+﻿# 安全模型（SECURITY MODEL）
 
 > bailongma-rust 安全基线总览（Phase 1：显式 Turn 状态机 + trace + policy/capability + 人工确认 + 注入防护）。
 
@@ -61,6 +61,6 @@
 cargo test --workspace
 # 全量回归（含 Phase 1 新增）：
 #   turn_state 3 测 / turn 4 测 / capability 表断言 / policy 12 测
-#   approval 9 测 / injector_format 注入测试 / security_regression 13 测（步骤 7）
+#   approval 9 测 / injector_format 注入测试 / security_regression 15 测（步骤 7）
 #   server.rs token/LAN 集成测试（round 4/5）
 ```
