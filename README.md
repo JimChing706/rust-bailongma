@@ -13,6 +13,7 @@ BaiLongma（白龙马）的 Rust 原生实现——一个本地优先、带「�
 - **安全**（M1.5）：delegate CLI 从字符串拼接改为参数数组直启，根除 shell 元字符注入面。
 - **安全**（第 3 轮审计）：LAN 暴露 fail-closed 启动检查——`network.allowLanAccess=true` 必须配置 `BAILONGMA_API_TOKEN`，否则拒绝启动（不允许「开 LAN 但不设 token」的暴露态）。
 - **安全**（第 4 轮审计）：LAN 读路径强制 token——token 配置后所有远端请求（`/events/history`、`/events` SSE、`/status`、静态资源）必须携带 Bearer token，对齐 WS `/scene`；回环来源不受影响。
+- **安全**（第 5 轮审计）：token 缺失时远端全拒——fail-closed 不再依赖启动检查单一路径；绕过启动检查（测试 / 嵌入调用直接组装 server）时，未配 token 的任何远端请求一律 403，杜绝 LAN 裸读残留暴露面。
 - **UI**：内置 Web 界面（`resources/index.html`），含 Agent 场景面板——实时消费 WS `/scene`（全量快照 + 增量 patch 渲染）、intent 三级视觉、choice 交互回传闭环。
 
 ## 工程结构
@@ -62,14 +63,15 @@ cargo build --release --workspace
 | 4 | /message 来源限流 | RateLimiter 固定窗口（默认 30 次/10s） | `rate_limiter_blocks_burst_per_key` |
 | 5 | /message token 强制校验 | 配置 token 后回环也强制；LAN 无 token 一律 403 | 第 2 轮 API 层实测（A/B/C/D 四组） |
 | 6 | **LAN 读路径强制 token** | token 配置后所有远端请求（/events/history、SSE、/status、静态资源）必须带 Bearer；回环不受影响 | 第 4 轮真实 LAN 侧跑 10 项 + `lan_read_routes_require_token_when_configured` |
+| 7 | **token 缺失时远端全拒** | token 未配置 → 所有远端请求（LAN 读/写路径）一律 403；fail-closed 不依赖启动检查单一路径 | `lan_read_forbidden_without_token_even_when_lan_enabled` |
 
 发布前跑一遍：`cargo test --workspace` + `powershell -ExecutionPolicy Bypass -File scripts\check_lan_exposure.ps1`。
 
 ## 测试与验证状态
 
-- 全量回归：**412 通过 / 0 失败**（core 391 + app 8 + db_compat 1 + sandbox 12；第 4 轮审计后）。
-- 覆盖：意识循环接线、工具层 9 工具、沙箱 JSON-RPC、LLM 指标、幂等防重放、唤醒合并风暴（8→1）、注入面回归（元字符载荷原样传递）、LAN 暴露 fail-closed、LAN 读路径强制 token。
-- 历史基线：M1 351 → M1.5 353 → M2 357 → M3 359 → M4 361 → P1-1 371 → P1-2 374 → UI 368(定向) → R3 397 → 第 1 轮审计 407 → 第 3 轮审计 409 → **第 4 轮审计 412**，逐轮递增全绿。
+- 全量回归：**413 通过 / 0 失败**（core 392 + app 8 + db_compat 1 + sandbox 12；第 5 轮审计后）。
+- 覆盖：意识循环接线、工具层 9 工具、沙箱 JSON-RPC、LLM 指标、幂等防重放、唤醒合并风暴（8→1）、注入面回归（元字符载荷原样传递）、LAN 暴露 fail-closed、LAN 读路径强制 token、token 缺失时远端全拒。
+- 历史基线：M1 351 → M1.5 353 → M2 357 → M3 359 → M4 361 → P1-1 371 → P1-2 374 → UI 368(定向) → R3 397 → 第 1 轮审计 407 → 第 3 轮审计 409 → 第 4 轮审计 412 → **第 5 轮审计 413**，逐轮递增全绿。
 
 ## 增强历史
 
@@ -80,6 +82,7 @@ cargo build --release --workspace
 - **第 2 轮审计**：API 层四组实测矩阵全绿（token 强制校验 / 限流 429 / LAN 场景），serve 支持 `--port` 侧跑。
 - **第 3 轮审计**：LAN 暴露 fail-closed 启动检查 + 检查脚本 + 回归测试（`lan_exposure_check_*`）。
 - **第 4 轮审计**：LAN 读路径强制 token——/events/history（含 LLM 调用日志）、/events SSE、/status、静态资源远端访问必须带 token（此前可被网内裸读）；3 个回归测试 + 真实 LAN 侧跑 10 项全绿。
+- **第 5 轮审计**：token 缺失时远端全拒——删除 lan_enabled 兜底放行分支，未配 token 时任何远端请求一律 403（fail-closed 不依赖启动检查单一路径）；新增回归测试 `lan_read_forbidden_without_token_even_when_lan_enabled`。
 - **M1–M4 / P1-1 / P1-2**：详见 `SUMMARY_RUST_RECOVERY.md`。
 
 ## 许可

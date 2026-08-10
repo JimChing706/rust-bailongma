@@ -8,6 +8,8 @@
 //! - `POST /message` 专属防护（第 1 轮审计修复）：来源限流 + token 强制校验
 //! - LAN 读路径强制 token（第 4 轮审计修复）：token 配置后所有远端请求
 //!   （/events/history、/events SSE、/status、静态资源）必须携带 Bearer token，对齐 WS /scene
+//! - token 缺失时远端全拒（第 5 轮审计修复）：fail-closed 不依赖启动检查单一路径，
+//!   绕过启动检查（测试 / 嵌入调用）时 token 未配置 → 任何远端请求一律 403
 //!
 //! SSE 流：connected → 粘性事件 → 实时广播；axum KeepAlive 保活（15s 注释帧，
 //! 对齐 Node 的 `: ping\n\n`）。
@@ -36,8 +38,8 @@ use super::events::EventMsg;
 use super::routes::{self, ApiState};
 use super::security::{
     authorize_ws_upgrade_with_credential, extract_bearer, get_web_socket_credential,
-    is_allowed_origin, is_loopback_address, is_private_lan_address, normalize_remote_address,
-    timing_safe_token_equal, RateLimiter,
+    is_allowed_origin, is_loopback_address, normalize_remote_address, timing_safe_token_equal,
+    RateLimiter,
 };
 use crate::error::Result as CoreResult;
 
@@ -155,7 +157,7 @@ async fn guard_request(
         }
     }
 
-    // 2. access 校验：回环 || Bearer token || LAN 请求（对齐 hasAllowedAccess）
+    // 2. access 校验：回环 || Bearer token（对齐 hasAllowedAccess）
     let remote_addr = normalize_remote_address(&remote.ip().to_string());
     let is_loopback = is_loopback_address(&remote_addr);
     let has_token = {
@@ -173,16 +175,13 @@ async fn guard_request(
         // （含 LAN）访问 /events/history、/events SSE、/status、静态资源都
         // 必须携带有效 Bearer token（对齐 WS /scene 已强制行为）。此前仅
         // /message 与 WS 强制，事件历史（含 LLM 调用日志）可被网内裸读。
-        if !guard.token.is_empty() {
-            if !has_token {
-                return json_response(
-                    StatusCode::FORBIDDEN,
-                    json!({ "ok": false, "error": "forbidden" }),
-                );
-            }
-        } else if !(guard.lan_enabled && is_private_lan_address(&remote_addr)) {
-            // token 未配置：仅回环或已开 LAN 的私有地址（该暴露态已被启动时
-            // lan_exposure_check 拦截，此分支仅兜底测试/旧语义）
+        //
+        // 第 5 轮审计修复：token 未配置时远端一律拒绝——不再信任 lan_enabled
+        // 兜底放行。第 3 轮启动检查虽已保证「开 LAN 必须配 token」，但
+        // fail-closed 不应依赖单一路径：绕过启动检查（测试 / 嵌入调用）时，
+        // token 缺失 → 远端全拒，杜绝残留暴露面。token 为空时
+        // timing_safe_token_equal 恒为 false，故统一按 has_token 判定即可。
+        if !has_token {
             return json_response(
                 StatusCode::FORBIDDEN,
                 json!({ "ok": false, "error": "forbidden" }),
@@ -678,6 +677,32 @@ mod tests {
         assert_eq!(history.status(), StatusCode::OK, "回环 /events/history 无 token 应放行");
         let sse = router.oneshot(local_req("/events")).await.unwrap();
         assert_eq!(sse.status(), StatusCode::OK, "回环 SSE 无 token 应放行");
+    }
+
+    // ── 第 5 轮审计修复：token 缺失时远端全拒（fail-closed 兜底，不依赖启动检查）──
+
+    #[tokio::test]
+    async fn lan_read_forbidden_without_token_even_when_lan_enabled() {
+        // 构造 Guard{lan_enabled:true, token:""}——本应被第 3 轮启动检查拦截的暴露态。
+        // 即使绕过启动检查（测试 / 嵌入调用直接组装 server），LAN 读路径也必须 403，
+        // 不允许任何「LAN 裸读事件历史 / SSE / status」的残留暴露面。
+        let state = test_state();
+        let guard = Guard {
+            lan_enabled: true,
+            token: String::new(),
+            message_rate: Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
+        };
+        let server = server_with_guard(state, guard);
+        let router = server.router();
+
+        for uri in ["/status", "/events/history", "/events"] {
+            let resp = router.clone().oneshot(lan_request(uri, None)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "LAN 无 token 读 {uri}（即使 lan_enabled）应 403"
+            );
+        }
     }
 
 }
