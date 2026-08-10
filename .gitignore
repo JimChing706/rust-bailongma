@@ -28,6 +28,9 @@ _diag_*.py
 _dist/
 *.zip
 
+# 攻击验证残留（不入库）
+audit_tmp/
+
 # 系统
 Thumbs.db
 .DS_Store

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::events::{iso_now, EventBus};
+use super::security::RateLimiter;
 use crate::db::repositories::brain_ui_events;
 use crate::db::Db;
 use crate::scene::SceneStore;
@@ -191,10 +192,22 @@ pub struct ApiState {
 }
 
 /// 安全守卫配置（请求中间件 / WS 授权共享）。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Guard {
     pub lan_enabled: bool,
     pub token: String,
+    /// `POST /message` 限流器（按来源地址计数；防刷接口烧额度 / 撑爆 DB）
+    pub message_rate: Arc<RateLimiter>,
+}
+
+impl Default for Guard {
+    fn default() -> Self {
+        Self {
+            lan_enabled: false,
+            token: String::new(),
+            message_rate: Arc::new(RateLimiter::default()),
+        }
+    }
 }
 
 impl ApiState {

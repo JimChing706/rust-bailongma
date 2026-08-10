@@ -13,14 +13,17 @@
 //!         {"id":1,"ok":false,"error":"..."}
 //! ```
 //!
-//! 能力约束（对齐 RUST-ROADMAP.md §6.1）：
-//! - 路径约束：所有文件操作限定在 `root`（绝对路径，默认进程 cwd）内，防 `..` 穿越
-//! - 命令执行：超时强杀（kill 后 wait），stdout/stderr 各截断 64KB
+//! 能力约束（对齐 RUST-ROADMAP.md §6.1 + 第 1 轮审计修复）：
+//! - 路径约束：所有文件操作限定在 `root`（绝对路径，必须显式指定）内，防 `..` 穿越
+//!   与同名前缀兄弟目录穿越（组件级边界判定，非字符串前缀比较）
+//! - 命令执行：超时强杀（kill 后 wait），stdout/stderr 各截断 64KB；
+//!   白名单按命令首参数 argv[0] 精确匹配（大小写不敏感）并拒绝 shell 元字符
+//! - 读取防护：read_file 先查文件大小，超过上限拒绝而非整读截断（内存炸弹防护）
 //! - 环境清理：执行子命令时继承最小环境（PATH/TMP 等），不注入父进程敏感变量
 //! - 一次一请求：串行处理，天然防并发资源争抢
 
 use std::io::{BufRead, Read, Write};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -34,6 +37,8 @@ const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 /// read_file 默认最大读取字节
 const DEFAULT_MAX_READ_BYTES: usize = 256 * 1024;
+/// read_file 服务端硬上限（字节）：超过一律拒绝，不整读
+const MAX_READ_HARD_CAP: usize = 64 * 1024 * 1024;
 
 // ─────────────────────────────────────────────────────────────
 // 沙箱执行器
@@ -42,12 +47,20 @@ const DEFAULT_MAX_READ_BYTES: usize = 256 * 1024;
 pub struct Sandbox {
     /// 路径约束根（绝对路径）；所有文件操作必须落在其内
     pub root: PathBuf,
-    /// 命令前缀白名单（空 = 全部允许）；逐条 `starts_with` 前缀匹配
+    /// 命令白名单（空 = 全部允许）；逐条匹配命令首参数 argv[0]
     pub allow_commands: Vec<String>,
 }
 
 impl Sandbox {
     pub fn new(root: PathBuf, allow_commands: Vec<String>) -> Self {
+        // root 必须绝对化：相对 root 会让路径判定基准漂移（前缀碰撞漏洞的温床）
+        let root = if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(root)
+        };
         Self {
             root: normalize_absolute(&root),
             allow_commands,
@@ -92,11 +105,7 @@ impl Sandbox {
             return Err("参数非法: command 为空".into());
         }
         if !self.allow_commands.is_empty() {
-            let allowed = self
-                .allow_commands
-                .iter()
-                .any(|prefix| command.starts_with(prefix.as_str()));
-            if !allowed {
+            if !command_allowed(&command, &self.allow_commands) {
                 return Err(format!(
                     "命令不在白名单内: {}",
                     command.chars().take(80).collect::<String>()
@@ -223,17 +232,28 @@ impl Sandbox {
             .get("max_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_MAX_READ_BYTES as u64) as usize;
+        // 读前查大小：超过请求上限或服务端硬上限一律拒绝，不整读（内存炸弹防护）
+        let file_len = std::fs::metadata(&full)
+            .map_err(|e| format!("读取元数据失败: {e}"))?
+            .len();
+        if file_len > MAX_READ_HARD_CAP as u64 {
+            return Err(format!(
+                "文件过大（{} 字节，服务端上限 {} 字节）",
+                file_len, MAX_READ_HARD_CAP
+            ));
+        }
+        if file_len > max_bytes as u64 {
+            return Err(format!(
+                "文件过大（{} 字节，请求上限 {} 字节）",
+                file_len, max_bytes
+            ));
+        }
         let bytes = std::fs::read(&full).map_err(|e| format!("读取失败: {e}"))?;
-        let truncated = bytes.len() > max_bytes;
-        let content = if truncated {
-            String::from_utf8_lossy(&bytes[..max_bytes]).into_owned()
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
+        let content = String::from_utf8_lossy(&bytes).into_owned();
         Ok(json!({
             "content": content,
             "bytes": bytes.len(),
-            "truncated": truncated,
+            "truncated": false,
         }))
     }
 
@@ -352,18 +372,71 @@ fn normalize_absolute(path: &Path) -> PathBuf {
     out
 }
 
-/// 路径前缀比较（Windows 大小写不敏感）。
+/// 组件级边界判定：`a` 等于 `b` 或在 `b` 的完整组件序列之内。
+/// 替代旧实现的字符串 `starts_with` 前缀比较——旧实现会让 `root`
+/// 放行 `root2\...`（同名前缀兄弟目录）造成 sandbox 逃逸（第 1 轮审计实锤）。
 fn same_path_prefix(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
     {
-        let a = a.to_string_lossy().to_lowercase();
-        let b = b.to_string_lossy().to_lowercase();
-        a.starts_with(&b)
+        // Windows 统一小写后做组件级 strip_prefix（组件比较天然带分隔符边界）。
+        // 注意：小写字符串必须先绑定到 let 变量——直接内联 `Path::new(&expr)`
+        // 会让 to_string_lossy 的临时 Cow 在语句结束即被 drop（E0716 编译错误）。
+        let a_lower = a.to_string_lossy().to_lowercase();
+        let b_lower = b.to_string_lossy().to_lowercase();
+        let a = Path::new(&a_lower);
+        let b = Path::new(&b_lower);
+        a == b || a.strip_prefix(b).map(|r| !r.as_os_str().is_empty()).unwrap_or(false)
     }
     #[cfg(not(windows))]
     {
-        a.starts_with(b)
+        a == b || a.strip_prefix(b).map(|r| !r.as_os_str().is_empty()).unwrap_or(false)
     }
+}
+
+/// 命令白名单判定：argv[0]（首参数，处理引号）与白名单项精确匹配
+/// （Windows 大小写不敏感），且命令不含 shell 元字符（cmd / sh 分隔符）。
+/// 替代旧实现的字符串 `starts_with` 前缀匹配——旧实现放行
+/// `echo hi && echo BYPASS-OK` 这类 shell 链（第 1 轮审计实锤）。
+fn command_allowed(command: &str, allow_commands: &[String]) -> bool {
+    let token = first_command_token(command);
+    if token.is_empty() {
+        return false;
+    }
+    let clean = !command.contains('&')
+        && !command.contains('|')
+        && !command.contains(';')
+        && !command.contains('>')
+        && !command.contains('<')
+        && !command.contains('`')
+        && !command.contains('$')
+        && !command.contains('%')
+        && !command.contains('\n')
+        && !command.contains('\r');
+    if !clean {
+        return false;
+    }
+    allow_commands.iter().any(|a| {
+        #[cfg(windows)]
+        {
+            a.eq_ignore_ascii_case(token)
+        }
+        #[cfg(not(windows))]
+        {
+            a == token
+        }
+    })
+}
+
+/// 提取命令首参数（argv[0]；带引号时取引号内内容）。
+fn first_command_token(command: &str) -> &str {
+    let trimmed = command.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        if let Some(end) = rest.find('"') {
+            return &rest[..end];
+        }
+        return trimmed; // 未闭合引号，整体当 token
+    }
+    trimmed.split_whitespace().next().unwrap_or("")
 }
 
 /// 截断到 max 字节（UTF-8 安全：不切坏字符边界），返回 (文本, 是否截断)。
@@ -376,6 +449,45 @@ fn truncate_bytes(s: &str, max: usize) -> (String, bool) {
         end -= 1;
     }
     (s[..end].to_string(), true)
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令行参数解析（独立函数以便单测）
+// ─────────────────────────────────────────────────────────────
+
+/// 解析 CLI 参数；`--root` 缺失时返回 Err（拒绝用进程 cwd 兜底）。
+fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
+    let mut root: Option<PathBuf> = None;
+    let mut allow: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--root" => {
+                if let Some(v) = args.get(i + 1) {
+                    root = Some(PathBuf::from(v));
+                    i += 2;
+                    continue;
+                }
+                return Err("--root 缺少参数值".into());
+            }
+            "--allow" => {
+                if let Some(v) = args.get(i + 1) {
+                    allow = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .collect();
+                    i += 2;
+                    continue;
+                }
+                return Err("--allow 缺少参数值".into());
+            }
+            _ => return Err(format!("未知参数: {}", args[i])),
+        }
+    }
+    let root = root.ok_or("缺少 --root：沙箱根必须显式指定（拒绝使用进程 cwd 兜底）")?;
+    Ok((root, allow))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -432,41 +544,20 @@ fn main() {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
             "bailongma-sandbox — 工具执行沙箱子进程 (JSON-RPC over stdin/stdout)\n\
-             用法: bailongma-sandbox [--root <dir>] [--allow <prefix>[,<prefix>...]]\n\
+             用法: bailongma-sandbox --root <dir> [--allow <prefix>[,<prefix>...]]\n\
              \x20    bailongma-sandbox --self-test   # 内置冒烟测试\n\
              协议: 每行一个 JSON 请求 {{id, method, params}} → 每行一个 JSON 响应"
         );
         return;
     }
 
-    let mut root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let mut allow: Vec<String> = Vec::new();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--root" => {
-                if let Some(v) = args.get(i + 1) {
-                    root = PathBuf::from(v);
-                    i += 2;
-                    continue;
-                }
-            }
-            "--allow" => {
-                if let Some(v) = args.get(i + 1) {
-                    allow = v
-                        .split(',')
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                        .collect();
-                    i += 2;
-                    continue;
-                }
-            }
-            _ => {}
+    let (mut root, allow) = match parse_args(&args) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("bailongma-sandbox: {e}");
+            std::process::exit(2);
         }
-        i += 1;
-    }
+    };
     // root 必须绝对路径（resolve 时相对父进程 cwd）
     if root.is_relative() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -638,5 +729,64 @@ mod tests {
     fn normalize_keeps_drive_prefix() {
         let p = normalize_absolute(Path::new("c:/Users/ADMIN/../ADMIN/app/./x"));
         assert_eq!(p.to_string_lossy(), "C:\\Users\\ADMIN\\app\\x");
+    }
+
+    // ── 第 1 轮审计修复的回归测试（红转绿）──
+
+    #[test]
+    fn prefix_collision_sibling_rejected() {
+        // root=…/root 时，`..\root2\secret.txt` 落在 root 外同名前缀兄弟目录
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let root2 = dir.path().join("root2");
+        std::fs::create_dir_all(&root2).unwrap();
+        std::fs::write(root2.join("secret.txt"), "TOP-SECRET-OUTSIDE-ROOT").unwrap();
+
+        let sb = Sandbox::new(root, vec![]);
+        let r = sb.handle(&json!({ "id": 1, "method": "read_file", "params": { "path": "..\\root2\\secret.txt" } }));
+        assert_eq!(r["ok"], false, "前缀碰撞穿越应被拒: {r}");
+    }
+
+    #[test]
+    fn allowlist_rejects_shell_chaining() {
+        let dir = tempfile::tempdir().unwrap();
+        let sb = Sandbox::new(dir.path().to_path_buf(), vec!["echo".into()]);
+        // `&&` 链：白名单只放行 argv[0]=echo，后续任意命令必须被拒
+        let chain = sb.handle(&json!({ "id": 1, "method": "exec", "params": { "command": "echo hi && echo BYPASS-OK" } }));
+        assert_eq!(chain["ok"], false, "白名单应拒绝 shell 链: {chain}");
+        // 普通白名单命令仍放行
+        let plain = sb.handle(&json!({ "id": 2, "method": "exec", "params": { "command": "echo allowed" } }));
+        assert_eq!(plain["ok"], true, "白名单普通命令: {plain}");
+        // 大小写不敏感（Windows 命令语义）
+        let case = sb.handle(&json!({ "id": 3, "method": "exec", "params": { "command": "ECHO hi" } }));
+        assert_eq!(case["ok"], true, "大小写不敏感: {case}");
+    }
+
+    #[test]
+    fn read_file_rejects_oversized() {
+        let (sb, d) = test_sandbox();
+        std::fs::write(d.path().join("big.bin"), vec![0u8; 1024 * 1024]).unwrap();
+        let r = sb.handle(&json!({ "id": 1, "method": "read_file", "params": { "path": "big.bin", "max_bytes": 1024 } }));
+        assert_eq!(r["ok"], false, "超大文件应拒绝而非整读截断: {r}");
+    }
+
+    #[test]
+    fn parse_args_requires_root() {
+        // 无 --root 时拒绝启动（不再默认进程 cwd 作沙箱根）
+        let args = vec!["bailongma-sandbox.exe".to_string(), "--allow".to_string(), "echo".to_string()];
+        assert!(
+            parse_args(&args).is_err(),
+            "缺少 --root 应拒绝启动: {args:?}"
+        );
+        // 显式 --root 正常
+        let args2 = vec![
+            "bailongma-sandbox.exe".to_string(),
+            "--root".to_string(),
+            "C:\\tmp\\sandbox".to_string(),
+        ];
+        let (root, allow) = parse_args(&args2).unwrap();
+        assert_eq!(root, PathBuf::from("C:\\tmp\\sandbox"));
+        assert!(allow.is_empty());
     }
 }

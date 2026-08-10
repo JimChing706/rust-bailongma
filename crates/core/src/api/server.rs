@@ -5,12 +5,14 @@
 //! - 路由挂载：`POST /message`、`GET /events`（SSE）、`GET /events/history`、`GET /status`
 //! - WebSocket `/scene`：授权（authorize_ws_upgrade_with_credential）后建立连接
 //! - 启动时补发粘性事件（agent_name_updated，对齐 api.js）
+//! - `POST /message` 专属防护（第 1 轮审计修复）：来源限流 + token 强制校验
 //!
 //! SSE 流：connected → 粘性事件 → 实时广播；axum KeepAlive 保活（15s 注释帧，
 //! 对齐 Node 的 `: ping\n\n`）。
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::connect_info::ConnectInfo;
@@ -33,7 +35,7 @@ use super::routes::{self, ApiState};
 use super::security::{
     authorize_ws_upgrade_with_credential, extract_bearer, get_web_socket_credential,
     is_allowed_origin, is_loopback_address, is_private_lan_address, normalize_remote_address,
-    timing_safe_token_equal,
+    timing_safe_token_equal, RateLimiter,
 };
 use crate::error::Result as CoreResult;
 
@@ -56,6 +58,7 @@ impl ApiServer {
         let guard = routes::Guard {
             lan_enabled,
             token: token.unwrap_or_default().trim().to_string(),
+            message_rate: Arc::new(RateLimiter::default()),
         };
         let state = state.with_guard(guard);
         // 启动时补发 agent_name 粘性事件（对齐 api.js 307-310 行）
@@ -126,7 +129,7 @@ impl ApiServer {
 // 安全中间件（对齐 api.js 的请求守卫）
 // ─────────────────────────────────────────────────────────────
 
-/// 请求守卫：origin 校验 → access 校验 → CORS → OPTIONS。
+/// 请求守卫：origin 校验 → access 校验 → /message 专属防护 → CORS → OPTIONS。
 async fn guard_request(
     State(state): State<ApiState>,
     ConnectInfo(remote): ConnectInfo<SocketAddr>,
@@ -169,6 +172,33 @@ async fn guard_request(
             StatusCode::FORBIDDEN,
             json!({ "ok": false, "error": "forbidden" }),
         );
+    }
+
+    // 2.5 POST /message 专属防护（第 1 轮审计修复）：
+    // - 无论来源，先按来源地址限流（防刷接口烧额度 / 撑爆 DB）
+    // - token 已配置 → 强制校验（回环来源也不例外，堵死本机任意进程免 token 驱动）
+    // - token 未配置 → 仅回环来源可用（LAN 即使 lan_enabled 也拒绝 /message）
+    let is_message = req.method() == Method::POST && req.uri().path() == "/message";
+    if is_message {
+        if !guard.message_rate.allow(&remote_addr) {
+            return json_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({ "ok": false, "error": "rate limited" }),
+            );
+        }
+        if !guard.token.is_empty() {
+            if !has_token {
+                return json_response(
+                    StatusCode::FORBIDDEN,
+                    json!({ "ok": false, "error": "forbidden" }),
+                );
+            }
+        } else if !is_loopback {
+            return json_response(
+                StatusCode::FORBIDDEN,
+                json!({ "ok": false, "error": "forbidden" }),
+            );
+        }
     }
 
     // 3. CORS 响应头 + OPTIONS（对齐 setCorsHeaders + OPTIONS 204）
@@ -320,6 +350,7 @@ pub fn test_server(state: ApiState) -> ApiServer {
 #[cfg(test)]
 mod tests {
     use super::super::events::EventBus;
+    use super::super::routes::Guard;
     use super::*;
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
@@ -403,6 +434,127 @@ mod tests {
         let frames: Vec<&str> = text.split("\n\n").collect();
         assert!(frames.iter().any(|f| f.contains("\"type\":\"connected\"")));
         assert!(frames.iter().any(|f| f.contains("boot.wav")));
+    }
+
+    // ── 第 1 轮审计修复的回归测试（红转绿）──
+
+    /// 构造带自定义 Guard 的 server（覆盖 ApiServer::new 的默认守卫）。
+    fn server_with_guard(state: ApiState, guard: Guard) -> ApiServer {
+        let mut server = ApiServer::new(state, guard.lan_enabled, Some(guard.token.clone()));
+        server.state = server.state.with_guard(guard);
+        server
+    }
+
+    fn post_message_req() -> HttpRequest<Body> {
+        local_req_with(
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/message")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"content":"hello"}"#))
+                .unwrap(),
+        )
+    }
+
+    fn post_message_req_auth(token: &str) -> HttpRequest<Body> {
+        local_req_with(
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/message")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(r#"{"content":"hello"}"#))
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn message_requires_token_when_configured() {
+        // 配置 token 后，回环来源也必须带 token（堵死「本机任意进程免 token 驱动 LLM 工具循环」）
+        let state = test_state();
+        let guard = Guard {
+            lan_enabled: false,
+            token: "secret".into(),
+            message_rate: Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
+        };
+        let server = server_with_guard(state, guard);
+        let router = server.router();
+
+        let no_token = router
+            .clone()
+            .oneshot(post_message_req())
+            .await
+            .unwrap();
+        assert_eq!(
+            no_token.status(),
+            StatusCode::FORBIDDEN,
+            "配置 token 后无 token 的 /message 应被拒"
+        );
+
+        let with_token = router
+            .oneshot(post_message_req_auth("secret"))
+            .await
+            .unwrap();
+        assert_eq!(with_token.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn message_rejects_lan_without_token() {
+        // lan_enabled 时，LAN 来源无 token 的 /message 必须被拒（堵死「网内设备免 token 直通」）
+        let state = test_state();
+        let guard = Guard {
+            lan_enabled: true,
+            token: String::new(),
+            message_rate: Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
+        };
+        let server = server_with_guard(state, guard);
+        let router = server.router();
+
+        let mut req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/message")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"content":"hello"}"#))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 5], 9999))));
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "LAN 来源无 token 的 /message 应被拒"
+        );
+    }
+
+    #[tokio::test]
+    async fn message_rate_limited_after_burst() {
+        // 同来源窗口内超过上限 → 429（防刷接口烧额度 / 撑爆 DB）
+        let state = test_state();
+        let guard = Guard {
+            lan_enabled: false,
+            token: String::new(),
+            message_rate: Arc::new(RateLimiter::new(Duration::from_secs(60), 3)),
+        };
+        let server = server_with_guard(state, guard);
+        let router = server.router();
+
+        for _ in 0..3 {
+            let resp = router
+                .clone()
+                .oneshot(post_message_req())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "窗口内前 3 条应放行");
+        }
+        let blocked = router
+            .oneshot(post_message_req())
+            .await
+            .unwrap();
+        assert_eq!(
+            blocked.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "窗口内第 4 条应 429"
+        );
     }
 
     /// 构造带 loopback ConnectInfo 的本地请求（模拟本机访问）。

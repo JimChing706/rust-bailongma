@@ -6,7 +6,7 @@
 //! | 工具 | 能力 |
 //! |---|---|
 //! | `get_timestamp` | 当前时间（iso / unix / human） |
-//! | `read_file` | 读文件（root 约束 + 字节上限） |
+//! | `read_file` | 读文件（root 约束 + 字节上限 + 读前查大小） |
 //! | `write_file` | 写文件（root 约束 + 大小上限） |
 //! | `list_dir` | 列目录（root 约束） |
 //! | `make_dir` | 建目录（root 约束） |
@@ -16,7 +16,8 @@
 //! | `send_message` | 消息投递（注入回调；未接线返回明确错误） |
 //!
 //! 安全边界：文件工具全部经 [`resolve_under_root`] 约束在 `root` 内，
-//! `..` 越界与绝对路径越界一律拒绝（对齐 sandbox crate 的路径策略）。
+//! `..` 越界、绝对路径越界与同名前缀兄弟目录越界一律拒绝
+//! （对齐 sandbox crate 的路径策略）。
 
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
@@ -45,6 +46,8 @@ const MAX_CMD_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 /// 读文件默认上限（字节）
 const DEFAULT_MAX_READ_BYTES: usize = 256 * 1024;
+/// 读文件服务端硬上限（字节）：超过一律拒绝，不整读（内存炸弹防护）
+const MAX_READ_HARD_CAP: usize = 64 * 1024 * 1024;
 /// 记忆检索默认条数
 const DEFAULT_MEMORY_LIMIT: u32 = 10;
 
@@ -130,19 +133,30 @@ impl NativeToolExecutor {
             .get("max_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_MAX_READ_BYTES as u64) as usize;
+        // 读前查大小：超过请求上限或服务端硬上限一律拒绝，不整读（内存炸弹防护）
+        let file_len = std::fs::metadata(&full)
+            .map_err(|e| CoreError::Tool(format!("读取元数据失败: {e}")))?
+            .len();
+        if file_len > MAX_READ_HARD_CAP as u64 {
+            return Err(CoreError::Tool(format!(
+                "文件过大（{} 字节，服务端上限 {} 字节）",
+                file_len, MAX_READ_HARD_CAP
+            )));
+        }
+        if file_len > max_bytes as u64 {
+            return Err(CoreError::Tool(format!(
+                "文件过大（{} 字节，请求上限 {} 字节）",
+                file_len, max_bytes
+            )));
+        }
         let bytes = std::fs::read(&full).map_err(|e| CoreError::Tool(format!("读取失败: {e}")))?;
-        let truncated = bytes.len() > max_bytes;
-        let content = if truncated {
-            String::from_utf8_lossy(&bytes[..max_bytes]).into_owned()
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
-        };
+        let content = String::from_utf8_lossy(&bytes).into_owned();
         Ok(json!({
             "ok": true,
             "path": path,
             "content": content,
             "bytes": bytes.len(),
-            "truncated": truncated,
+            "truncated": false,
         }))
     }
 
@@ -556,16 +570,24 @@ fn normalize_absolute(path: &Path) -> PathBuf {
     out
 }
 
+/// 组件级边界判定：`a` 等于 `b` 或在 `b` 的完整组件序列之内。
+/// 替代旧实现的字符串 `starts_with` 前缀比较——旧实现会让 `root`
+/// 放行 `root2\...`（同名前缀兄弟目录）造成 sandbox 逃逸（第 1 轮审计实锤）。
 fn path_prefix_within(a: &Path, b: &Path) -> bool {
     #[cfg(windows)]
     {
-        let a = a.to_string_lossy().to_lowercase();
-        let b = b.to_string_lossy().to_lowercase();
-        a.starts_with(&b)
+        // Windows 统一小写后做组件级 strip_prefix（组件比较天然带分隔符边界）。
+        // 注意：小写字符串必须先绑定到 let 变量——直接内联 `Path::new(&expr)`
+        // 会让 to_string_lossy 的临时 Cow 在语句结束即被 drop（E0716 编译错误）。
+        let a_lower = a.to_string_lossy().to_lowercase();
+        let b_lower = b.to_string_lossy().to_lowercase();
+        let a = Path::new(&a_lower);
+        let b = Path::new(&b_lower);
+        a == b || a.strip_prefix(b).map(|r| !r.as_os_str().is_empty()).unwrap_or(false)
     }
     #[cfg(not(windows))]
     {
-        a.starts_with(b)
+        a == b || a.strip_prefix(b).map(|r| !r.as_os_str().is_empty()).unwrap_or(false)
     }
 }
 
@@ -780,5 +802,34 @@ mod tests {
             .with_send_message(Arc::new(|_, _| Ok("ok".into())));
         assert!(ex2.is_ready("search_memory"));
         assert!(ex2.is_ready("send_message"));
+    }
+
+    // ── 第 1 轮审计修复的回归测试（红转绿）──
+
+    #[test]
+    fn prefix_collision_sibling_rejected() {
+        // root=…/root 时，`..\root2\secret.txt` 落在 root 外同名前缀兄弟目录
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let root2 = dir.path().join("root2");
+        std::fs::create_dir_all(&root2).unwrap();
+        std::fs::write(root2.join("secret.txt"), "TOP-SECRET-OUTSIDE-ROOT").unwrap();
+
+        let ex = executor(&root);
+        let r = ex.execute("read_file", &json!({ "path": "..\\root2\\secret.txt" }));
+        assert!(r.is_err(), "前缀碰撞穿越应被拒: {r:?}");
+    }
+
+    #[test]
+    fn read_file_rejects_oversized_before_reading() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("big.bin"), vec![0u8; 1024 * 1024]).unwrap();
+        let ex = executor(dir.path());
+        let r = ex.execute(
+            "read_file",
+            &json!({ "path": "big.bin", "max_bytes": 1024 }),
+        );
+        assert!(r.is_err(), "超大文件应拒绝而非整读截断: {r:?}");
     }
 }

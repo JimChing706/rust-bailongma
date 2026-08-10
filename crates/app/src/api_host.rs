@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -86,12 +86,21 @@ fn locate_sandbox_bin() -> Option<PathBuf> {
     None
 }
 
+/// 工具沙箱根：user_dir 下显式 sandbox 目录（第 1 轮审计修复——
+/// 不再用 serve 进程 cwd 兜底，避免「从哪启动根就是哪」的隐式逃逸面）。
+fn sandbox_root(user_dir: &Path) -> PathBuf {
+    let dir = user_dir.join("sandbox");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 /// R3 意识闭环：入站消息 → 归属/注入/落库 → LLM 工具循环 → 回复落库 + 广播。
 async fn run_conscious_turn(
     db: Db,
     bus: EventBus,
     state: Arc<Mutex<RuntimeState>>,
     cfg: Config,
+    tool_root: PathBuf,
     sandbox_bin: Option<PathBuf>,
     msg: InboundMessage,
     conversation_id: i64,
@@ -186,7 +195,7 @@ async fn run_conscious_turn(
         );
         Ok("delivered".into())
     });
-    let mut executor = NativeToolExecutor::new(cfg_dir())
+    let mut executor = NativeToolExecutor::new(tool_root)
         .with_db(db.clone())
         .with_send_message(send_message);
     if let Some(bin) = sandbox_bin {
@@ -280,11 +289,6 @@ async fn run_conscious_turn(
     }
 }
 
-/// 工具沙箱根：当前工作目录（与 Node 版 capabilities cwd 语义一致）。
-fn cfg_dir() -> PathBuf {
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-}
-
 pub async fn run_api_server() -> Result<()> {
     if let Err(e) = init_logging(&LogConfig::default()) {
         eprintln!("[fatal] 日志初始化失败: {e}");
@@ -321,6 +325,9 @@ pub async fn run_api_server() -> Result<()> {
     let inbound_bus = bus.clone();
     let inbound_state = state.clone();
     let inbound_cfg = cfg.clone();
+    // 工具沙箱根：user_dir/sandbox（显式目录，不再用进程 cwd）
+    let tool_root = sandbox_root(&user_dir);
+    tracing::info!("[R3] 工具沙箱根: {}", tool_root.display());
     let sandbox_bin = locate_sandbox_bin();
     if let Some(bin) = &sandbox_bin {
         tracing::info!("[R3] sandbox 子进程: {}", bin.display());
@@ -349,9 +356,10 @@ pub async fn run_api_server() -> Result<()> {
         let bus = inbound_bus.clone();
         let state = inbound_state.clone();
         let cfg = inbound_cfg.clone();
+        let tool_root = tool_root.clone();
         let sandbox_bin = sandbox_bin.clone();
         tokio::spawn(async move {
-            run_conscious_turn(db, bus, state, cfg, sandbox_bin, msg, conversation_id).await;
+            run_conscious_turn(db, bus, state, cfg, tool_root, sandbox_bin, msg, conversation_id).await;
         });
 
         Some(InboundQueued { conversation_id })
@@ -374,6 +382,14 @@ pub async fn run_api_server() -> Result<()> {
         status,
     );
     let token = std::env::var("BAILONGMA_API_TOKEN").ok();
+    if token.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        tracing::warn!(
+            "[API] BAILONGMA_API_TOKEN 未配置：/message 仅允许回环来源并受限流保护；\
+             推荐配置 token 以启用局域网安全访问"
+        );
+    } else {
+        tracing::info!("[API] BAILONGMA_API_TOKEN 已配置：/message 强制 token 校验");
+    }
     let lan = cfg.allow_lan_access();
     let server = ApiServer::new(state, lan, token);
 

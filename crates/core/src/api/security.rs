@@ -4,6 +4,7 @@
 //! - loopback / 私有 LAN 地址判定（含 IPv4-mapped `::ffff:` 剥离）
 //! - 常量时间 token 比较（Bearer header / `?token=` / WS `sec-websocket-protocol` base64url）
 //! - HTTP origin 与 WebSocket upgrade 授权
+//! - `/message` 来源限流（固定窗口，防刷接口烧额度 / 撑爆 DB）
 
 /// WS 公共子协议名（对齐 WS_PUBLIC_PROTOCOL）
 pub const WS_PUBLIC_PROTOCOL: &str = "bailongma.v1";
@@ -219,6 +220,49 @@ pub fn authorize_ws_upgrade_with_credential(
     }
 }
 
+/// 固定窗口限流器（按来源键独立计数；滑动窗口清理过期）。
+///
+/// 第 1 轮审计修复：`POST /message` 无速率限制，本机任意进程/网内设备
+/// 可刷接口烧 API 额度、撑爆 DB。接入 guard 后按来源地址限流。
+#[derive(Debug)]
+pub struct RateLimiter {
+    inner: std::sync::Mutex<std::collections::HashMap<String, Vec<std::time::Instant>>>,
+    window: std::time::Duration,
+    max: usize,
+}
+
+impl RateLimiter {
+    pub fn new(window: std::time::Duration, max: usize) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+            window,
+            max,
+        }
+    }
+
+    /// 尝试放行；窗口内已达上限返回 false。
+    pub fn allow(&self, key: &str) -> bool {
+        let now = std::time::Instant::now();
+        let mut m = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let v = m.entry(key.to_string()).or_default();
+        v.retain(|t| now.duration_since(*t) < self.window);
+        if v.len() >= self.max {
+            return false;
+        }
+        v.push(now);
+        true
+    }
+}
+
+impl Default for RateLimiter {
+    fn default() -> Self {
+        Self::new(std::time::Duration::from_secs(10), 30)
+    }
+}
+
 /// 取 URL 的 hostname（简单解析，不引入 URL crate）。
 fn url_hostname(origin: &str) -> Result<String, ()> {
     let s = origin.trim();
@@ -424,5 +468,15 @@ mod tests {
         assert_eq!(url_hostname("https://[::1]:8080").unwrap(), "[::1]");
         assert_eq!(url_hostname("http://192.168.1.5").unwrap(), "192.168.1.5");
         assert!(url_hostname("").is_err());
+    }
+
+    #[test]
+    fn rate_limiter_blocks_burst_per_key() {
+        let rl = RateLimiter::new(std::time::Duration::from_secs(60), 3);
+        assert!(rl.allow("a"));
+        assert!(rl.allow("a"));
+        assert!(rl.allow("a"));
+        assert!(!rl.allow("a"), "同一来源窗口内第 4 次应被拒");
+        assert!(rl.allow("b"), "不同来源独立计数");
     }
 }
