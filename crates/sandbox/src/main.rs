@@ -151,6 +151,25 @@ impl Sandbox {
             .spawn()
             .map_err(|e| format!("命令启动失败: {e}"))?;
 
+        // 立即用读线程排空 stdout/stderr：进程运行期间不读管道的话，
+        // 输出超过 pipe 缓冲时子进程写阻塞，与父进程互相等待 → 超时死锁。
+        let out_handle = {
+            let mut o = child.stdout.take().expect("stdout 管道缺失");
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = o.read_to_end(&mut buf);
+                buf
+            })
+        };
+        let err_handle = {
+            let mut e = child.stderr.take().expect("stderr 管道缺失");
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = e.read_to_end(&mut buf);
+                buf
+            })
+        };
+
         let deadline = start + Duration::from_millis(timeout_ms);
         let mut timed_out = false;
         loop {
@@ -177,24 +196,8 @@ impl Sandbox {
             }
         }
 
-        let stdout = child
-            .stdout
-            .take()
-            .map(|mut o| {
-                let mut buf = Vec::new();
-                let _ = o.read_to_end(&mut buf);
-                buf
-            })
-            .unwrap_or_default();
-        let stderr = child
-            .stderr
-            .take()
-            .map(|mut o| {
-                let mut buf = Vec::new();
-                let _ = o.read_to_end(&mut buf);
-                buf
-            })
-            .unwrap_or_default();
+        let stdout = out_handle.join().unwrap_or_default();
+        let stderr = err_handle.join().unwrap_or_default();
 
         let stdout_str = String::from_utf8_lossy(&stdout);
         let stderr_str = String::from_utf8_lossy(&stderr);
@@ -324,6 +327,19 @@ impl Sandbox {
                 self.root.display(),
                 path.display()
             ));
+        }
+        // 双保险：词法判定通过后，若路径已存在，再解析符号链接/junction，
+        // 验证真实落点仍在 root 内（词法判定不解析链接 → junction 逃逸）。
+        if let Ok(canon) = std::fs::canonicalize(&normalized) {
+            let canon_root = std::fs::canonicalize(&self.root)
+                .unwrap_or_else(|_| self.root.clone());
+            if !same_path_prefix(&canon, &canon_root) {
+                return Err(format!(
+                    "路径越界（链接解析后，沙箱根 {}）: {}",
+                    self.root.display(),
+                    path.display()
+                ));
+            }
         }
         Ok(normalized)
     }
