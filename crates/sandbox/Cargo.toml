@@ -1,0 +1,18 @@
+[package]
+name = "bailongma-sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bailongma 工具执行沙箱子进程。R1 实现：JSON-RPC over stdin/stdout，路径约束 + 命令白名单 + 超时强杀 + 输出截断。"
+
+[[bin]]
+name = "bailongma-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

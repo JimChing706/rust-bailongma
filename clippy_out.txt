@@ -1,0 +1,147 @@
+﻿cargo :     Checking bailongma-core v0.1.0 (D:\PFiles\Bailongma\bailongma-rust\crates\core)
+所在位置 行:1 字符: 1
++ cargo clippy --workspace --all-targets --all-features -- -D warnings  ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking ba...st\crates\core):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+error: this function has too many arguments (8/7)
+   --> crates\core\src\llm\caller.rs:126:1
+    |
+126 | / pub fn build_chat_completion_request(
+127 | |     provider: &str,
+128 | |     model: &str,
+129 | |     messages: Vec<ChatMessage>,
+...   |
+134 | |     tools: &[Value],
+135 | | ) -> ChatCompletionRequest {
+    | |__________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#too_many_argum
+ents
+    = note: `-D clippy::too-many-arguments` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::too_many_arguments)]`
+
+error: this block may be rewritten with the `?` operator
+   --> crates\core\src\llm\caller.rs:267:29
+    |
+267 | / ...                   if let Err(e) = handle_data(
+268 | | ...                       &payload,
+269 | | ...                       &mut result,
+270 | | ...                       &mut tool_calls_map,
+...   |
+275 | | ...                       return Err(e);
+276 | | ...                   }
+    | |_______________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#question_mark
+    = note: `-D clippy::question-mark` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::question_mark)]`
+help: replace it with
+    |
+267 ~                             handle_data(
+268 +                                 &payload,
+269 +                                 &mut result,
+270 +                                 &mut tool_calls_map,
+271 +                                 &mut think_state,
+272 +                                 &mut text_stream_started,
+273 +                                 ctx,
+274 +                             )?
+    |
+
+error: this block may be rewritten with the `?` operator
+   --> crates\core\src\llm\caller.rs:303:13
+    |
+303 | /             if let Err(e) = handle_data(
+304 | |                 &payload,
+305 | |                 &mut result,
+306 | |                 &mut tool_calls_map,
+...   |
+311 | |                 return Err(e);
+312 | |             }
+    | |_____________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#question_mark
+help: replace it with
+    |
+303 ~             handle_data(
+304 +                 &payload,
+305 +                 &mut result,
+306 +                 &mut tool_calls_map,
+307 +                 &mut think_state,
+308 +                 &mut text_stream_started,
+309 +                 ctx,
+310 +             )?
+    |
+
+error: the loop variable `attempt` is used to index `BACKOFFS_MS`
+  --> crates\core\src\llm\retry.rs:85:20
+   |
+85 |     for attempt in 0..MAX_ATTEMPTS {
+   |                    ^^^^^^^^^^^^^^^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#needless_range_
+loop
+   = note: `-D clippy::needless-range-loop` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::needless_range_loop)]`
+help: consider using an iterator and enumerate()
+   |
+85 -     for attempt in 0..MAX_ATTEMPTS {
+85 +     for (attempt, <item>) in BACKOFFS_MS.iter().enumerate().take(MAX_ATTEMPTS) {
+   |
+
+error: this function has too many arguments (8/7)
+   --> crates\core\src\llm\tool_loop.rs:309:1
+    |
+309 | / pub async fn call_llm(
+310 | |     client: &Client,
+311 | |     cfg: &LlmConfig,
+312 | |     stream: &StreamFn,
+...   |
+317 | |     limits: &ToolLoopLimits,
+318 | | ) -> Result<LlmCallResult> {
+    | |__________________________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#too_many_argum
+ents
+
+error: needlessly taken reference of both operands
+   --> crates\core\src\llm\types.rs:273:12
+    |
+273 |         if &pending[start..] == &TAG[..l] {
+    |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#op_ref
+    = note: `-D clippy::op-ref` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::op_ref)]`
+help: use the values directly
+    |
+273 -         if &pending[start..] == &TAG[..l] {
+273 +         if pending[start..] == TAG[..l] {
+    |
+
+error: could not compile `bailongma-core` (lib) due to 6 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: unnecessary use of `to_string`
+   --> crates\core\src\llm\tool_loop.rs:639:27
+    |
+639 |         st.record_outcome(&"other:{}".to_string(), "ok");
+    |                           ^^^^^^^^^^^^^^^^^^^^^^^ help: use: `"other:{}"`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#unnecessary_to
+_owned
+    = note: `-D clippy::unnecessary-to-owned` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::unnecessary_to_owned)]`
+
+error: equality checks against false can be replaced by a negation
+   --> crates\core\src\llm\types.rs:443:17
+    |
+443 |         assert!(s.think_done == false);
+    |                 ^^^^^^^^^^^^^^^^^^^^^ help: try: `!s.think_done`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.94.0/index.html#bool_compariso
+n
+    = note: `-D clippy::bool-comparison` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::bool_comparison)]`
+
+error: could not compile `bailongma-core` (lib test) due to 8 previous errors

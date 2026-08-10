@@ -1,0 +1,29 @@
+# Rust
+/target
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# 本地数据（运行时生成，绝不入库）
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+logs/
+portable.flag
+
+# 前端（M8 阶段）
+node_modules/
+ui/dist/
+
+# 测试/构建日志（本地验证产物，不入库）
+*.log
+*.pdb
+_diag_*.py
+
+# 系统
+Thumbs.db
+.DS_Store

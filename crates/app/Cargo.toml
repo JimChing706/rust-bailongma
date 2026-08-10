@@ -1,0 +1,56 @@
+[package]
+name = "bailongma-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bailongma desktop shell (Tauri). M0 阶段为最小骨架，M7 接入完整窗口/托盘。"
+
+[[bin]]
+name = "bailongma"
+path = "src/main.rs"
+
+# M2 里程碑验证：命令行 TUI 对话（真实 config + DeepSeek 一轮带工具对话）
+[[bin]]
+name = "chat"
+path = "src/bin/chat.rs"
+
+# M3 里程碑验证：启动 API 服务器（HTTP/SSE/WS，127.0.0.1:3721）
+[[bin]]
+name = "serve"
+path = "src/bin/serve.rs"
+
+# 本地 Agent 扫描验证：探测 → 写库 → 读回（对齐 Node collectAgents）
+[[bin]]
+name = "scan_agents"
+path = "src/bin/scan_agents.rs"
+
+[dependencies]
+bailongma-core = { path = "../core" }
+tokio.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+reqwest.workspace = true
+
+# 桌面壳（bailongma bin）可选：wry/tao 在 Linux 上会拉入 GTK/webkit2gtk
+# 全家依赖，而 serve/chat/scan_agents 用不到——默认不启用，桌面构建时
+# 使用 `--features desktop`。
+[features]
+default = []
+desktop = ["wry", "tao", "tray-icon"]
+
+[dependencies.wry]
+version = "0.56"
+optional = true
+
+[dependencies.tao]
+version = "0.36"
+optional = true
+
+[dependencies.tray-icon]
+version = "0.24"
+optional = true
+
+# M7 引入：tauri = { version = "2", features = [] }, tauri-plugin-updater = "2"

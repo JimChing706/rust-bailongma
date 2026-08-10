@@ -1,0 +1,54 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/app",
+    "crates/sandbox",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.94"
+
+[workspace.dependencies]
+# 核心运行时
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "query", "tokio"] }
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+thiserror = "2"
+
+# 网络
+# default-features=false：reqwest 默认的 default-tls（native-tls）在 Linux 上
+# 拉入 openssl-sys/libssl-dev；统一走 rustls（纯 Rust TLS，跨平台零系统依赖）。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2", "charset"] }
+futures-util = "0.3"
+tokio-stream = "0.1"
+
+# 数据库
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
+
+# 通用工具
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+once_cell = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+anyhow = "1"
+base64 = "0.22"
+
+# 测试
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.26"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
