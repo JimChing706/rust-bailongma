@@ -49,6 +49,7 @@ pub mod policy;
 pub mod runtime;
 pub mod scene;
 pub mod tools;
+pub mod trace;
 pub mod turn;
 pub mod wakeup;
 

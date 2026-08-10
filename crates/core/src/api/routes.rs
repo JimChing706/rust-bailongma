@@ -255,6 +255,42 @@ pub struct ApprovalBody {
     pub decision: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct TraceQuery {
+    #[serde(default)]
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub tool: Option<String>,
+}
+
+/// GET /trace —— 工具调用轨迹查询（Phase 2 可观测性）。
+pub async fn get_trace(
+    Query(q): Query<TraceQuery>,
+) -> (StatusCode, Json<Value>) {
+    let limit = q.limit.unwrap_or(50).min(500);
+    let tool = q.tool.unwrap_or_default();
+    let traces = crate::trace::global().recent(limit, &tool);
+    let items: Vec<Value> = traces
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "ts_ms": t.ts_ms,
+                "tool": t.tool,
+                "stage": t.stage,
+                "decision": t.decision,
+                "detail": t.detail,
+                "duration_ms": t.duration_ms,
+                "ok": t.ok,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "ok": true, "count": items.len(), "traces": items })),
+    )
+}
+
 pub async fn post_approval(
     State(state): State<ApiState>,
     Json(body): Json<ApprovalBody>,

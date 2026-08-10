@@ -248,7 +248,7 @@ impl NativeToolExecutor {
     }
 
     fn exec_command(&self, args: &Value) -> Result<Value> {
-        let command = args
+        let mut command = args
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or("")
@@ -262,11 +262,13 @@ impl NativeToolExecutor {
             let preview: String = command.chars().take(120).collect();
             let detail = String::from("exec_command: ") + preview.as_str();
             let decision = gate.guard_tool_call("exec_command", detail.as_str());
-            if let Err(e) = decision.as_ref() {
-                return Err(CoreError::Other(e.to_string()));
-            }
-            if let Ok(GuardResult::Denied(r)) = decision.as_ref() {
-                return Err(CoreError::Tool(String::from("exec_command 被拒绝: ") + r.as_str()));
+            match decision {
+                Ok(GuardResult::Proceed) => {}
+                Ok(GuardResult::Modified(new_cmd)) => command = new_cmd,
+                Ok(GuardResult::Denied(r)) => {
+                    return Err(CoreError::Tool(String::from("exec_command 被拒绝: ") + r.as_str()));
+                }
+                Err(e) => return Err(CoreError::Other(e.to_string())),
             }
         }
 
@@ -284,7 +286,17 @@ impl NativeToolExecutor {
 
         // 委托 sandbox 子进程（如果配置了）
         if let Some(bin) = &self.sandbox_bin {
-            return self.exec_via_sandbox(bin, &command, &cwd, timeout_ms);
+            let t0 = Instant::now();
+            let r = self.exec_via_sandbox(bin, &command, &cwd, timeout_ms);
+            crate::trace::global().record(
+                "exec_command",
+                "execute",
+                if r.is_ok() { "ok" } else { "err" },
+                "",
+                t0.elapsed().as_millis() as u64,
+                r.is_ok(),
+            );
+            return r;
         }
 
         // 直接执行（Windows cmd /C，Unix sh -c）
@@ -347,6 +359,15 @@ impl NativeToolExecutor {
             .flatten()
             .map(|s| s.code().unwrap_or(-1))
             .unwrap_or(-1);
+
+        crate::trace::global().record(
+            "exec_command",
+            "execute",
+            if timed_out { "timeout" } else { "ok" },
+            "",
+            start.elapsed().as_millis() as u64,
+            !timed_out,
+        );
 
         Ok(json!({
             "ok": true,

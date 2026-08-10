@@ -36,18 +36,20 @@ pub enum ApprovalChoice {
     AllowSession,
     /// 拒绝
     Deny,
-    /// 修改参数后重试（Phase 2 实现，当前按拒绝返回）
+    /// 修改参数后放行（Phase 2 闭环：执行端以新参数替换原参数执行）
     Modify(String),
 }
 
 impl ApprovalChoice {
-    /// 从 HTTP 表单值解析（未知值视为改参意图）。
+    /// 从 HTTP 表单值解析（未知值 fail-closed 按拒绝处理，仅显式 modify:<参数> 前缀触发改参）。
     pub fn parse(s: &str) -> Self {
         match s {
             "allow_once" => Self::AllowOnce,
             "allow_session" => Self::AllowSession,
             "deny" => Self::Deny,
-            other => Self::Modify(other.to_string()),
+            // Phase 2：显式 modify:<参数> 前缀；未知值 fail-closed 按拒绝处理
+            _ if s.starts_with("modify:") => Self::Modify(s["modify:".len()..].to_string()),
+            _ => Self::Deny,
         }
     }
 
@@ -77,6 +79,8 @@ pub enum GuardResult {
     Proceed,
     /// 拒绝（reason 给调用方回显）
     Denied(String),
+    /// 用户改参后放行（携带修改后的参数，执行端替换原参数执行）
+    Modified(String),
 }
 
 struct GateInner {
@@ -127,12 +131,14 @@ impl ApprovalGate {
 
     /// 工具调用守卫：Allow → Proceed；RequireApproval → 挂起等用户抉择；
     /// Deny / 未知工具 / 超时 → Denied。
-    pub fn guard_tool_call(&self, tool: &str, _detail: &str) -> Result<GuardResult> {
+    pub fn guard_tool_call(&self, tool: &str, detail: &str) -> Result<GuardResult> {
         let session_ok = self.inner.lock().unwrap().session_approved.contains(tool);
         let decision = {
             let mut inner = self.inner.lock().unwrap();
             inner.policy.check_tool_call(tool, session_ok)
         };
+        let guard_summary = decision.summary();
+        crate::trace::global().record(tool, "guard", &guard_summary, detail, 0, true);
         match decision {
             PolicyDecision::Allow => Ok(GuardResult::Proceed),
             PolicyDecision::Deny(r) => Ok(GuardResult::Denied(r)),
@@ -163,9 +169,7 @@ impl ApprovalGate {
                         GuardResult::Proceed
                     }
                     Ok(ApprovalChoice::Deny) => GuardResult::Denied("用户拒绝该操作".into()),
-                    Ok(ApprovalChoice::Modify(_)) => {
-                        GuardResult::Denied("改参执行暂未支持（Phase 2 落地）".into())
-                    }
+                    Ok(ApprovalChoice::Modify(p)) => GuardResult::Modified(p),
                     Err(RecvTimeoutError::Timeout) => {
                         GuardResult::Denied("等待用户确认超时（120s），按拒绝处理".into())
                     }
@@ -173,6 +177,13 @@ impl ApprovalGate {
                         GuardResult::Denied("审批通道已断开".into())
                     }
                 };
+                let approval_ms = now_ms().saturating_sub(req.created_ms);
+                let (adec, adetail, aok) = match &outcome {
+                    GuardResult::Proceed => ("approved", "", true),
+                    GuardResult::Modified(p) => ("modify", p.as_str(), true),
+                    GuardResult::Denied(r) => ("denied", r.as_str(), false),
+                };
+                crate::trace::global().record(tool, "approval", adec, adetail, approval_ms, aok);
                 // 清理挂起条目（无论结果）
                 self.inner.lock().unwrap().pending.remove(&req.id);
                 Ok(outcome)
@@ -331,6 +342,31 @@ mod tests {
     }
 
     #[test]
+    fn modify_returns_modified_with_new_params() {
+        let g = gate();
+        let g2 = g.clone();
+        let handle = thread::spawn(move || {
+            g2.guard_tool_call("exec_command", "dir").unwrap()
+        });
+        let id = wait_pending(&g);
+        g.submit(&id, "modify:dir /b").unwrap();
+        assert_eq!(
+            handle.join().unwrap(),
+            GuardResult::Modified("dir /b".to_string())
+        );
+        assert_eq!(g.pending_count(), 0);
+    }
+
+    #[test]
+    fn parse_unknown_value_fails_closed_to_deny() {
+        assert_eq!(ApprovalChoice::parse("allows"), ApprovalChoice::Deny);
+        assert_eq!(
+            ApprovalChoice::parse("modify:echo hi"),
+            ApprovalChoice::Modify("echo hi".to_string())
+        );
+    }
+
+    #[test]
     fn allow_session_persists_for_same_tool() {
         let g = gate();
         let g2 = g.clone();
@@ -368,10 +404,8 @@ mod tests {
     fn choice_parse_roundtrip() {
         assert_eq!(ApprovalChoice::parse("allow_once"), ApprovalChoice::AllowOnce);
         assert_eq!(ApprovalChoice::parse("deny"), ApprovalChoice::Deny);
-        assert_eq!(
-            ApprovalChoice::parse("anything_else"),
-            ApprovalChoice::Modify("anything_else".into())
-        );
+        // Phase 2：未知值 fail-closed 按拒绝处理（原兜底会静默变成改参意图）
+        assert_eq!(ApprovalChoice::parse("anything_else"), ApprovalChoice::Deny);
     }
 
     #[test]

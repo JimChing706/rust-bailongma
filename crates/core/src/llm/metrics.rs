@@ -134,6 +134,7 @@ impl MetricsCollector {
 #[derive(Clone)]
 pub struct FlusherHandle {
     tx: mpsc::UnboundedSender<FlushCmd>,
+    #[allow(dead_code)] // 预留：shutdown 完整等待用（当前只发命令不 await，进程退出最多丢最后 30s）
     join: Arc<JoinHandle<()>>,
 }
 

@@ -118,6 +118,7 @@ impl ApiServer {
             .route("/status", get(routes::get_status))
             .route("/scene", get(handle_scene_ws))
             .route("/approval", post(routes::post_approval))
+        .route("/trace", get(routes::get_trace))
             // 静态资源 fallback（对齐 handleStaticRoutes：API 未匹配时尝试页面/资产）
             .fallback(move |req: Request| async move {
                 match super::static_assets::handle_static(&req, &resources, needs_activation) {
