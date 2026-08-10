@@ -263,6 +263,30 @@ impl Default for RateLimiter {
     }
 }
 
+/// 第 3 轮审计检查项：LAN 暴露 fail-closed 启动检查。
+///
+/// 背景：运行中的桌面实例（Node 版 Bailongma.exe）曾以 `0.0.0.0:3721` 监听
+/// 且未配置 token——网内任意设备可直接访问其 `/message`（旧版无 token 强制
+/// 校验，不受 Rust 修复保护）。
+///
+/// Rust 版 serve 启动时强制执行：`network.allowLanAccess=true` 必须同时配置
+/// `BAILONGMA_API_TOKEN`，否则拒绝启动（fail-closed）。不允许「开 LAN 但
+/// 不设 token」的暴露态存在；只监听回环（allowLanAccess=false）时无 token 可放行。
+///
+/// 返回 `Ok(())` = 检查通过；`Err(message)` = 检查不通过（含修复指引）。
+pub fn lan_exposure_check(lan_enabled: bool, token_configured: bool) -> Result<(), String> {
+    if lan_enabled && !token_configured {
+        return Err(
+            "LAN 暴露检查未通过：network.allowLanAccess=true 但未配置 BAILONGMA_API_TOKEN。\
+             开启局域网访问必须配置 token，否则拒绝启动（fail-closed）。\
+             修复：设置环境变量 BAILONGMA_API_TOKEN=<强随机值> 后重启，\
+             或关闭 allowLanAccess（仅回环 127.0.0.1 监听，网内不可达）。"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// 取 URL 的 hostname（简单解析，不引入 URL crate）。
 fn url_hostname(origin: &str) -> Result<String, ()> {
     let s = origin.trim();
@@ -478,5 +502,27 @@ mod tests {
         assert!(rl.allow("a"));
         assert!(!rl.allow("a"), "同一来源窗口内第 4 次应被拒");
         assert!(rl.allow("b"), "不同来源独立计数");
+    }
+
+    // ── 第 3 轮审计检查项：LAN 暴露 fail-closed ──
+
+    #[test]
+    fn lan_exposure_check_fail_closed() {
+        // 开 LAN + 无 token → 拒绝启动（fail-closed，即「LAN 暴露」必须被拦截）
+        assert!(lan_exposure_check(true, false).is_err());
+        // 开 LAN + 有 token → 放行
+        assert!(lan_exposure_check(true, true).is_ok());
+        // 关 LAN（仅回环 127.0.0.1）→ 无 token 也放行
+        assert!(lan_exposure_check(false, false).is_ok());
+        assert!(lan_exposure_check(false, true).is_ok());
+    }
+
+    #[test]
+    fn lan_exposure_check_error_is_actionable() {
+        let err = lan_exposure_check(true, false).unwrap_err();
+        // 错误信息必须给出可执行修复路径（token 或改绑回环）
+        assert!(err.contains("BAILONGMA_API_TOKEN"));
+        assert!(err.contains("127.0.0.1"));
+        assert!(err.contains("allowLanAccess"));
     }
 }

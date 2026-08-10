@@ -294,6 +294,8 @@ pub async fn run_api_server() -> Result<()> {
 }
 
 /// 第 2 轮审计验证：支持自定义端口侧跑（不与运行中的桌面实例冲突）。
+/// 第 3 轮审计验证：启动时强制执行 LAN 暴露 fail-closed 检查——
+/// `network.allowLanAccess=true` 必须配置 `BAILONGMA_API_TOKEN`，否则拒绝启动。
 pub async fn run_api_server_on(port: u16) -> Result<()> {
     if let Err(e) = init_logging(&LogConfig::default()) {
         eprintln!("[fatal] 日志初始化失败: {e}");
@@ -302,6 +304,16 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
 
     let user_dir = resolve_user_dir()?;
     let cfg = load_config(&user_dir)?;
+
+    // ── 第 3 轮审计检查项：LAN 暴露 fail-closed ──
+    // 运行中桌面实例曾以 0.0.0.0:3721 监听且无 token（网内任意设备可直连 /message）。
+    // 现在：开 LAN 必须配 token，否则启动即失败；仅回环（未开 LAN）不受影响。
+    let token = std::env::var("BAILONGMA_API_TOKEN").ok();
+    let token_configured = !token.as_deref().map(str::trim).unwrap_or("").is_empty();
+    let lan = cfg.allow_lan_access();
+    bailongma_core::api::security::lan_exposure_check(lan, token_configured)
+        .map_err(CoreError::Api)?;
+
     let db_path = user_dir.join("data").join("jarvis.db");
     tracing::info!("数据库: {}", db_path.display());
     let db = Db::open(&db_path)?;
@@ -386,16 +398,14 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
         Arc::new(move || agent_name.clone()),
         status,
     );
-    let token = std::env::var("BAILONGMA_API_TOKEN").ok();
-    if token.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        tracing::warn!(
-            "[API] BAILONGMA_API_TOKEN 未配置：/message 仅允许回环来源并受限流保护；\
-             推荐配置 token 以启用局域网安全访问"
-        );
-    } else {
+    if token_configured {
         tracing::info!("[API] BAILONGMA_API_TOKEN 已配置：/message 强制 token 校验");
+    } else {
+        tracing::warn!(
+            "[API] BAILONGMA_API_TOKEN 未配置：仅回环监听（127.0.0.1）+ 限流保护；\
+             如需局域网访问请配置 token 后重启"
+        );
     }
-    let lan = cfg.allow_lan_access();
     let server = ApiServer::new(state, lan, token);
 
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
