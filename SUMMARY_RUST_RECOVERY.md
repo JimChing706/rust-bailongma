@@ -165,6 +165,18 @@
 - **P2-3 收尾打包**：全量回归 **504 passed / 0 failed**（core 466 + api_e2e 8 + db_compat 1 + sandbox 12 + escape 17）；release 构建 5 个产物（bailongma / serve / bailongma-sandbox / chat / scan_agents）打包至 `_dist/bin` + `_dist/bailongma-rust-20260810.zip`（12.1MB）。
 - ✅ 至此 Phase 2 整体收官（提交 `a1ef95a` 起，含 Modify 闭环 fail-closed + trace 可观测性）。
 
+## P3-2 模型路由（2026-08-10，commit `aadce19`）
+
+- `LlmConfig` 新增 `fast_model` 字段 + `route_model(scenario)`：后台低强度场景（tick/wakeup/startup）优先走 fast_model（如 deepseek-chat），交互/工具循环走主模型；fast_model 未配置时回退主模型。
+- `Config` 新增 `fast_model` 配置项；`api_host.rs` / `chat.rs` 接线交互轮显式路由主模型。
+- 新增 route_model 测试（含无 fast_model 回退路径）。
+
+## P3-3 token 预算闸门（2026-08-10，commit `64d25ee`）
+
+- `WeeklyReport` 新增 `avg_tokens_per_call()`——cost/turn 环比观测指标（周报验收口径）。
+- `token_budget_gate(db, days, budget)`：基于 `llm_metrics_daily` 周聚合**全量** tokens（所有 stage）判断 Allow/Blocked；`budget <= 0` 关闭闸门纯观测（默认安全形态），与 P1-1 wakeup 专用闸门互补。
+- 新增 3 条测试：预算内放行（含剩余额度）/ 超预算拦截 / 0 预算关闭。
+
 ## P3-1 缓存友好化（2026-08-10）
 
 - `injector_format.rs`：`format_context_block` 双区渲染——稳定段（self-evolution/self-perception/constraints/active-policies/person/user-profile/task/thread/threads-background/task-knowledge）前置，变动段（self-snapshot/temporal/memories/directions/extra）后置。prompt 前缀多轮稳定 → provider prompt cache 命中率提升。新增 `NODE_CONTEXT_ORDER`（Node 对齐基线，对照用）与 `CACHE_FRIENDLY_ORDER` 常量。
