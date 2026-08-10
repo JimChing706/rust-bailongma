@@ -24,6 +24,10 @@ ui/dist/
 *.pdb
 _diag_*.py
 
+# 发行打包产物（不入库）
+_dist/
+*.zip
+
 # 系统
 Thumbs.db
 .DS_Store
