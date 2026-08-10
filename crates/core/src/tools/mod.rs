@@ -1,7 +1,7 @@
 //! 工具能力层（R2 真实实现）——替代 M2 阶段仅存在于测试里的 demo 执行器。
 //!
 //! [`NativeToolExecutor`] 实现 [`crate::llm::tool_loop::ToolExecutor`]，供 LLM
-//! 工具循环调用，落地 9 个真实工具：
+//! 工具循环调用，落地真实工具：
 //!
 //! | 工具 | 能力 |
 //! |---|---|
@@ -14,6 +14,8 @@
 //! | `exec_command` | 执行命令（超时强杀 + 输出截断；可委托 sandbox 子进程） |
 //! | `search_memory` | 记忆检索（FTS5 关键词 + 日期窗口，注入 Db） |
 //! | `send_message` | 消息投递（注入回调；未接线返回明确错误） |
+//! | `collect_agents` | 列出已知 Agent（known_agents 表；tools/extra.rs） |
+//! | `remind` | 查询到期提醒（reminders 表；tools/extra.rs） |
 //!
 //! 安全边界：文件工具全部经 [`resolve_under_root`] 约束在 `root` 内，
 //! `..` 越界、绝对路径越界与同名前缀兄弟目录越界一律拒绝
@@ -33,6 +35,8 @@ use crate::llm::tool_loop::ToolExecutor;
 use crate::llm::tools::{
     enum_param, integer_param, string_param, ToolSchema,
 };
+
+pub mod extra;
 
 // ─────────────────────────────────────────────────────────────
 // 常量
@@ -98,7 +102,7 @@ impl NativeToolExecutor {
     /// 工具是否已接线（供上层决定是否把工具暴露给 LLM）。
     pub fn is_ready(&self, name: &str) -> bool {
         match name {
-            "search_memory" => self.db.is_some(),
+            "search_memory" | "collect_agents" | "remind" => self.db.is_some(),
             "send_message" => self.send_message.is_some(),
             _ => true,
         }
@@ -467,6 +471,8 @@ impl ToolExecutor for NativeToolExecutor {
             "exec_command" => self.exec_command(args)?,
             "search_memory" => self.search_memory(args)?,
             "send_message" => self.send_message_impl(args)?,
+            "collect_agents" => extra::collect_agents_impl(self, args)?,
+            "remind" => extra::remind_impl(self, args)?,
             other => return Err(CoreError::Tool(format!("未知工具: {other}"))),
         };
         Ok(result.to_string())
@@ -479,7 +485,7 @@ impl ToolExecutor for NativeToolExecutor {
 
 /// 全部内置工具 schema（供 LLM 工具循环注册）。
 pub fn all_tool_schemas() -> Vec<ToolSchema> {
-    vec![
+    let mut tools = vec![
         ToolSchema::new("get_timestamp", "获取当前时间（iso / unix / human 三种格式）")
             .param("format", enum_param("时间格式", &["iso", "unix", "human"])),
         ToolSchema::new("read_file", "读取文件内容（限定在沙箱根目录内；max_bytes 控制读取上限）")
@@ -504,7 +510,9 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
         ToolSchema::new("send_message", "向指定对象发送消息（投递最终回复给用户）")
             .required("target_id", string_param("接收方 ID，如 ID:000001"))
             .required("content", string_param("消息正文")),
-    ]
+    ];
+    tools.extend(extra::extra_tool_schemas());
+    tools
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -558,7 +566,7 @@ fn normalize_absolute(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
         match comp {
-            Component::RootDir => out.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::RootDir => out.push(std::env::MAIN_SEPARATOR.to_string()),
             Component::CurDir => {}
             Component::ParentDir => {
                 out.pop();
@@ -779,6 +787,8 @@ mod tests {
             "exec_command",
             "search_memory",
             "send_message",
+            "collect_agents",
+            "remind",
         ] {
             assert!(names.contains(&tool), "缺少 schema: {tool}");
         }
@@ -796,12 +806,16 @@ mod tests {
         let ex = executor(dir.path());
         assert!(!ex.is_ready("search_memory"));
         assert!(!ex.is_ready("send_message"));
+        assert!(!ex.is_ready("collect_agents"));
+        assert!(!ex.is_ready("remind"));
         assert!(ex.is_ready("exec_command"));
         let ex2 = executor(dir.path())
             .with_db(Db::open(dir.path().join("t2.db")).unwrap())
             .with_send_message(Arc::new(|_, _| Ok("ok".into())));
         assert!(ex2.is_ready("search_memory"));
         assert!(ex2.is_ready("send_message"));
+        assert!(ex2.is_ready("collect_agents"));
+        assert!(ex2.is_ready("remind"));
     }
 
     // ── 第 1 轮审计修复的回归测试（红转绿）──
