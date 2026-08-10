@@ -15,7 +15,8 @@ use crate::error::Result;
 
 /// 业务表清单（不含 sqlite_sequence 与 memories_fts 的 4 张内部影子表）。
 /// 与 Node 版 schema.js 最终状态一致：24 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 29；
-/// M1 新增 3 张 LLM 指标表 → 27 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 32。
+/// M1 新增 3 张 LLM 指标表 → 27 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 32；
+/// P1 新增 turn_state（显式 Turn 状态机）→ 30 张业务表。
 pub const BUSINESS_TABLES: &[&str] = &[
     "conversations",
     "memories",
@@ -46,6 +47,7 @@ pub const BUSINESS_TABLES: &[&str] = &[
     "llm_metrics_daily",
     "llm_context_sections",
     "llm_turns",
+    "turn_state",
 ];
 
 /// 检查某表是否已存在指定列。
@@ -647,6 +649,30 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           calls         INTEGER NOT NULL DEFAULT 0,
           created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
         );
+
+        -- Phase 1：显式 Turn 状态机（turn_state 表）。
+        -- 每个 user/tick turn 占一行，状态全程落库；启动时扫描未终态按 recover_policy 恢复。
+        -- idempotency_key 部分唯一：同一逻辑轮重试复用同一行，防重复执行。
+        CREATE TABLE IF NOT EXISTS turn_state (
+          turn_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+          state           TEXT    NOT NULL DEFAULT 'received',
+          round           INTEGER NOT NULL DEFAULT 0,
+          attempt         INTEGER NOT NULL DEFAULT 1,
+          idempotency_key TEXT    NOT NULL DEFAULT '',
+          conversation_id INTEGER,
+          channel         TEXT    NOT NULL DEFAULT '',
+          from_id         TEXT    NOT NULL DEFAULT '',
+          input_snapshot  TEXT    NOT NULL DEFAULT '',
+          trace_id        TEXT    NOT NULL DEFAULT '',
+          last_error      TEXT    NOT NULL DEFAULT '',
+          recover_policy  TEXT    NOT NULL DEFAULT 'retry',
+          started_at      TEXT    NOT NULL,
+          updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+          finished_at     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_turn_state_state ON turn_state(state);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_state_idem
+          ON turn_state(idempotency_key) WHERE idempotency_key != '';
         "#,
     )?;
 
@@ -807,6 +833,29 @@ mod tests {
             .unwrap();
         assert_eq!(idx_count, 1, "llm_calls.request_id 唯一索引缺失");
 
+        // Phase 1：turn_state 关键列 + 状态索引
+        for col in [
+            "turn_id",
+            "state",
+            "round",
+            "attempt",
+            "idempotency_key",
+            "recover_policy",
+            "started_at",
+            "finished_at",
+        ] {
+            assert!(
+                has_column(&conn, "turn_state", col).unwrap(),
+                "缺列 turn_state.{col}"
+            );
+        }
+        let state_idx: i64 = conn
+            .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_turn_state_state'")
+            .unwrap()
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        assert_eq!(state_idx, 1, "turn_state.state 索引缺失");
+
         // 触发器存在
         for trig in ["memories_ai", "memories_au", "memories_ad"] {
             let count: i64 = conn
@@ -828,7 +877,7 @@ mod tests {
             .unwrap()
             .query_row([], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 30); // 29 业务表 + sqlite_sequence（M3 新增 llm_context_sections / llm_turns）
+        assert_eq!(count, 31); // 30 业务表 + sqlite_sequence（P1 新增 turn_state）
     }
 
     #[test]

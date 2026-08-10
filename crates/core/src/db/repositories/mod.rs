@@ -10,4 +10,5 @@ pub mod llm_metrics;
 pub mod memories;
 pub mod reminders;
 pub mod threads;
+pub mod turn_state;
 pub mod ui_signals;

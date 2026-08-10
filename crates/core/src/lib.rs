@@ -27,6 +27,8 @@
 //! `embedding` 提供 `Embedder` 抽象（当前 NoopEmbedder → FTS5-only 完整路径）。
 //!
 //! R2 落地：`tools::NativeToolExecutor` 真实工具层（9 个工具）已接入工具循环。
+//!
+//! P1 落地：`turn` 显式状态机（状态集/转移/恢复决策）+ `turn_state` 表仓库。
 
 pub mod agents;
 pub mod api;
@@ -40,6 +42,7 @@ pub mod memory;
 pub mod runtime;
 pub mod scene;
 pub mod tools;
+pub mod turn;
 pub mod wakeup;
 
 // ── M2+ 模块占位（规划中，避免编译期空目录问题） ──
