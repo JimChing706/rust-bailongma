@@ -7,6 +7,7 @@ pub mod brain_ui_events;
 pub mod config;
 pub mod conversations;
 pub mod llm_metrics;
+pub mod matters;
 pub mod memories;
 pub mod reminders;
 pub mod threads;

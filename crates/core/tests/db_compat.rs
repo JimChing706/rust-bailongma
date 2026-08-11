@@ -4,9 +4,10 @@
 //! 不修改用户数据）。开发机存在真实 DB 时全量断言；CI/其他环境
 //! 无此文件则自动跳过。
 //!
-//! 契约更新：打开老库会幂等新增 6 张表——M1 的 3 张 LLM 指标表
+//! 契约更新：打开老库会幂等新增 7 张表——M1 的 3 张 LLM 指标表
 //! （llm_calls / llm_tool_calls / llm_metrics_daily）+ M3 的 2 张观测表
-//! （llm_context_sections / llm_turns）+ P1 的 turn_state（显式 Turn 状态机）。
+//! （llm_context_sections / llm_turns）+ P1 的 turn_state（显式 Turn 状态机）
+//! + 事项账本 matters（PHILOSOPHY_MULTI_AGENT_MATTER 落地）。
 //! 除此之外零数据改动——这正是"观测层不碰用户数据"的承诺边界。
 
 use bailongma_core::db::open_database;
@@ -22,6 +23,9 @@ const NEW_M3_TABLES: &[&str] = &["llm_context_sections", "llm_turns"];
 
 /// P1 新增的 1 张状态机表（显式 Turn 状态机数据层）。
 const NEW_P1_TABLES: &[&str] = &["turn_state"];
+
+/// 事项账本（多Agent事项哲学落地：差距/验收/三主体分离/四种死法）。
+const NEW_MATTERS_TABLES: &[&str] = &["matters"];
 
 fn row_count(conn: &rusqlite::Connection, table: &str) -> i64 {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -81,13 +85,14 @@ fn real_db_copy_opens_without_data_loss() {
             |r| r.get(0),
         )
         .unwrap();
-    let new_tables = NEW_M1_TABLES.len() + NEW_M3_TABLES.len() + NEW_P1_TABLES.len();
+    let new_tables =
+        NEW_M1_TABLES.len() + NEW_M3_TABLES.len() + NEW_P1_TABLES.len() + NEW_MATTERS_TABLES.len();
     assert_eq!(
         tables,
         src_tables + new_tables as i64,
-        "表数量变化：打开老库应恰好新增观测表（M1 3 张 + M3 2 张 + P1 1 张）"
+        "表数量变化：打开老库应恰好新增观测表（M1 3 张 + M3 2 张 + P1 1 张 + matters 1 张）"
     );
-    assert_eq!(tables, 35);
+    assert_eq!(tables, 36);
     for name in NEW_M1_TABLES {
         let exists: i64 = conn
             .query_row(
@@ -117,6 +122,16 @@ fn real_db_copy_opens_without_data_loss() {
             )
             .unwrap();
         assert_eq!(exists, 1, "P1 新增表 {name} 应存在");
+    }
+    for name in NEW_MATTERS_TABLES {
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "事项账本新增表 {name} 应存在");
     }
 
     // 4.5 M3：llm_calls.stage 补列幂等

@@ -16,7 +16,7 @@ use crate::error::Result;
 /// 业务表清单（不含 sqlite_sequence 与 memories_fts 的 4 张内部影子表）。
 /// 与 Node 版 schema.js 最终状态一致：24 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 29；
 /// M1 新增 3 张 LLM 指标表 → 27 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 32；
-/// P1 新增 turn_state（显式 Turn 状态机）→ 30 张业务表。
+/// P1 新增 turn_state（显式 Turn 状态机）→ 30 张业务表；事项账本 matters → 31 张。
 pub const BUSINESS_TABLES: &[&str] = &[
     "conversations",
     "memories",
@@ -48,6 +48,7 @@ pub const BUSINESS_TABLES: &[&str] = &[
     "llm_context_sections",
     "llm_turns",
     "turn_state",
+    "matters",
 ];
 
 /// 检查某表是否已存在指定列。
@@ -673,6 +674,32 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_turn_state_state ON turn_state(state);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_state_idem
           ON turn_state(idempotency_key) WHERE idempotency_key != '';
+
+        -- 多Agent事项账本（PHILOSOPHY_MULTI_AGENT_MATTER.md 落地）：
+        -- 事项=差距（期望态 vs 当前态）+ 验收标准（verifiable，无验收只是愿望）；
+        -- 发起/执行/验证三主体分离（verifier_id != executor_id）；四种死法登记 death_reason；
+        -- parent_id 支持分解（子事项可独立验证才可拆）。
+        CREATE TABLE IF NOT EXISTS matters (
+          id           INTEGER PRIMARY KEY AUTOINCREMENT,
+          title        TEXT    NOT NULL,
+          expectation  TEXT    NOT NULL,
+          current_state TEXT   NOT NULL DEFAULT '',
+          gap_desc     TEXT    NOT NULL DEFAULT '',
+          acceptance_criteria TEXT NOT NULL DEFAULT '',
+          status       TEXT    NOT NULL DEFAULT 'open',
+          creator_id   TEXT    NOT NULL DEFAULT '',
+          executor_id  TEXT,
+          verifier_id  TEXT,
+          parent_id    INTEGER,
+          evidence     TEXT    NOT NULL DEFAULT '',
+          death_reason TEXT    NOT NULL DEFAULT '',
+          started_at   TEXT,
+          finished_at  TEXT,
+          created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+          updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_matters_status ON matters(status);
+        CREATE INDEX IF NOT EXISTS idx_matters_parent ON matters(parent_id);
         "#,
     )?;
 
@@ -877,7 +904,7 @@ mod tests {
             .unwrap()
             .query_row([], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 31); // 30 业务表 + sqlite_sequence（P1 新增 turn_state）
+        assert_eq!(count, 32); // 31 业务表 + sqlite_sequence（事项账本 matters 加入）
     }
 
     #[test]

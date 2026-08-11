@@ -45,6 +45,7 @@ pub mod evolution;
 pub mod error;
 pub mod llm;
 pub mod logging;
+pub mod matter;
 pub mod memory;
 pub mod policy;
 pub mod runtime;

@@ -64,6 +64,10 @@ pub enum CoreError {
     UnsupportedPlatform(String),
     #[error("无效输入: {0}")]
     InvalidInput(String),
+    #[error("校验失败: {0}")]
+    Validation(String),
+    #[error("未找到: {0}")]
+    NotFound(String),
     #[error("其他错误: {0}")]
     Other(String),
 }
