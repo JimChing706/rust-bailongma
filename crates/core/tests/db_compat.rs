@@ -7,7 +7,7 @@
 //! 契约更新：打开老库会幂等新增 7 张表——M1 的 3 张 LLM 指标表
 //! （llm_calls / llm_tool_calls / llm_metrics_daily）+ M3 的 2 张观测表
 //! （llm_context_sections / llm_turns）+ P1 的 turn_state（显式 Turn 状态机）
-//! + 事项账本 matters（PHILOSOPHY_MULTI_AGENT_MATTER 落地）。
+//! + 事项账本 matters / matter_events（PHILOSOPHY_MULTI_AGENT_MATTER 落地）。
 //! 除此之外零数据改动——这正是"观测层不碰用户数据"的承诺边界。
 
 use bailongma_core::db::open_database;
@@ -25,7 +25,7 @@ const NEW_M3_TABLES: &[&str] = &["llm_context_sections", "llm_turns"];
 const NEW_P1_TABLES: &[&str] = &["turn_state"];
 
 /// 事项账本（多Agent事项哲学落地：差距/验收/三主体分离/四种死法）。
-const NEW_MATTERS_TABLES: &[&str] = &["matters"];
+const NEW_MATTERS_TABLES: &[&str] = &["matters", "matter_events"];
 
 fn row_count(conn: &rusqlite::Connection, table: &str) -> i64 {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
@@ -77,7 +77,7 @@ fn real_db_copy_opens_without_data_loss() {
         "memories 行数被改动"
     );
 
-    // 4. 表结构变化仅限观测层（M1 的 3 张 + M3 的 2 张 + P1 的 turn_state = 6 张）
+    // 4. 表结构变化仅限观测层（M1 的 3 张 + M3 的 2 张 + P1 的 turn_state + 事项账本 2 张 = 8 张）
     let tables: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'",
@@ -90,9 +90,9 @@ fn real_db_copy_opens_without_data_loss() {
     assert_eq!(
         tables,
         src_tables + new_tables as i64,
-        "表数量变化：打开老库应恰好新增观测表（M1 3 张 + M3 2 张 + P1 1 张 + matters 1 张）"
+        "表数量变化：打开老库应恰好新增观测表（M1 3 张 + M3 2 张 + P1 1 张 + matters/matter_events 2 张）"
     );
-    assert_eq!(tables, 36);
+    assert_eq!(tables, 37);
     for name in NEW_M1_TABLES {
         let exists: i64 = conn
             .query_row(

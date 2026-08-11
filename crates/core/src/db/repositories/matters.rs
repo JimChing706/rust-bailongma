@@ -45,6 +45,8 @@ pub struct MatterRow {
     pub additivity_decl: String,
     /// 命题2/3：信号台账（JSON 数组 [{ts,kind,detail}]）
     pub signals: String,
+    /// 命题4/7：执行者自证标记（verifier 缺省=执行者时完成 → true，可信等级降级）
+    pub self_verified: bool,
 }
 
 /// 投影列清单（get / scan_active / list_children 共用，顺序与 row_from 一一对应）。
@@ -53,7 +55,7 @@ const MATTER_COLS: &str = "id, title, expectation, current_state, gap_desc, acce
         death_reason, started_at, finished_at, created_at, updated_at,
         delegation_choose, delegation_path, delegation_execute,
         delegation_verify, delegation_terminate,
-        intent_original, additivity_decl, signals";
+        intent_original, additivity_decl, signals, self_verified";
 
 /// 新建事项（status='open'）。返回 id。
 /// 业务校验（验收标准非空、验证者≠执行者、子项可加性声明）由 `crate::matter::create` 完成，本函数只落库。
@@ -186,6 +188,75 @@ pub fn set_signals(db: &Db, id: i64, signals: &str) -> Result<()> {
     Ok(())
 }
 
+/// 执行者自证标记落库（命题4/7）：self_verified=true 表示验证者缺省为执行者。
+pub fn set_self_verified(db: &Db, id: i64, v: bool) -> Result<()> {
+    let conn = db.conn();
+    conn.execute(
+        "UPDATE matters SET self_verified = ?2, updated_at = datetime('now') WHERE id = ?1",
+        rusqlite::params![id, v as i64],
+    )?;
+    Ok(())
+}
+
+/// matter_events 事件行映射（四态死亡 + 状态转移留痕，命题4/7）。
+#[derive(Debug, Clone)]
+pub struct MatterEvent {
+    pub id: i64,
+    pub matter_id: i64,
+    pub event_type: String,
+    pub from_status: String,
+    pub to_status: String,
+    pub reason: String,
+    pub actor: String,
+    pub created_at: String,
+}
+
+/// 追加一条事件流水（completed/cancelled/shelved/expired/状态转移等）。
+pub fn insert_event(
+    db: &Db,
+    matter_id: i64,
+    event_type: &str,
+    from_status: &str,
+    to_status: &str,
+    reason: &str,
+    actor: &str,
+) -> Result<()> {
+    let conn = db.conn();
+    conn.execute(
+        "INSERT INTO matter_events
+           (matter_id, event_type, from_status, to_status, reason, actor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![matter_id, event_type, from_status, to_status, reason, actor],
+    )?;
+    Ok(())
+}
+
+/// 取某事项的全部事件流水（按 id 升序）。
+pub fn list_events(db: &Db, matter_id: i64) -> Result<Vec<MatterEvent>> {
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT id, matter_id, event_type, from_status, to_status, reason, actor, created_at
+         FROM matter_events WHERE matter_id = ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([matter_id], |r| {
+        Ok(MatterEvent {
+            id: r.get(0)?,
+            matter_id: r.get(1)?,
+            event_type: r.get(2)?,
+            from_status: r.get(3)?,
+            to_status: r.get(4)?,
+            reason: r.get(5)?,
+            actor: r.get(6)?,
+            created_at: r.get(7)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
+}
+
 /// SQLite 当前 UTC 时间（"YYYY-MM-DD HH:MM:SS"），供信号台账打时间戳。
 pub fn now_utc(db: &Db) -> Result<String> {
     let conn = db.conn();
@@ -253,6 +324,7 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<MatterRow> {
         intent_original: r.get(22)?,
         additivity_decl: r.get(23)?,
         signals: r.get(24)?,
+        self_verified: r.get(25)?,
     })
 }
 

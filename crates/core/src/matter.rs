@@ -191,6 +191,16 @@ pub struct DriftVerdict {
     pub report: String,
 }
 
+/// 幽灵事项候选（命题7 兜底）：挂起无主 + 超时无进展 + 无验收判据。
+/// 只出信号不自动终止；终止/搁置由人类决策。
+#[derive(Debug)]
+pub struct GhostCandidate {
+    pub id: i64,
+    pub title: String,
+    pub updated_at: String,
+    pub reason: String,
+}
+
 /// 创建事项（规则：验收标准非空、验证者≠执行者、子项必须带可加性声明）。返回新事项 id。
 #[allow(clippy::too_many_arguments)]
 pub fn create(
@@ -281,7 +291,16 @@ pub fn decision_allowed(db: &Db, id: i64, actor: &str, point: DecisionPoint) -> 
         DecisionPoint::Choose => is_exec && dm.choose,
         DecisionPoint::Path => is_exec && dm.path,
         DecisionPoint::Execute => is_exec && dm.execute,
-        DecisionPoint::Verify => is_ver && dm.verify,
+        DecisionPoint::Verify => {
+            if is_ver && dm.verify {
+                true
+            } else if is_exec && dm.verify && row.verifier_id.is_none() {
+                // 命题4/7：未登记独立验证者时，verify 委托给执行者 = 允许自证完成（降级）
+                true
+            } else {
+                false
+            }
+        }
         DecisionPoint::Terminate => (is_exec || is_ver) && dm.terminate,
     };
     Ok(ok)
@@ -299,7 +318,7 @@ fn require_allowed(db: &Db, id: i64, actor: &str, point: DecisionPoint) -> Resul
 
 /// 开始执行：open → in_progress（登记 started_at）。需 execute 决策点授权。
 pub fn start(db: &Db, id: i64, actor: &str) -> Result<()> {
-    transition(db, id, MatterStatus::InProgress, |_| {
+    transition(db, id, MatterStatus::InProgress, actor, |_| {
         require_allowed(db, id, actor, DecisionPoint::Execute)?;
         crate::db::repositories::matters::mark_started(db, id)
     })
@@ -313,7 +332,7 @@ pub fn submit_evidence(db: &Db, id: i64, actor: &str, evidence: &str) -> Result<
             "提交验证必须附证据（evidence），否则只是语言承诺".into(),
         ));
     }
-    transition(db, id, MatterStatus::AwaitingVerification, |_| {
+    transition(db, id, MatterStatus::AwaitingVerification, actor, |_| {
         require_allowed(db, id, actor, DecisionPoint::Execute)?;
         crate::db::repositories::matters::set_evidence(db, id, evidence)
     })
@@ -326,32 +345,56 @@ pub fn verify(db: &Db, id: i64, actor: &str) -> Result<()> {
     let row = crate::db::repositories::matters::get(db, id)?
         .ok_or_else(|| crate::error::CoreError::NotFound(format!("事项不存在: {id}")))?;
 
-    let registered = row
-        .verifier_id
-        .ok_or_else(|| crate::error::CoreError::Validation("事项未登记验证者".into()))?;
-    if registered != actor {
-        return Err(crate::error::CoreError::Validation(format!(
-            "验证者必须是登记的 {registered}，实际是 {actor}"
-        )));
-    }
-    if let Some(exec) = &row.executor_id {
-        if exec == actor {
-            return Err(crate::error::CoreError::Validation(
-                "验证者不能同时是执行者（三主体分离）".into(),
-            ));
+    match &row.verifier_id {
+        // 命题4/7：未登记独立验证者 → verifier 缺省=执行者，执行者自证完成（可信等级降级）
+        None => {
+            let is_exec = row.executor_id.as_deref() == Some(actor);
+            if !is_exec {
+                return Err(crate::error::CoreError::Validation(format!(
+                    "事项未登记验证者，仅执行者 {:?} 可自证完成；实际是 {actor}",
+                    row.executor_id
+                )));
+            }
+            transition(db, id, MatterStatus::Completed, actor, |_| {
+                require_allowed(db, id, actor, DecisionPoint::Verify)?;
+                crate::db::repositories::matters::set_self_verified(db, id, true)?;
+                crate::db::repositories::matters::mark_finished(db, id, "completed", "completed")
+            })?;
+            record_signal(
+                db,
+                id,
+                "self_verified",
+                "验证者缺省为执行者：执行者自证完成，可信等级降级（不再全信）".into(),
+            )?;
+        }
+        // 命题4：独立验证者路径（注册验证者 ≠ 执行者）
+        Some(registered) => {
+            if registered != actor {
+                return Err(crate::error::CoreError::Validation(format!(
+                    "验证者必须是登记的 {registered}，实际是 {actor}"
+                )));
+            }
+            if let Some(exec) = &row.executor_id {
+                if exec == actor {
+                    return Err(crate::error::CoreError::Validation(
+                        "验证者不能同时是执行者（三主体分离）".into(),
+                    ));
+                }
+            }
+            transition(db, id, MatterStatus::Completed, actor, |_| {
+                require_allowed(db, id, actor, DecisionPoint::Verify)?;
+                crate::db::repositories::matters::set_self_verified(db, id, false)?;
+                crate::db::repositories::matters::mark_finished(db, id, "completed", "completed")
+            })?;
         }
     }
-    transition(db, id, MatterStatus::Completed, |_| {
-        require_allowed(db, id, actor, DecisionPoint::Verify)?;
-        crate::db::repositories::matters::mark_finished(db, id, "completed", "completed")
-    })?;
     check_additivity_on_complete(db, id)?;
     Ok(())
 }
 
 /// 取消：任意非终态 → cancelled（死因登记）。需 terminate 决策点授权。
 pub fn cancel(db: &Db, id: i64, actor: &str) -> Result<()> {
-    transition(db, id, MatterStatus::Cancelled, |_| {
+    transition(db, id, MatterStatus::Cancelled, actor, |_| {
         require_allowed(db, id, actor, DecisionPoint::Terminate)?;
         crate::db::repositories::matters::mark_finished(db, id, "cancelled", "cancelled")
     })
@@ -359,7 +402,7 @@ pub fn cancel(db: &Db, id: i64, actor: &str) -> Result<()> {
 
 /// 搁置：任意非终态 → shelved（死因登记）。需 terminate 决策点授权。
 pub fn shelve(db: &Db, id: i64, actor: &str) -> Result<()> {
-    transition(db, id, MatterStatus::Shelved, |_| {
+    transition(db, id, MatterStatus::Shelved, actor, |_| {
         require_allowed(db, id, actor, DecisionPoint::Terminate)?;
         crate::db::repositories::matters::mark_finished(db, id, "shelved", "shelved")
     })
@@ -371,13 +414,49 @@ pub fn expire_stale(db: &Db, stale_before: &str) -> Result<Vec<i64>> {
     let mut dead = Vec::new();
     for row in crate::db::repositories::matters::scan_active(db)? {
         // updated_at 为 SQLite datetime('now')（UTC "YYYY-MM-DD HH:MM:SS"），
-        // stale_before 需按同格式传入；字符串比较即时间序比较。
+        // stale_before 需按同样格式传入；字符串比较即时序比较。
         if row.updated_at < stale_before.to_string() {
             crate::db::repositories::matters::mark_finished(db, row.id, "expired", "expired")?;
+            crate::db::repositories::matters::insert_event(
+                db,
+                row.id,
+                "expired",
+                &row.status,
+                "expired",
+                &("stale_before=".to_owned() + stale_before),
+                "system",
+            )?;
             dead.push(row.id);
         }
     }
     Ok(dead)
+}
+
+/// 幽灵事项检测（命题4/7 兜底）：挂起无主（executor 空）+ 超过 stale_before 无进展
+/// + 无验收判据（老数据可能为空）→ 候选清单；只出 ghost_candidate 信号，
+/// 不自动终止，终止/搁置由人类决策。
+pub fn detect_ghosts(db: &Db, stale_before: &str) -> Result<Vec<GhostCandidate>> {
+    let mut ghosts = Vec::new();
+    for row in crate::db::repositories::matters::scan_active(db)? {
+        let orphan = row.executor_id.is_none();
+        let idle = row.updated_at < stale_before.to_string();
+        let no_criteria = row.acceptance_criteria.trim().is_empty();
+        if orphan && idle && no_criteria {
+            record_signal(
+                db,
+                row.id,
+                "ghost_candidate",
+                format!("幽灵事项：挂起无主且 {stale_before} 前无进展且无验收判据，建议终止或显式搁置"),
+            )?;
+            ghosts.push(GhostCandidate {
+                id: row.id,
+                title: row.title,
+                updated_at: row.updated_at,
+                reason: "挂起无主 / 超时无进展 / 无验收判据".into(),
+            });
+        }
+    }
+    Ok(ghosts)
 }
 
 /// 父事项能否关闭：所有子事项都已终态（分解可加性；无子事项时视为可关闭）。
@@ -465,6 +544,7 @@ fn transition(
     db: &Db,
     id: i64,
     to: MatterStatus,
+    actor: &str,
     action: impl FnOnce(i64) -> Result<()>,
 ) -> Result<()> {
     let row = crate::db::repositories::matters::get(db, id)?
@@ -480,7 +560,18 @@ fn transition(
             to.as_str()
         )));
     }
-    action(id)
+    action(id)?;
+    // 命题4/7：状态转移全部留痕（open→in_progress / →awaiting_verification / 四态死亡）
+    crate::db::repositories::matters::insert_event(
+        db,
+        id,
+        to.as_str(),
+        from.as_str(),
+        to.as_str(),
+        "",
+        actor,
+    )?;
+    Ok(())
 }
 
 /// 命题3 收口：母项 completed 时，子项声明的可加性关系必须与实际结果吻合，否则记信号。
@@ -943,5 +1034,151 @@ mod tests {
             "signals: {}",
             prow.signals
         );
+    }
+
+    // ── M5：验证者分离 + 事件留痕 + 幽灵检测（命题4/7） ──
+
+    #[test]
+    fn verifier_defaults_to_executor_self_verified() {
+        let db = test_db();
+        let id = create(
+            &db, "自证事项", "e", "c", "g", "crit", "ID:000001", Some("codex"), None, None, "", "",
+        )
+        .unwrap();
+        delegate(&db, id, "ID:000001", DecisionPoint::Execute, true).unwrap();
+        delegate(&db, id, "ID:000001", DecisionPoint::Verify, true).unwrap();
+        start(&db, id, "codex").unwrap();
+        submit_evidence(&db, id, "codex", "证据").unwrap();
+        verify(&db, id, "codex").unwrap();
+
+        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        assert_eq!(row.status, "completed");
+        assert!(row.self_verified, "执行者自证应落 self_verified=true");
+        assert!(row.signals.contains("self_verified"), "signals: {}", row.signals);
+        let events = crate::db::repositories::matters::list_events(&db, id).unwrap();
+        assert!(events.iter().any(|e| e.event_type == "completed"), "应记录 completed 事件");
+    }
+
+    #[test]
+    fn explicit_verifier_not_self_verified() {
+        let db = test_db();
+        let id = create(
+            &db, "独立验证", "e", "c", "g", "crit", "ID:000001", Some("codex"), Some("jarvis"), None, "", "",
+        )
+        .unwrap();
+        delegate(&db, id, "ID:000001", DecisionPoint::Execute, true).unwrap();
+        delegate(&db, id, "ID:000001", DecisionPoint::Verify, true).unwrap();
+        start(&db, id, "codex").unwrap();
+        submit_evidence(&db, id, "codex", "证据").unwrap();
+        verify(&db, id, "jarvis").unwrap();
+
+        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        assert_eq!(row.status, "completed");
+        assert!(!row.self_verified, "独立验证者完成不应标记 self_verified");
+    }
+
+    #[test]
+    fn self_verify_requires_executor() {
+        let db = test_db();
+        let id = create(
+            &db, "自证越权", "e", "c", "g", "crit", "ID:000001", Some("codex"), None, None, "", "",
+        )
+        .unwrap();
+        delegate(&db, id, "ID:000001", DecisionPoint::Verify, true).unwrap();
+        let err = verify(&db, id, "stranger").unwrap_err();
+        assert!(err.to_string().contains("自证"), "err: {err}");
+    }
+
+    #[test]
+    fn death_events_recorded_for_all_terminal_states() {
+        let db = test_db();
+        let c1 = seed(&db);
+        cancel(&db, c1, "ID:000001").unwrap();
+        let c2 = seed(&db);
+        shelve(&db, c2, "ID:000001").unwrap();
+
+        let ev1 = crate::db::repositories::matters::list_events(&db, c1).unwrap();
+        assert!(ev1.iter().any(|e| e.event_type == "cancelled"), "缺 cancelled 事件");
+        let ev2 = crate::db::repositories::matters::list_events(&db, c2).unwrap();
+        assert!(ev2.iter().any(|e| e.event_type == "shelved"), "缺 shelved 事件");
+    }
+
+    #[test]
+    fn expire_records_event_with_system_actor() {
+        let db = test_db();
+        let id = seed(&db);
+        db.conn()
+            .execute(
+                "UPDATE matters SET updated_at = '2020-01-01 00:00:00' WHERE id = ?1",
+                (id,),
+            )
+            .unwrap();
+        let dead = expire_stale(&db, "2021-01-01 00:00:00").unwrap();
+        assert!(dead.contains(&id), "应过期事项 {id}");
+        let events = crate::db::repositories::matters::list_events(&db, id).unwrap();
+        let ev = events
+            .iter()
+            .find(|e| e.event_type == "expired")
+            .expect("缺 expired 事件");
+        assert_eq!(ev.actor, "system");
+    }
+
+    #[test]
+    fn ghost_detected_when_orphan_idle_no_criteria() {
+        let db = test_db();
+        let id = create(
+            &db, "幽灵", "e", "c", "g", "crit", "ID:000001", None, None, None, "", "",
+        )
+        .unwrap();
+        // 模拟老数据：无验收判据 + 长时间未动
+        db.conn()
+            .execute(
+                "UPDATE matters SET acceptance_criteria = '', updated_at = '2020-01-01 00:00:00' WHERE id = ?1",
+                (id,),
+            )
+            .unwrap();
+        let ghosts = detect_ghosts(&db, "2021-01-01 00:00:00").unwrap();
+        assert_eq!(ghosts.len(), 1, "应识别 1 个幽灵事项: {ghosts:?}");
+        assert_eq!(ghosts[0].id, id);
+        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        assert!(row.signals.contains("ghost_candidate"), "signals: {}", row.signals);
+    }
+
+    #[test]
+    fn ghost_excludes_owned_fresh_or_with_criteria() {
+        let db = test_db();
+        // 有主 + 老 + 无判据 → 不算幽灵（有主）
+        let owned = create(
+            &db, "有主", "e", "c", "g", "crit", "ID:000001", Some("codex"), None, None, "", "",
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE matters SET acceptance_criteria = '', updated_at = '2020-01-01 00:00:00' WHERE id = ?1",
+                (owned,),
+            )
+            .unwrap();
+        // 无主 + 新 + 无判据 → 不算幽灵（有进展）
+        let fresh = create(
+            &db, "活跃", "e", "c", "g", "crit", "ID:000001", None, None, None, "", "",
+        )
+        .unwrap();
+        db.conn()
+            .execute(
+                "UPDATE matters SET acceptance_criteria = '' WHERE id = ?1",
+                (fresh,),
+            )
+            .unwrap();
+        // 无主 + 老 + 有判据 → 不算幽灵（有验收判据）
+        let crit = create(
+            &db, "有判据", "e", "c", "g", "crit", "ID:000001", None, None, None, "", "",
+        )
+        .unwrap();
+        db.conn()
+            .execute("UPDATE matters SET updated_at = '2020-01-01 00:00:00' WHERE id = ?1", (crit,))
+            .unwrap();
+
+        let ghosts = detect_ghosts(&db, "2021-01-01 00:00:00").unwrap();
+        assert!(ghosts.is_empty(), "不应识别任何幽灵: {ghosts:?}");
     }
 }

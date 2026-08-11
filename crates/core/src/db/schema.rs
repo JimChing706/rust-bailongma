@@ -16,7 +16,7 @@ use crate::error::Result;
 /// 业务表清单（不含 sqlite_sequence 与 memories_fts 的 4 张内部影子表）。
 /// 与 Node 版 schema.js 最终状态一致：24 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 29；
 /// M1 新增 3 张 LLM 指标表 → 27 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 32；
-/// P1 新增 turn_state（显式 Turn 状态机）→ 30 张业务表；事项账本 matters → 31 张。
+/// P1 新增 turn_state（显式 Turn 状态机）→ 30 张业务表；事项账本 matters/matter_events → 32 张。
 pub const BUSINESS_TABLES: &[&str] = &[
     "conversations",
     "memories",
@@ -49,6 +49,7 @@ pub const BUSINESS_TABLES: &[&str] = &[
     "llm_turns",
     "turn_state",
     "matters",
+    "matter_events",
 ];
 
 /// 检查某表是否已存在指定列。
@@ -703,6 +704,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           additivity_decl TEXT NOT NULL DEFAULT '',
           -- 命题2/3 信号台账（JSON 数组：[{ts,kind,detail}]）
           signals TEXT NOT NULL DEFAULT '[]',
+          -- 命题4/7 执行者自证标记：verifier 缺省为执行者时完成 → 1（可信等级降级）
+          self_verified INTEGER NOT NULL DEFAULT 0,
           evidence     TEXT    NOT NULL DEFAULT '',
           death_reason TEXT    NOT NULL DEFAULT '',
           started_at   TEXT,
@@ -727,6 +730,25 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     ensure_column(conn, "matters", "intent_original", "intent_original TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "matters", "additivity_decl", "additivity_decl TEXT NOT NULL DEFAULT ''")?;
     ensure_column(conn, "matters", "signals", "signals TEXT NOT NULL DEFAULT '[]'")?;
+
+    // ── M5：验证者分离收口（命题4/7；幂等；新库 CREATE 已带） ──
+    ensure_column(conn, "matters", "self_verified", "self_verified INTEGER NOT NULL DEFAULT 0")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS matter_events (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            matter_id   INTEGER NOT NULL,
+            event_type  TEXT    NOT NULL DEFAULT '',
+            from_status TEXT    NOT NULL DEFAULT '',
+            to_status   TEXT    NOT NULL DEFAULT '',
+            reason      TEXT    NOT NULL DEFAULT '',
+            actor       TEXT    NOT NULL DEFAULT '',
+            created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+        )",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_matter_events_matter ON matter_events(matter_id)"
+    )?;
+
 
     // ── 一次性历史迁移：外部渠道前缀 ID 统一为 canonical 用户（与 Node 版相同，flag 守卫） ──
     migrate_canonical_user(conn)?;
@@ -926,7 +948,7 @@ mod tests {
             .unwrap()
             .query_row([], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 32); // 31 业务表 + sqlite_sequence（事项账本 matters 加入）
+        assert_eq!(count, 33); // 32 业务表 + sqlite_sequence（matter_events 加入） // 31 业务表 + sqlite_sequence（事项账本 matters 加入）
     }
 
     #[test]
