@@ -3,10 +3,15 @@
 //! 七个命题中对齐到本模块的规则：
 //! 1. **事项是差距不是物**——创建必须带验收标准（`acceptance_criteria` 非空），
 //!    无验收标准的只是愿望，不进入账本（拒绝创建）。
-//! 3. **可分性是实用主义的**——子事项必须可独立验证才允许拆分；
-//!    父事项关闭前所有子事项必须已终态（`can_close` 判定）。
+//! 2. **意图漂移可度量**——创建时锚定 `intent_original` 意图原句；收敛报告给出
+//!    "原意图 / 我理解 / 做成了"三栏对照，漂移落信号台账（`intent_drift`）。
+//! 3. **分解可加性声明**——子事项必须声明与母项验收判据的还原关系
+//!    （`all_completed` / `any_completed`），声明缺失或未知拒绝创建；
+//!    母项关闭时声明与实际结果对不上 → 记 `additivity_violation` 信号。
 //! 4. **发起/执行/验证三主体分离**——验证者不得是执行者（`verify` 强制校验）。
 //! 5. **语言承诺 ≠ 世界事实**——提交验证必须带证据（`evidence` 非空）。
+//! 6. **决策点委托显式化**——choose/path/execute/verify/terminate 五决策点默认
+//!    全归人类（false）；agent 只在显式授权点可自主，越权拒绝；只有发起人能改委托。
 //! 7. **事项四种死法**——completed / cancelled / shelved / expired，终态登记死因。
 //!
 //! 数据层在 [`crate::db::repositories::matters`]；本模块负责状态机与规则校验，
@@ -100,7 +105,93 @@ impl FromStr for MatterStatus {
     }
 }
 
-/// 创建事项（规则：验收标准非空、验证者≠执行者）。返回新事项 id。
+/// 决策点（命题6）：agent 在哪些点上可以自主行使判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecisionPoint {
+    /// 选哪个事项/方案
+    Choose,
+    /// 选哪条执行路径
+    Path,
+    /// 执行动作
+    Execute,
+    /// 验证结果
+    Verify,
+    /// 终止/关闭事项
+    Terminate,
+}
+
+impl DecisionPoint {
+    /// 落库用的稳定字符串（与 delegation_* 列名一致）。
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DecisionPoint::Choose => "choose",
+            DecisionPoint::Path => "path",
+            DecisionPoint::Execute => "execute",
+            DecisionPoint::Verify => "verify",
+            DecisionPoint::Terminate => "terminate",
+        }
+    }
+}
+
+/// 委托地图（命题6）：五决策点全 false = 人类保留全部决策。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DelegationMap {
+    pub choose: bool,
+    pub path: bool,
+    pub execute: bool,
+    pub verify: bool,
+    pub terminate: bool,
+}
+
+/// 从行投影取委托地图（命题6 数据视图）。
+pub fn delegation_map(row: &crate::db::repositories::matters::MatterRow) -> DelegationMap {
+    DelegationMap {
+        choose: row.delegation_choose,
+        path: row.delegation_path,
+        execute: row.delegation_execute,
+        verify: row.delegation_verify,
+        terminate: row.delegation_terminate,
+    }
+}
+
+/// 分解可加性声明（命题3）：子事项验收判据与母项验收判据的还原关系。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdditivityDecl {
+    /// 母项可关闭要求：全部子事项 completed
+    AllCompleted,
+    /// 母项可关闭要求：至少一个子事项 completed
+    AnyCompleted,
+}
+
+impl AdditivityDecl {
+    pub fn parse(s: &str) -> std::result::Result<Self, String> {
+        match s.trim() {
+            "all_completed" => Ok(AdditivityDecl::AllCompleted),
+            "any_completed" => Ok(AdditivityDecl::AnyCompleted),
+            "" => Err("可加性声明不能为空（子事项必须声明与母项验收判据的还原关系）".into()),
+            other => Err(format!(
+                "未知可加性声明: {other}（仅支持 all_completed | any_completed）"
+            )),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AdditivityDecl::AllCompleted => "all_completed",
+            AdditivityDecl::AnyCompleted => "any_completed",
+        }
+    }
+}
+
+/// 意图漂移对照报告（命题2）。
+pub struct DriftVerdict {
+    /// 三栏对齐（无理解漂移且无执行漂移）
+    pub aligned: bool,
+    /// 人类可读对照：原意图 / 我理解 / 做成了
+    pub report: String,
+}
+
+/// 创建事项（规则：验收标准非空、验证者≠执行者、子项必须带可加性声明）。返回新事项 id。
 #[allow(clippy::too_many_arguments)]
 pub fn create(
     db: &Db,
@@ -113,6 +204,8 @@ pub fn create(
     executor_id: Option<&str>,
     verifier_id: Option<&str>,
     parent_id: Option<i64>,
+    intent_original: &str,
+    additivity_decl: &str,
 ) -> Result<i64> {
     // 命题1：无验收标准的只是愿望，不进入账本。
     let criteria = acceptance_criteria.trim();
@@ -129,13 +222,14 @@ pub fn create(
             ));
         }
     }
-    // 命题3：父事项必须存在才允许挂子事项。
+    // 命题3：父事项必须存在才允许挂子事项；子事项必须声明可加性关系。
     if let Some(pid) = parent_id {
         if crate::db::repositories::matters::get(db, pid)?.is_none() {
-            return Err(crate::error::CoreError::Validation(
-                format!("父事项不存在: {pid}"),
-            ));
+            return Err(crate::error::CoreError::Validation(format!(
+                "父事项不存在: {pid}"
+            )));
         }
+        AdditivityDecl::parse(additivity_decl)?;
     }
     crate::db::repositories::matters::create(
         db,
@@ -148,65 +242,125 @@ pub fn create(
         executor_id,
         verifier_id,
         parent_id,
+        intent_original,
+        additivity_decl,
     )
 }
 
-/// 开始执行：open → in_progress（登记 started_at）。
-pub fn start(db: &Db, id: i64) -> Result<()> {
+/// 授权/收回某个决策点（命题6）。只有发起人（人类）能改委托地图。
+pub fn delegate(
+    db: &Db,
+    id: i64,
+    actor: &str,
+    point: DecisionPoint,
+    allowed: bool,
+) -> Result<()> {
+    let row = crate::db::repositories::matters::get(db, id)?
+        .ok_or_else(|| crate::error::CoreError::NotFound(format!("事项不存在: {id}")))?;
+    if row.creator_id != actor {
+        return Err(crate::error::CoreError::Validation(format!(
+            "只有发起人（{}）能授权决策点，实际是 {actor}",
+            row.creator_id
+        )));
+    }
+    crate::db::repositories::matters::set_delegation(db, id, point.as_str(), allowed)
+}
+
+/// 某 actor 在某决策点是否被授权（命题6）。发起人（人类）始终放行；
+/// agent 必须同时满足"角色匹配（执行者/验证者）+ 对应委托位为 true"。
+pub fn decision_allowed(db: &Db, id: i64, actor: &str, point: DecisionPoint) -> Result<bool> {
+    let row = crate::db::repositories::matters::get(db, id)?
+        .ok_or_else(|| crate::error::CoreError::NotFound(format!("事项不存在: {id}")))?;
+    if row.creator_id == actor {
+        return Ok(true);
+    }
+    let dm = delegation_map(&row);
+    let is_exec = row.executor_id.as_deref() == Some(actor);
+    let is_ver = row.verifier_id.as_deref() == Some(actor);
+    let ok = match point {
+        DecisionPoint::Choose => is_exec && dm.choose,
+        DecisionPoint::Path => is_exec && dm.path,
+        DecisionPoint::Execute => is_exec && dm.execute,
+        DecisionPoint::Verify => is_ver && dm.verify,
+        DecisionPoint::Terminate => (is_exec || is_ver) && dm.terminate,
+    };
+    Ok(ok)
+}
+
+fn require_allowed(db: &Db, id: i64, actor: &str, point: DecisionPoint) -> Result<()> {
+    if !decision_allowed(db, id, actor, point)? {
+        return Err(crate::error::CoreError::Validation(format!(
+            "{actor} 在 {} 决策点未获授权（委托地图默认人类保留，需发起人显式授权）",
+            point.as_str()
+        )));
+    }
+    Ok(())
+}
+
+/// 开始执行：open → in_progress（登记 started_at）。需 execute 决策点授权。
+pub fn start(db: &Db, id: i64, actor: &str) -> Result<()> {
     transition(db, id, MatterStatus::InProgress, |_| {
+        require_allowed(db, id, actor, DecisionPoint::Execute)?;
         crate::db::repositories::matters::mark_started(db, id)
     })
 }
 
-/// 提交验证证据：in_progress → awaiting_verification。
+/// 提交验证证据：in_progress → awaiting_verification。需 execute 决策点授权。
 /// 规则（命题5）：证据非空——语言承诺必须落到世界事实。
-pub fn submit_evidence(db: &Db, id: i64, evidence: &str) -> Result<()> {
+pub fn submit_evidence(db: &Db, id: i64, actor: &str, evidence: &str) -> Result<()> {
     if evidence.trim().is_empty() {
         return Err(crate::error::CoreError::Validation(
             "提交验证必须附证据（evidence），否则只是语言承诺".into(),
         ));
     }
     transition(db, id, MatterStatus::AwaitingVerification, |_| {
+        require_allowed(db, id, actor, DecisionPoint::Execute)?;
         crate::db::repositories::matters::set_evidence(db, id, evidence)
     })
 }
 
-/// 验证通过：awaiting_verification → completed。
+/// 验证通过：awaiting_verification → completed。需 verify 决策点授权。
 /// 规则（命题4）：验证者必须与登记 verifier 一致，且不得是执行者。
-pub fn verify(db: &Db, id: i64, verifier_id: &str) -> Result<()> {
+/// 母项完成时执行命题3 收口：子项可加性声明与实际结果对不上 → 记信号。
+pub fn verify(db: &Db, id: i64, actor: &str) -> Result<()> {
     let row = crate::db::repositories::matters::get(db, id)?
         .ok_or_else(|| crate::error::CoreError::NotFound(format!("事项不存在: {id}")))?;
 
     let registered = row
         .verifier_id
         .ok_or_else(|| crate::error::CoreError::Validation("事项未登记验证者".into()))?;
-    if registered != verifier_id {
+    if registered != actor {
         return Err(crate::error::CoreError::Validation(format!(
-            "验证者必须是登记的 {registered}，实际是 {verifier_id}"
+            "验证者必须是登记的 {registered}，实际是 {actor}"
         )));
     }
     if let Some(exec) = &row.executor_id {
-        if exec == verifier_id {
+        if exec == actor {
             return Err(crate::error::CoreError::Validation(
                 "验证者不能同时是执行者（三主体分离）".into(),
             ));
         }
     }
     transition(db, id, MatterStatus::Completed, |_| {
+        require_allowed(db, id, actor, DecisionPoint::Verify)?;
         crate::db::repositories::matters::mark_finished(db, id, "completed", "completed")
-    })
+    })?;
+    check_additivity_on_complete(db, id)?;
+    Ok(())
 }
 
-/// 取消：任意非终态 → cancelled（死因登记）。
-pub fn cancel(db: &Db, id: i64) -> Result<()> {
+/// 取消：任意非终态 → cancelled（死因登记）。需 terminate 决策点授权。
+pub fn cancel(db: &Db, id: i64, actor: &str) -> Result<()> {
     transition(db, id, MatterStatus::Cancelled, |_| {
+        require_allowed(db, id, actor, DecisionPoint::Terminate)?;
         crate::db::repositories::matters::mark_finished(db, id, "cancelled", "cancelled")
     })
 }
 
-/// 搁置：任意非终态 → shelved（死因登记）。
-pub fn shelve(db: &Db, id: i64) -> Result<()> {
+/// 搁置：任意非终态 → shelved（死因登记）。需 terminate 决策点授权。
+pub fn shelve(db: &Db, id: i64, actor: &str) -> Result<()> {
     transition(db, id, MatterStatus::Shelved, |_| {
+        require_allowed(db, id, actor, DecisionPoint::Terminate)?;
         crate::db::repositories::matters::mark_finished(db, id, "shelved", "shelved")
     })
 }
@@ -245,6 +399,66 @@ pub fn list_active(db: &Db) -> Result<Vec<crate::db::repositories::matters::Matt
     crate::db::repositories::matters::scan_active(db)
 }
 
+/// 命题2 收敛对照：给出"原意图 / 我理解 / 做成了"三栏报告；
+/// 理解或执行发生漂移时落 `intent_drift` 信号，并返回对齐判定。
+pub fn intent_drift_report(
+    db: &Db,
+    id: i64,
+    understood_as: &str,
+    done_as: &str,
+) -> Result<DriftVerdict> {
+    let row = crate::db::repositories::matters::get(db, id)?
+        .ok_or_else(|| crate::error::CoreError::NotFound(format!("事项不存在: {id}")))?;
+    let original = row.intent_original.trim();
+    let understood = understood_as.trim();
+    let done = done_as.trim();
+
+    let mut drift = Vec::new();
+    if !original.is_empty() && original != understood {
+        drift.push(format!("理解漂移（原:{original} ≠ 理解:{understood}）"));
+        record_signal(
+            db,
+            id,
+            "intent_drift",
+            format!("理解漂移: 原={original} 理解={understood}"),
+        )?;
+    }
+    if understood != done {
+        drift.push(format!("执行漂移（理解:{understood} ≠ 做成:{done}）"));
+        record_signal(
+            db,
+            id,
+            "intent_drift",
+            format!("执行漂移: 理解={understood} 做成={done}"),
+        )?;
+    }
+
+    let mut report = format!("原意图: {original}\n我理解: {understood}\n做成了: {done}");
+    if drift.is_empty() {
+        report.push_str("\n结论: 对齐");
+    } else {
+        report.push_str(&format!("\n结论: {}", drift.join("; ")));
+    }
+    Ok(DriftVerdict {
+        aligned: drift.is_empty(),
+        report,
+    })
+}
+
+/// 信号台账追加（命题2/3）：kind 如 intent_drift / additivity_violation。
+pub fn record_signal(db: &Db, id: i64, kind: &str, detail: String) -> Result<()> {
+    let row = crate::db::repositories::matters::get(db, id)?
+        .ok_or_else(|| crate::error::CoreError::NotFound(format!("事项不存在: {id}")))?;
+    let mut signals: Vec<serde_json::Value> =
+        serde_json::from_str(&row.signals).unwrap_or_default();
+    signals.push(serde_json::json!({
+        "ts": crate::db::repositories::matters::now_utc(db)?,
+        "kind": kind,
+        "detail": detail,
+    }));
+    crate::db::repositories::matters::set_signals(db, id, &serde_json::to_string(&signals)?)
+}
+
 // ── 内部：校验转移合法性后执行动作 ──────────────────────────────
 
 fn transition(
@@ -269,6 +483,50 @@ fn transition(
     action(id)
 }
 
+/// 命题3 收口：母项 completed 时，子项声明的可加性关系必须与实际结果吻合，否则记信号。
+fn check_additivity_on_complete(db: &Db, parent_id: i64) -> Result<()> {
+    let children = crate::db::repositories::matters::list_children(db, parent_id)?;
+    if children.is_empty() {
+        return Ok(());
+    }
+    let mut any_completed = false;
+    let mut has_any_decl = false;
+    for child in &children {
+        if child.status == "completed" {
+            any_completed = true;
+        }
+        match AdditivityDecl::parse(&child.additivity_decl) {
+            Ok(AdditivityDecl::AllCompleted) => {
+                if child.status != "completed" {
+                    record_signal(
+                        db,
+                        parent_id,
+                        "additivity_violation",
+                        format!(
+                            "子事项 {} 声明 all_completed 但实际 {}",
+                            child.id, child.status
+                        ),
+                    )?;
+                }
+            }
+            Ok(AdditivityDecl::AnyCompleted) => {
+                has_any_decl = true;
+            }
+            // 老数据/空声明：不判定（兼容旧库，缺声明不追加信号）
+            Err(_) => {}
+        }
+    }
+    if has_any_decl && !any_completed {
+        record_signal(
+            db,
+            parent_id,
+            "additivity_violation",
+            "存在 any_completed 声明的子项，但没有任何子项 completed".into(),
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +538,7 @@ mod tests {
     }
 
     fn seed(db: &Db) -> i64 {
-        create(
+        let id = create(
             db,
             "接入协作者",
             "协作者能独立跑工具循环",
@@ -291,8 +549,15 @@ mod tests {
             Some("codex"),
             Some("jarvis"),
             None,
+            "让协作者能独立跑工具循环",
+            "",
         )
-        .unwrap()
+        .unwrap();
+        // 显式授权执行/验证/终止三个决策点给对应 agent（choose/path 保持人类保留）
+        delegate(db, id, "ID:000001", DecisionPoint::Execute, true).unwrap();
+        delegate(db, id, "ID:000001", DecisionPoint::Verify, true).unwrap();
+        delegate(db, id, "ID:000001", DecisionPoint::Terminate, true).unwrap();
+        id
     }
 
     #[test]
@@ -309,6 +574,8 @@ mod tests {
             None,
             None,
             None,
+            "",
+            "",
         )
         .unwrap_err();
         assert!(err.to_string().contains("验收标准"));
@@ -328,9 +595,99 @@ mod tests {
             Some("codex"),
             Some("codex"),
             None,
+            "",
+            "",
         )
         .unwrap_err();
         assert!(err.to_string().contains("三主体分离"));
+    }
+
+    #[test]
+    fn delegation_defaults_all_false() {
+        let db = test_db();
+        let id = create(
+            &db,
+            "x",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            Some("jarvis"),
+            None,
+            "意图",
+            "",
+        )
+        .unwrap();
+        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        assert_eq!(delegation_map(&row), DelegationMap::default());
+        // 人类发起人始终放行
+        assert!(decision_allowed(&db, id, "ID:000001", DecisionPoint::Execute).unwrap());
+    }
+
+    #[test]
+    fn unauthorized_agent_rejected_on_all_decision_points() {
+        let db = test_db();
+        let id = create(
+            &db,
+            "x",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            Some("jarvis"),
+            None,
+            "",
+            "",
+        )
+        .unwrap();
+        // 未授权 execute：执行者不能开工
+        assert!(start(&db, id, "codex").unwrap_err().to_string().contains("未获授权"));
+
+        // 授权 execute 后走到 awaiting_verification，再分别验证 verify/terminate 门禁
+        delegate(&db, id, "ID:000001", DecisionPoint::Execute, true).unwrap();
+        start(&db, id, "codex").unwrap();
+        submit_evidence(&db, id, "codex", "ev").unwrap();
+
+        // 未授权 verify：验证者不能通过（状态合法，被委托门禁拦下）
+        let err = verify(&db, id, "jarvis").unwrap_err();
+        assert!(err.to_string().contains("未获授权"), "got: {err}");
+
+        // 未授权 terminate：执行者不能取消
+        let err2 = cancel(&db, id, "codex").unwrap_err();
+        assert!(err2.to_string().contains("未获授权"), "got: {err2}");
+    }
+
+    #[test]
+    fn delegate_requires_creator_and_grants_flow() {
+        let db = test_db();
+        let id = create(
+            &db,
+            "x",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            Some("jarvis"),
+            None,
+            "",
+            "",
+        )
+        .unwrap();
+        // 非发起人不能改委托地图
+        let err = delegate(&db, id, "codex", DecisionPoint::Execute, true).unwrap_err();
+        assert!(err.to_string().contains("只有发起人"));
+        // 发起人授权后，执行者放行
+        delegate(&db, id, "ID:000001", DecisionPoint::Execute, true).unwrap();
+        start(&db, id, "codex").unwrap();
+        // 收回后再次拒绝
+        delegate(&db, id, "ID:000001", DecisionPoint::Execute, false).unwrap();
+        assert!(start(&db, id, "codex").unwrap_err().to_string().contains("非法状态转移"));
     }
 
     #[test]
@@ -338,12 +695,12 @@ mod tests {
         let db = test_db();
         let id = seed(&db);
 
-        start(&db, id).unwrap();
-        assert!(start(&db, id).unwrap_err().to_string().contains("非法状态转移"));
+        start(&db, id, "codex").unwrap();
+        assert!(start(&db, id, "codex").unwrap_err().to_string().contains("非法状态转移"));
 
-        submit_evidence(&db, id, "工具调用 trace 已落库").unwrap();
+        submit_evidence(&db, id, "codex", "工具调用 trace 已落库").unwrap();
         assert!(
-            submit_evidence(&db, id, "再次提交")
+            submit_evidence(&db, id, "codex", "再次提交")
                 .unwrap_err()
                 .to_string()
                 .contains("非法状态转移")
@@ -365,8 +722,8 @@ mod tests {
         let db = test_db();
         // 登记执行者 codex、验证者 jarvis；但代码层面防呆：直接以执行者身份验证
         let id = seed(&db);
-        start(&db, id).unwrap();
-        submit_evidence(&db, id, "ev").unwrap();
+        start(&db, id, "codex").unwrap();
+        submit_evidence(&db, id, "codex", "ev").unwrap();
         let err = verify(&db, id, "codex").unwrap_err();
         assert!(err.to_string().contains("验证者必须是登记的 jarvis"));
     }
@@ -375,14 +732,14 @@ mod tests {
     fn cancel_and_shelve_register_death() {
         let db = test_db();
         let a = seed(&db);
-        cancel(&db, a).unwrap();
+        cancel(&db, a, "codex").unwrap();
         let row = crate::db::repositories::matters::get(&db, a).unwrap().unwrap();
         assert_eq!(row.status, "cancelled");
         assert_eq!(row.death_reason, "cancelled");
 
         let b = seed(&db);
-        start(&db, b).unwrap();
-        shelve(&db, b).unwrap();
+        start(&db, b, "codex").unwrap();
+        shelve(&db, b, "codex").unwrap();
         let row = crate::db::repositories::matters::get(&db, b).unwrap().unwrap();
         assert_eq!(row.status, "shelved");
     }
@@ -424,6 +781,8 @@ mod tests {
             Some("codex"),
             Some("jarvis"),
             Some(parent),
+            "",
+            "all_completed",
         )
         .unwrap();
         assert!(!can_close(&db, parent).unwrap());
@@ -431,7 +790,7 @@ mod tests {
         // 子事项全部终态后父可关闭
         let kids = crate::db::repositories::matters::list_children(&db, parent).unwrap();
         for k in &kids {
-            cancel(&db, k.id).unwrap();
+            cancel(&db, k.id, "ID:000001").unwrap();
         }
         assert!(can_close(&db, parent).unwrap());
     }
@@ -450,8 +809,139 @@ mod tests {
             None,
             None,
             Some(9999),
+            "",
+            "",
         )
         .unwrap_err();
         assert!(err.to_string().contains("父事项不存在"));
+    }
+
+    #[test]
+    fn child_requires_additivity_decl() {
+        let db = test_db();
+        let parent = seed(&db);
+        // 声明缺失 → 拒绝
+        let err = create(
+            &db,
+            "子",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            None,
+            None,
+            Some(parent),
+            "",
+            "  ",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("可加性声明"));
+        // 未知声明值 → 拒绝
+        let err2 = create(
+            &db,
+            "子",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            None,
+            None,
+            Some(parent),
+            "",
+            "half_completed",
+        )
+        .unwrap_err();
+        assert!(err2.to_string().contains("未知可加性声明"));
+    }
+
+    #[test]
+    fn intent_original_persisted_and_drift_reported() {
+        let db = test_db();
+        let id = create(
+            &db,
+            "接入协作者",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            Some("jarvis"),
+            None,
+            "让协作者独立跑通工具循环",
+            "",
+        )
+        .unwrap();
+        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        assert_eq!(row.intent_original, "让协作者独立跑通工具循环");
+
+        // 理解漂移：原=做A 理解=做B → 未对齐，落信号
+        let v = intent_drift_report(&db, id, "让协作者独立跑通消息回复", "让协作者独立跑通消息回复").unwrap();
+        assert!(!v.aligned);
+        assert!(v.report.contains("理解漂移"));
+        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        assert!(row.signals.contains("intent_drift"), "signals: {}", row.signals);
+
+        // 完全对齐 → aligned
+        let v2 = intent_drift_report(&db, id, "让协作者独立跑通工具循环", "让协作者独立跑通工具循环").unwrap();
+        assert!(v2.aligned);
+    }
+
+    #[test]
+    fn additivity_violation_signals_on_parent_complete() {
+        let db = test_db();
+        let parent = seed(&db);
+        // 子1：声明 all_completed 且正常完成
+        let child = create(
+            &db,
+            "子1",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            Some("jarvis"),
+            Some(parent),
+            "",
+            "all_completed",
+        )
+        .unwrap();
+        delegate(&db, child, "ID:000001", DecisionPoint::Execute, true).unwrap();
+        delegate(&db, child, "ID:000001", DecisionPoint::Verify, true).unwrap();
+        start(&db, child, "codex").unwrap();
+        submit_evidence(&db, child, "codex", "ev").unwrap();
+        verify(&db, child, "jarvis").unwrap();
+
+        // 子2：声明 all_completed 但被取消 → 母项关闭时应记违反信号
+        let bad = create(
+            &db,
+            "子2",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            Some("jarvis"),
+            Some(parent),
+            "",
+            "all_completed",
+        )
+        .unwrap();
+        cancel(&db, bad, "ID:000001").unwrap();
+
+        start(&db, parent, "codex").unwrap();
+        submit_evidence(&db, parent, "codex", "全部子项已处理").unwrap();
+        verify(&db, parent, "jarvis").unwrap();
+
+        let prow = crate::db::repositories::matters::get(&db, parent).unwrap().unwrap();
+        assert!(
+            prow.signals.contains("additivity_violation"),
+            "signals: {}",
+            prow.signals
+        );
     }
 }

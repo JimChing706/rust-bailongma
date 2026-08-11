@@ -691,6 +691,18 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           executor_id  TEXT,
           verifier_id  TEXT,
           parent_id    INTEGER,
+          -- 命题6 决策点委托（默认全 0：人类保留全部决策；agent 仅在显式授权点可自主）
+          delegation_choose    INTEGER NOT NULL DEFAULT 0,
+          delegation_path      INTEGER NOT NULL DEFAULT 0,
+          delegation_execute   INTEGER NOT NULL DEFAULT 0,
+          delegation_verify    INTEGER NOT NULL DEFAULT 0,
+          delegation_terminate INTEGER NOT NULL DEFAULT 0,
+          -- 命题2 意图原句锚点（收敛对照"我理解为X做成了Y"）
+          intent_original TEXT NOT NULL DEFAULT '',
+          -- 命题3 分解可加性声明（子事项必填：all_completed | any_completed）
+          additivity_decl TEXT NOT NULL DEFAULT '',
+          -- 命题2/3 信号台账（JSON 数组：[{ts,kind,detail}]）
+          signals TEXT NOT NULL DEFAULT '[]',
           evidence     TEXT    NOT NULL DEFAULT '',
           death_reason TEXT    NOT NULL DEFAULT '',
           started_at   TEXT,
@@ -705,6 +717,16 @@ pub fn initialize(conn: &Connection) -> Result<()> {
 
     // ── M3：老库补 llm_calls.stage（幂等；新库 CREATE 已带） ──
     ensure_column(conn, "llm_calls", "stage", "stage TEXT NOT NULL DEFAULT ''")?;
+
+    // ── M4：matter ledger 三缺口补列（命题2/3/6；幂等；新库 CREATE 已带） ──
+    ensure_column(conn, "matters", "delegation_choose", "delegation_choose INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "matters", "delegation_path", "delegation_path INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "matters", "delegation_execute", "delegation_execute INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "matters", "delegation_verify", "delegation_verify INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "matters", "delegation_terminate", "delegation_terminate INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "matters", "intent_original", "intent_original TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "matters", "additivity_decl", "additivity_decl TEXT NOT NULL DEFAULT ''")?;
+    ensure_column(conn, "matters", "signals", "signals TEXT NOT NULL DEFAULT '[]'")?;
 
     // ── 一次性历史迁移：外部渠道前缀 ID 统一为 canonical 用户（与 Node 版相同，flag 守卫） ──
     migrate_canonical_user(conn)?;
