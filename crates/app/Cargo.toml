@@ -54,3 +54,7 @@ version = "0.24"
 optional = true
 
 # M7 引入：tauri = { version = "2", features = [] }, tauri-plugin-updater = "2"
+
+[dev-dependencies]
+# api_host 测试直接写 reminders 表（rusqlite::params!），需显式声明
+rusqlite.workspace = true

@@ -22,6 +22,7 @@ use bailongma_core::memory::messages::LlmRole;
 use bailongma_core::runtime::{init as runtime_init, run_user_turn, RuntimeState};
 use bailongma_core::tools::{all_tool_schemas, NativeToolExecutor, SendMessageFn};
 use bailongma_core::turn;
+use bailongma_core::wakeup::{coalesced_wakeup, CoalescedWakeup};
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -96,7 +97,6 @@ fn sandbox_root(user_dir: &Path) -> PathBuf {
 }
 
 /// R3 意识闭环：入站消息 → 归属/注入/落库 → LLM 工具循环 → 回复落库 + 广播。
-///
 /// Phase 1（显式 Turn 状态机）接线：本轮在 `turn_state` 表建行并全程落状态
 /// `received → running → completed / failed`，幂等键 = conversation_id 派生
 /// （同一入站消息重试复用同一行）；落库失败仅告警，不阻断意识闭环。
@@ -344,6 +344,265 @@ async fn run_conscious_turn(
     }
 }
 
+// ---------------------------------------------------------------------------
+// P1-1 接线：后台唤醒循环（TICK 轮）
+// ---------------------------------------------------------------------------
+
+/// 唤醒轮输入行。
+/// 格式 `[system] ts [tick] 内容`（对齐 parse_message_input 约定），
+/// sender_id=system、channel=tick —— 后台唤醒不冒充任何用户。
+pub fn wakeup_input_line(ts: &str, message: &str) -> String {
+    format!("[system] {ts} [tick] {message}")
+}
+
+/// 后台唤醒轮：合并提醒 → 一次 LLM 调用（stage='wakeup'，走 fast_model）→ 广播。
+/// LLM 未激活 / 调用失败 / 空回复时降级：把合并消息原文广播（提醒不丢，不空转）。
+async fn run_wakeup_turn(
+    db: Db,
+    bus: EventBus,
+    state: Arc<Mutex<RuntimeState>>,
+    cfg: Config,
+    tool_root: PathBuf,
+    sandbox_bin: Option<PathBuf>,
+    wake: CoalescedWakeup,
+) {
+    let from_id = "system";
+    let channel = "tick";
+
+    // 1) LLM 激活检查：未激活 → 原文广播降级（提醒仍送达）
+    let llm_cfg = match LlmConfig::from_config(&cfg) {
+        Ok(mut c) => {
+            // P3-2 模型路由：后台唤醒场景走 fast_model
+            c.model = c.route_model("wakeup");
+            c
+        }
+        Err(e) => {
+            tracing::warn!("[wakeup] LLM 未激活，原文广播降级: {e}");
+            bus.emit(
+                "message_out",
+                json!({
+                    "from_id": from_id,
+                    "content": wake.merged_message,
+                    "channel": channel,
+                    "timestamp": now_input_ts(),
+                }),
+            );
+            return;
+        }
+    };
+
+    // 2) 组装唤醒输入并跑注入闭包（对齐 run_conscious_turn）
+    let input = wakeup_input_line(&now_input_ts(), &wake.merged_message);
+    let embedder = NoopEmbedder;
+    let window = ContextWindowConfig::default();
+    let ctx = InjectorContext::default();
+    let agent_name = cfg
+        .extra
+        .get("agent_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(compat::DEFAULT_AGENT_NAME)
+        .to_string();
+
+    let turn = {
+        let mut guard = state.lock().await;
+        match run_user_turn(
+            &db,
+            &embedder,
+            &mut guard,
+            &input,
+            channel,
+            "",
+            &ctx,
+            &window,
+            &agent_name,
+            false,
+            None,
+            "",
+            None,
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!("[wakeup] run_user_turn 失败: {e}");
+                return;
+            }
+        }
+    };
+
+    // 3) 真实工具执行器（与交互轮一致）
+    let sender = bus.clone();
+    let send_db = db.clone();
+    let send_message: SendMessageFn = Arc::new(move |target: &str, content: &str| {
+        let _ = conversations::insert(&send_db, "agent", target, content);
+        sender.emit(
+            "message_out",
+            json!({
+                "from_id": target,
+                "content": content,
+                "channel": "API",
+                "timestamp": now_input_ts(),
+            }),
+        );
+        Ok("delivered".into())
+    });
+    let mut executor = NativeToolExecutor::new(tool_root)
+        .with_db(db.clone())
+        .with_send_message(send_message);
+    if let Some(bin) = sandbox_bin {
+        executor = executor.with_sandbox(bin);
+    }
+
+    // 组装 LLM 消息：LlmMessage → ChatMessage（OpenAI 线协议）
+    let chat_messages: Vec<ChatMessage> = turn
+        .llm_messages
+        .iter()
+        .map(|m| ChatMessage {
+            role: match m.role {
+                LlmRole::System => ChatRole::System,
+                LlmRole::User => ChatRole::User,
+                LlmRole::Assistant => ChatRole::Assistant,
+            },
+            content: Some(m.content.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning_content: None,
+        })
+        .collect();
+
+    let args = CallLlmArgs {
+        messages: Some(chat_messages),
+        tools: all_tool_schemas(),
+        local_reply: false,
+        must_reply: true,
+        ..Default::default()
+    };
+    let client = reqwest::Client::new();
+    let stream = real_stream_fn();
+    // M3：唤醒轮显式标 stage='wakeup' → 唤醒成本账本（M4 周报）开始有真实数据
+    let ctx = StreamContext {
+        stage: "wakeup".into(),
+        ..Default::default()
+    };
+
+    // 4) LLM 工具循环（真实流式调用 + 9 个真实工具）
+    let result = call_llm(
+        &client,
+        &llm_cfg,
+        stream.as_ref(),
+        &executor,
+        &args,
+        &ctx,
+        None,
+        &ToolLoopLimits::default(),
+        None,
+    )
+    .await;
+
+    match result {
+        Ok(r) => {
+            let content = r.content.trim().to_string();
+            if content.is_empty() {
+                // 有/无工具调用都保证提醒送达：空文本时原文兜底
+                tracing::warn!("[wakeup] LLM 空回复，原文兜底");
+                bus.emit(
+                    "message_out",
+                    json!({
+                        "from_id": from_id,
+                        "content": wake.merged_message,
+                        "channel": channel,
+                        "timestamp": now_input_ts(),
+                        "total_tool_calls": r.total_calls,
+                    }),
+                );
+                return;
+            }
+            bus.emit(
+                "message_out",
+                json!({
+                    "from_id": from_id,
+                    "content": content,
+                    "channel": channel,
+                    "timestamp": now_input_ts(),
+                    "total_tool_calls": r.total_calls,
+                }),
+            );
+            tracing::info!("[wakeup] 唤醒完成 tools={}", r.total_calls);
+        }
+        Err(e) => {
+            tracing::error!("[wakeup] call_llm 失败: {e}");
+            bus.emit(
+                "message_out",
+                json!({
+                    "from_id": from_id,
+                    "content": wake.merged_message,
+                    "channel": channel,
+                    "timestamp": now_input_ts(),
+                }),
+            );
+        }
+    }
+}
+
+/// P1-1 接线：后台唤醒循环（TICK 轮）。
+/// 周期查到期提醒 → 合并为 1 次唤醒 → run_wakeup_turn（stage='wakeup'，fast_model）。
+/// 配置项（cfg.extra）：
+///   wakeup_interval_secs：轮询间隔（默认 60s，最小 1s）
+///   wakeup_days：周窗口天数（默认 7）
+///   wakeup_budget_tokens：周窗口唤醒预算（默认 0 = 闸门关闭，纯观测不拦截）
+fn spawn_wakeup_loop(
+    db: Db,
+    bus: EventBus,
+    state: Arc<Mutex<RuntimeState>>,
+    cfg: Config,
+    tool_root: PathBuf,
+    sandbox_bin: Option<PathBuf>,
+) -> tokio::task::JoinHandle<()> {
+    let interval_secs = cfg
+        .extra
+        .get("wakeup_interval_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(60)
+        .max(1);
+    let days = cfg
+        .extra
+        .get("wakeup_days")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(7);
+    let budget = cfg
+        .extra
+        .get("wakeup_budget_tokens")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        loop {
+            interval.tick().await;
+            let now = now_input_ts();
+            match coalesced_wakeup(&db, &now, days, budget) {
+                Ok(Some(wake)) => {
+                    tracing::info!(
+                        "[wakeup] {} 条到期提醒合并为 1 次唤醒",
+                        wake.trigger_count
+                    );
+                    run_wakeup_turn(
+                        db.clone(),
+                        bus.clone(),
+                        state.clone(),
+                        cfg.clone(),
+                        tool_root.clone(),
+                        sandbox_bin.clone(),
+                        wake,
+                    )
+                    .await;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("[wakeup] 唤醒轮失败: {e}"),
+            }
+        }
+    })
+}
+
 pub async fn run_api_server() -> Result<()> {
     run_api_server_on(compat::DEFAULT_API_PORT).await
 }
@@ -420,6 +679,11 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
         tracing::warn!("[R3] 未找到 sandbox 子进程，exec_command 将直接执行");
     }
 
+    // P1-1 接线：唤醒循环在 inbound 闭包 move 之前预克隆
+    // （inbound 会 move 走 tool_root / sandbox_bin，唤醒循环需要自己的副本）
+    let wakeup_tool_root = tool_root.clone();
+    let wakeup_sandbox_bin = sandbox_bin.clone();
+
     let inbound = Arc::new(move |msg: InboundMessage| {
         // 1) 落库用户消息 → 真实 conversation_id
         let conversation_id = match conversations::insert(&inbound_db, "user", &msg.from_id, &msg.content) {
@@ -450,6 +714,17 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
         Some(InboundQueued { conversation_id })
     });
 
+    // P1-1 接线：后台唤醒循环（合并到期提醒 → 1 次唤醒 → stage='wakeup' LLM 调用）
+    let _wakeup_loop = spawn_wakeup_loop(
+        db.clone(),
+        bus.clone(),
+        state.clone(),
+        cfg.clone(),
+        wakeup_tool_root,
+        wakeup_sandbox_bin,
+    );
+    tracing::info!("[wakeup] 后台唤醒循环已启动");
+
     let status = Arc::new(|| json!({ "running": true }));
 
     let agent_name = cfg
@@ -479,4 +754,78 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
     let host = if lan { "0.0.0.0" } else { "127.0.0.1" };
     server.serve(host, port).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bailongma_core::db::open_database;
+
+    fn test_db() -> Db {
+        let dir = std::env::temp_dir().join(format!(
+            "blm_wakeup_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        open_database(dir.join("t.db")).unwrap()
+    }
+
+    fn insert_due_reminder(db: &Db, due_at: &str, task: &str) -> i64 {
+        let conn = db.conn();
+        conn.execute(
+            "INSERT INTO reminders (user_id, due_at, task, system_message, status, source)
+             VALUES (?1, ?2, ?3, ?4, 'pending', 'test')",
+            rusqlite::params!["ID:000001", due_at, task, format!("sys:{task}")],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn wakeup_input_line_formats() {
+        let line = wakeup_input_line(
+            "2026-08-11T08:00:00+08:00",
+            "有 1 条到期提醒待处理：\n- [2026-08-11T08:00:00+08:00] 喂猫",
+        );
+        assert!(line.starts_with("[system] 2026-08-11T08:00:00+08:00 [tick] "));
+        assert!(line.contains("喂猫"));
+    }
+
+    #[tokio::test]
+    async fn wakeup_loop_broadcasts_merged_message_when_llm_disabled() {
+        // LLM 未激活（默认 Config 无 provider）→ 降级路径：合并消息原文广播 + 提醒 fired
+        let db = test_db();
+        let rid = insert_due_reminder(&db, "2026-08-11T08:00:00+08:00", "喂猫提醒");
+        let bus = EventBus::new(Arc::new(|_, _, _, _| {}));
+        let mut rx = bus.subscribe();
+        let state = Arc::new(Mutex::new(runtime_init(&db).unwrap()));
+        let mut cfg = Config::default();
+        cfg.extra.insert("wakeup_interval_secs".into(), json!(1));
+
+        let tool_root = std::env::temp_dir().join("blm_wakeup_test_sandbox");
+        let _handle = spawn_wakeup_loop(db.clone(), bus, state, cfg, tool_root, None);
+
+        // 首个 tick 立即执行 → 广播合并消息（原文降级）
+        let msg = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("应收到 message_out 广播")
+            .expect("channel 不应关闭");
+        assert_eq!(msg.r#type, "message_out");
+        assert_eq!(msg.data["channel"], "tick");
+        assert_eq!(msg.data["from_id"], "system");
+        let content = msg.data["content"].as_str().unwrap();
+        assert!(content.contains("1 条到期提醒"), "内容: {content}");
+        assert!(content.contains("喂猫提醒"), "内容: {content}");
+
+        // 消费后提醒标记 fired（不会重复唤醒）
+        let conn = db.conn();
+        let status: String = conn
+            .query_row("SELECT status FROM reminders WHERE id = ?1", [rid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "fired");
+    }
 }

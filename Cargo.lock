@@ -142,6 +142,7 @@ dependencies = [
  "bailongma-core",
  "chrono",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tao",
