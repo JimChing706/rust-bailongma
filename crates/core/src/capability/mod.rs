@@ -301,7 +301,27 @@ const BUILTIN: &[ToolCapability] = &[
         output_policy: OutputPolicy::Passthrough,
         requires_approval: false,
     },
-];
+
+    ToolCapability {
+        name: "matter_create",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::Write],
+        scopes: &[Scope::System],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "matter_query",
+        risk_level: RiskLevel::Low,
+        side_effects: &[SideEffect::Read],
+        scopes: &[Scope::System],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },];
 
 /// 工具信任分层（P2-2）：由能力声明推导，供 PolicyEngine 分层放行。
 /// 纯声明推导，fail-closed：未知工具一律 Denied。
@@ -391,7 +411,8 @@ mod tests {
         }
         // 纯查询 / 沙箱内读写 / 对外发送（Medium 可控，文档既定）→ Trusted
         for n in ["get_timestamp", "read_file", "write_file", "list_dir", "make_dir",
-                  "search_memory", "collect_agents", "remind", "send_message"] {
+                  "search_memory", "collect_agents", "remind", "send_message",
+                  "matter_create", "matter_query"] {
             assert_eq!(trust_tier(n), TrustTier::Trusted, "{n}");
         }
         // 未知工具 → Denied
@@ -423,7 +444,7 @@ mod tests {
         let names = [
             "get_timestamp", "read_file", "list_dir", "write_file", "make_dir",
             "delete_file", "exec_command", "search_memory", "send_message",
-            "collect_agents", "remind",
+            "collect_agents", "remind", "matter_create", "matter_query",
         ];
         for n in names {
             assert!(builtin(n).is_some(), "能力表缺工具: {n}");

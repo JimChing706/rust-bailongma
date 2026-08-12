@@ -38,6 +38,7 @@ use crate::llm::tools::{
 };
 
 pub mod extra;
+pub mod matter_tools;
 pub mod validate;
 
 // ─────────────────────────────────────────────────────────────
@@ -112,7 +113,7 @@ impl NativeToolExecutor {
     /// 工具是否已接线（供上层决定是否把工具暴露给 LLM）。
     pub fn is_ready(&self, name: &str) -> bool {
         match name {
-            "search_memory" | "collect_agents" | "remind" => self.db.is_some(),
+            "search_memory" | "collect_agents" | "remind" | "matter_create" | "matter_query" => self.db.is_some(),
             "send_message" => self.send_message.is_some(),
             _ => true,
         }
@@ -519,6 +520,8 @@ impl ToolExecutor for NativeToolExecutor {
             "send_message" => self.send_message_impl(args)?,
             "collect_agents" => extra::collect_agents_impl(self, args)?,
             "remind" => extra::remind_impl(self, args)?,
+            "matter_create" => matter_tools::matter_create_impl(self, args)?,
+            "matter_query" => matter_tools::matter_query_impl(self, args)?,
             other => return Err(CoreError::Tool(format!("未知工具: {other}"))),
         };
         Ok(result.to_string())
@@ -558,6 +561,7 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
             .required("content", string_param("消息正文")),
     ];
     tools.extend(extra::extra_tool_schemas());
+    tools.extend(matter_tools::matter_tool_schemas());
     tools
 }
 
