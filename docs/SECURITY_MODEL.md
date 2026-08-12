@@ -17,6 +17,9 @@
 渲染时每段带 `<!-- SECTION source=.. trust=.. instruction_allowed=.. can_trigger_tool=.. -->`
 头注，LLM 侧可识别分区边界；不可信内容中的 `<`/`>` 等转义，杜绝 `</context><system>...` 闭合注入。
 
+另有 `ToolResult` 源（工具执行结果回喂）：系统生成内容，归最高信任层（不携带
+不可信指令），作为扩展来源由 injector_format 注入（Phase 1 审计补记）。
+
 ## 网络访问策略
 
 - 云元数据地址 / 保留地址（`169.254.169.254`、`metadata.*.internal`）→ **拒绝**
@@ -45,9 +48,11 @@
 |-------|------|---------------|
 | `guard` | 策略判定 | `allow` / `deny` / `require_approval` |
 | `approval` | 人工确认结果（含审批耗时 ms） | `approved` / `modify` / `denied` / 超时 |
-| `execute` | 实际执行结果（含耗时 ms） | `ok` / `timeout` / `err` |
+| `execute` | 实际执行结果（含耗时 ms，全工具统一记录） | `ok` / `timeout` / `err` |
 
 - 内存环形缓冲（上限 10k 条，先进先出），进程级单例。
+- `execute` stage 由 `NativeToolExecutor::execute` 分发层统一记录（Phase 1 修复 E），
+  不再只覆盖 exec_command；`guard`/`approval` stage 由 ApprovalGate 记录。
 - 查询：`GET /trace?limit=50&tool=exec_command`（时间倒序，limit 上限 500）。
 - 工具调用台账落库由 `llm_tool_calls`（工具循环层）承接，本层专注决策链路。
 

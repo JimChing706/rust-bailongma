@@ -29,7 +29,12 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::agents::delegate::{
+    delegate_to_agent_schema, exec_delegate_to_agent, exec_grant_agent_delegation,
+    grant_agent_delegation_schema,
+};
 use crate::approval::{ApprovalGate, GuardResult};
+use crate::capability::{builtin, CallerTrust};
 use crate::db::Db;
 use crate::error::{CoreError, Result};
 use crate::llm::tool_loop::ToolExecutor;
@@ -75,8 +80,10 @@ pub struct NativeToolExecutor {
     pub send_message: Option<SendMessageFn>,
     /// sandbox 子进程路径（Some 时 exec_command 走子进程委托；None 直接执行）
     pub sandbox_bin: Option<PathBuf>,
-    /// 人工确认门（Some 时 exec_command 默认先过审批；None = 不启用，保持旧行为）
+    /// 人工确认门（Some 时 needs_approval 工具先过审批；None = 不启用，保持旧行为）
     pub approval: Option<Arc<ApprovalGate>>,
+    /// 调用来源信任分层（P2-2，Phase 1 修复 D）：System 免确认，User/Agent 需人工确认
+    pub caller_trust: CallerTrust,
 }
 
 impl NativeToolExecutor {
@@ -87,6 +94,7 @@ impl NativeToolExecutor {
             send_message: None,
             sandbox_bin: None,
             approval: None,
+            caller_trust: CallerTrust::Agent,
         }
     }
 
@@ -110,10 +118,54 @@ impl NativeToolExecutor {
         self
     }
 
+    pub fn with_caller_trust(mut self, trust: CallerTrust) -> Self {
+        self.caller_trust = trust;
+        self
+    }
+
+    /// Phase 1 修复 B+D：needs_approval 工具分发前统一过 ApprovalGate
+    /// （CallerTrust 分层：System 免确认，User/Agent 需人工确认，120s 超时按拒绝）。
+    /// Modified 抉择按工具替换主参数（exec_command→command，delete_file→path）。
+    fn guard_approval(&self, name: &str, args: &mut Value) -> Result<()> {
+        let Some(gate) = self.approval.as_ref() else {
+            return Ok(());
+        };
+        let Some(cap) = builtin(name) else {
+            return Ok(());
+        };
+        if !cap.needs_approval() {
+            return Ok(());
+        }
+        let preview: String = args.to_string().chars().take(160).collect();
+        let detail = format!("{name}: {preview}");
+        let decision = gate.guard_tool_call_with_caller(name, &detail, self.caller_trust);
+        match decision {
+            Ok(GuardResult::Proceed) => Ok(()),
+            Ok(GuardResult::Modified(new_val)) => {
+                let key = match name {
+                    "exec_command" => "command",
+                    "delete_file" => "path",
+                    _ => {
+                        return Err(CoreError::Tool(format!(
+                            "{name} 不支持改参执行（ApprovalGate modify）"
+                        )));
+                    }
+                };
+                if let Some(obj) = args.as_object_mut() {
+                    obj.insert(key.into(), Value::String(new_val));
+                }
+                Ok(())
+            }
+            Ok(GuardResult::Denied(r)) => Err(CoreError::Tool(format!("{name} 被拒绝: {r}"))),
+            Err(e) => Err(CoreError::Other(e.to_string())),
+        }
+    }
+
     /// 工具是否已接线（供上层决定是否把工具暴露给 LLM）。
     pub fn is_ready(&self, name: &str) -> bool {
         match name {
-            "search_memory" | "collect_agents" | "remind" | "matter_create" | "matter_query" => self.db.is_some(),
+            "search_memory" | "collect_agents" | "remind" | "matter_create" | "matter_query"
+            | "delegate_to_agent" | "grant_agent_delegation" => self.db.is_some(),
             "send_message" => self.send_message.is_some(),
             _ => true,
         }
@@ -250,7 +302,7 @@ impl NativeToolExecutor {
     }
 
     fn exec_command(&self, args: &Value) -> Result<Value> {
-        let mut command = args
+        let command = args
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or("")
@@ -259,21 +311,6 @@ impl NativeToolExecutor {
         if command.is_empty() {
             return Err(CoreError::Tool("exec_command 缺 command".into()));
         }
-        // Phase 1 人工确认：exec_command 默认 require approval（fail-closed）
-        if let Some(gate) = self.approval.as_ref() {
-            let preview: String = command.chars().take(120).collect();
-            let detail = String::from("exec_command: ") + preview.as_str();
-            let decision = gate.guard_tool_call("exec_command", detail.as_str());
-            match decision {
-                Ok(GuardResult::Proceed) => {}
-                Ok(GuardResult::Modified(new_cmd)) => command = new_cmd,
-                Ok(GuardResult::Denied(r)) => {
-                    return Err(CoreError::Tool(String::from("exec_command 被拒绝: ") + r.as_str()));
-                }
-                Err(e) => return Err(CoreError::Other(e.to_string())),
-            }
-        }
-
         let timeout_ms = args
             .get("timeout_ms")
             .and_then(Value::as_u64)
@@ -288,16 +325,7 @@ impl NativeToolExecutor {
 
         // 委托 sandbox 子进程（如果配置了）
         if let Some(bin) = &self.sandbox_bin {
-            let t0 = Instant::now();
             let r = self.exec_via_sandbox(bin, &command, &cwd, timeout_ms);
-            crate::trace::global().record(
-                "exec_command",
-                "execute",
-                if r.is_ok() { "ok" } else { "err" },
-                "",
-                t0.elapsed().as_millis() as u64,
-                r.is_ok(),
-            );
             return r;
         }
 
@@ -361,15 +389,6 @@ impl NativeToolExecutor {
             .flatten()
             .map(|s| s.code().unwrap_or(-1))
             .unwrap_or(-1);
-
-        crate::trace::global().record(
-            "exec_command",
-            "execute",
-            if timed_out { "timeout" } else { "ok" },
-            "",
-            start.elapsed().as_millis() as u64,
-            !timed_out,
-        );
 
         Ok(json!({
             "ok": true,
@@ -508,23 +527,61 @@ impl ToolExecutor for NativeToolExecutor {
     fn execute(&self, name: &str, args: &Value) -> Result<String> {
         // P2-2: 分发前统一参数 schema 校验（fail-closed：未知参数/类型错/enum 越界一律拒绝）
         validate::validate_args(name, args)?;
-        let result = match name {
-            "get_timestamp" => self.get_timestamp(args)?,
-            "read_file" => self.read_file(args)?,
-            "write_file" => self.write_file(args)?,
-            "list_dir" => self.list_dir(args)?,
-            "make_dir" => self.make_dir(args)?,
-            "delete_file" => self.delete_file(args)?,
-            "exec_command" => self.exec_command(args)?,
-            "search_memory" => self.search_memory(args)?,
-            "send_message" => self.send_message_impl(args)?,
-            "collect_agents" => extra::collect_agents_impl(self, args)?,
-            "remind" => extra::remind_impl(self, args)?,
-            "matter_create" => matter_tools::matter_create_impl(self, args)?,
-            "matter_query" => matter_tools::matter_query_impl(self, args)?,
-            other => return Err(CoreError::Tool(format!("未知工具: {other}"))),
+        // Phase 1 修复 B+D：needs_approval 工具（delete_file/exec_command/delegate…）分发前
+        // 统一过 ApprovalGate（CallerTrust 分层：System 免确认，User/Agent 需人工确认）。
+        // 原 exec_command 内部 guard 上移至此，补齐 delete_file 等执行链缺口。
+        let mut args = args.clone();
+        self.guard_approval(name, &mut args)?;
+        // Phase 1 修复 E：全工具统一记录 execute stage（原仅 exec_command 有轨迹）
+        let t0 = Instant::now();
+        let result: Result<Value> = match name {
+            "get_timestamp" => self.get_timestamp(&args),
+            "read_file" => self.read_file(&args),
+            "write_file" => self.write_file(&args),
+            "list_dir" => self.list_dir(&args),
+            "make_dir" => self.make_dir(&args),
+            "delete_file" => self.delete_file(&args),
+            "exec_command" => self.exec_command(&args),
+            "search_memory" => self.search_memory(&args),
+            "send_message" => self.send_message_impl(&args),
+            "collect_agents" => extra::collect_agents_impl(self, &args),
+            "remind" => extra::remind_impl(self, &args),
+            "matter_create" => matter_tools::matter_create_impl(self, &args),
+            "matter_query" => matter_tools::matter_query_impl(self, &args),
+            "delegate_to_agent" => {
+                let Some(db) = &self.db else {
+                    return Err(CoreError::Tool(
+                        "delegate_to_agent 未接线（未注入 Db，当前轮不可用）".into(),
+                    ));
+                };
+                let raw = exec_delegate_to_agent(db, &args);
+                serde_json::from_str::<Value>(&raw)
+                    .map_err(|e| CoreError::Tool(format!("delegate 结果解析失败: {e}")))
+            }
+            "grant_agent_delegation" => {
+                let Some(db) = &self.db else {
+                    return Err(CoreError::Tool(
+                        "grant_agent_delegation 未接线（未注入 Db，当前轮不可用）".into(),
+                    ));
+                };
+                let raw = exec_grant_agent_delegation(db, &args);
+                serde_json::from_str::<Value>(&raw)
+                    .map_err(|e| CoreError::Tool(format!("delegate 结果解析失败: {e}")))
+            }
+            other => Err(CoreError::Tool(format!("未知工具: {other}"))),
         };
-        Ok(result.to_string())
+        let dur_ms = t0.elapsed().as_millis() as u64;
+        match result {
+            Ok(v) => {
+                crate::trace::global().record(name, "execute", "ok", "", dur_ms, true);
+                Ok(v.to_string())
+            }
+            Err(e) => {
+                let msg: String = e.to_string().chars().take(200).collect();
+                crate::trace::global().record(name, "execute", "err", &msg, dur_ms, false);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -562,6 +619,8 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
     ];
     tools.extend(extra::extra_tool_schemas());
     tools.extend(matter_tools::matter_tool_schemas());
+    tools.push(delegate_to_agent_schema());
+    tools.push(grant_agent_delegation_schema());
     tools
 }
 
@@ -895,5 +954,121 @@ mod tests {
             &json!({ "path": "big.bin", "max_bytes": 1024 }),
         );
         assert!(r.is_err(), "超大文件应拒绝而非整读截断: {r:?}");
+    }
+
+    // ── Phase 1 修复 B：delete_file 挂 ApprovalGate（原仅 exec_command 挂门）──
+
+    #[test]
+    fn delete_file_requires_approval_when_gate_present() {
+        use crate::approval::ApprovalGate;
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("victim.txt"), "x").unwrap();
+        let gate = Arc::new(
+            ApprovalGate::new(dir.path().to_path_buf())
+                .with_timeout(Duration::from_millis(300)),
+        );
+        let ex = executor(dir.path()).with_approval(gate.clone());
+        let handle = std::thread::spawn(move || {
+            ex.execute("delete_file", &json!({ "path": "victim.txt" }))
+        });
+        let mut id = None;
+        for _ in 0..100 {
+            if let Some(first) = gate.pending_ids().first() {
+                id = Some(first.clone());
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let id = id.expect("delete_file 应产生审批挂起");
+        gate.submit(&id, "allow_once").unwrap();
+        let r = handle.join().unwrap();
+        assert!(r.is_ok(), "allow_once 后应删除成功: {r:?}");
+        assert!(!dir.path().join("victim.txt").exists(), "文件应已被删除");
+    }
+
+    #[test]
+    fn delete_file_denied_on_timeout_when_gate_present() {
+        use crate::approval::ApprovalGate;
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("victim.txt"), "x").unwrap();
+        let gate = Arc::new(
+            ApprovalGate::new(dir.path().to_path_buf())
+                .with_timeout(Duration::from_millis(150)),
+        );
+        let ex = executor(dir.path()).with_approval(gate.clone());
+        let r = ex.execute("delete_file", &json!({ "path": "victim.txt" }));
+        assert!(r.is_err(), "无人确认应拒绝: {r:?}");
+        assert!(r.unwrap_err().to_string().contains("拒绝"));
+        assert!(dir.path().join("victim.txt").exists(), "文件不应被删");
+        assert_eq!(gate.pending_count(), 0, "挂起请求应已清理");
+    }
+
+    // ── Phase 1 修复 D：CallerTrust 分层接线（System 免确认）──
+
+    #[test]
+    fn system_caller_bypasses_approval_for_high_risk_tools() {
+        use crate::approval::ApprovalGate;
+        use crate::capability::CallerTrust;
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("victim.txt"), "x").unwrap();
+        let gate = Arc::new(ApprovalGate::new(dir.path().to_path_buf()));
+        let ex = executor(dir.path())
+            .with_approval(gate.clone())
+            .with_caller_trust(CallerTrust::System);
+        let r = ex.execute("delete_file", &json!({ "path": "victim.txt" }));
+        assert!(r.is_ok(), "System 来源应免确认: {r:?}");
+        assert_eq!(gate.pending_count(), 0);
+        assert!(!dir.path().join("victim.txt").exists());
+    }
+
+    // ── Phase 1 修复 C：delegate 工具注册进工具循环 ──
+
+    #[test]
+    fn delegate_tools_registered_and_gated() {
+        let schemas = all_tool_schemas();
+        let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"delegate_to_agent"), "schema 缺失 delegate_to_agent");
+        assert!(names.contains(&"grant_agent_delegation"), "schema 缺失 grant_agent_delegation");
+        // 无 db：未接线错误（不执行真实进程）
+        let dir = tempdir().unwrap();
+        let ex = executor(dir.path());
+        assert!(!ex.is_ready("delegate_to_agent"));
+        let r = ex.execute(
+            "delegate_to_agent",
+            &json!({ "agent_id": "codex", "prompt": "hi" }),
+        );
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("未接线"));
+        // 能力声明：High + 需确认（与文档一致）
+        assert!(builtin("delegate_to_agent").unwrap().needs_approval());
+        assert!(builtin("grant_agent_delegation").unwrap().needs_approval());
+        assert_eq!(crate::capability::trust_tier("delegate_to_agent"), crate::capability::TrustTier::Approval);
+    }
+
+    // ── Phase 1 修复 E：execute stage 全工具统一记录 ──
+
+    #[test]
+    fn execute_stage_traced_for_all_tools() {
+        let dir = tempdir().unwrap();
+        let ex = executor(dir.path());
+        let _ = ex.execute("get_timestamp", &json!({ "format": "iso" }));
+        let _ = ex.execute("list_dir", &json!({ "path": "." }));
+        let recent = crate::trace::global().recent(20, "");
+        let tools_with_execute: Vec<&str> = recent
+            .iter()
+            .filter(|t| t.stage == "execute" && t.decision == "ok")
+            .map(|t| t.tool.as_str())
+            .collect();
+        assert!(tools_with_execute.contains(&"get_timestamp"), "recent={recent:?}");
+        assert!(tools_with_execute.contains(&"list_dir"), "recent={recent:?}");
+        // 失败也记录 err
+        let _ = ex.execute("read_file", &json!({ "path": "no-such.txt" }));
+        let recent = crate::trace::global().recent(5, "read_file");
+        let errs: Vec<&str> = recent
+            .iter()
+            .filter(|t| t.stage == "execute" && t.decision == "err")
+            .map(|t| t.tool.as_str())
+            .collect();
+        assert!(!errs.is_empty(), "read_file 失败应记录 execute/err");
     }
 }

@@ -21,6 +21,7 @@ use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::capability::CallerTrust;
 use crate::error::{CoreError, Result};
 use crate::policy::{PolicyDecision, PolicyEngine};
 
@@ -132,10 +133,23 @@ impl ApprovalGate {
     /// 工具调用守卫：Allow → Proceed；RequireApproval → 挂起等用户抉择；
     /// Deny / 未知工具 / 超时 → Denied。
     pub fn guard_tool_call(&self, tool: &str, detail: &str) -> Result<GuardResult> {
+        // 默认按终端用户来源评估（保持旧行为语义）
+        self.guard_tool_call_with_caller(tool, detail, CallerTrust::User)
+    }
+
+    /// 信任分层版守卫（P2-2 接线，Phase 1 修复 D）：CallerTrust::System 来源
+    /// 直接放行需确认工具（`check_tool_call_with_caller` 语义）；User/Agent 需
+    /// 人工确认。未知工具 fail-closed 拒绝。
+    pub fn guard_tool_call_with_caller(
+        &self,
+        tool: &str,
+        detail: &str,
+        caller: CallerTrust,
+    ) -> Result<GuardResult> {
         let session_ok = self.inner.lock().unwrap().session_approved.contains(tool);
         let decision = {
             let mut inner = self.inner.lock().unwrap();
-            inner.policy.check_tool_call(tool, session_ok)
+            inner.policy.check_tool_call_with_caller(tool, caller, session_ok)
         };
         let guard_summary = decision.summary();
         crate::trace::global().record(tool, "guard", &guard_summary, detail, 0, true);
@@ -213,6 +227,11 @@ impl ApprovalGate {
     /// 当前挂起请求数（测试 / 状态接口用）。
     pub fn pending_count(&self) -> usize {
         self.inner.lock().unwrap().pending.len()
+    }
+
+    /// 当前挂起请求 id 列表（测试 / 状态接口用；POST /approval 需按 id 回传）。
+    pub fn pending_ids(&self) -> Vec<String> {
+        self.inner.lock().unwrap().pending.keys().cloned().collect()
     }
 
     /// 是否本会话已获准该工具。

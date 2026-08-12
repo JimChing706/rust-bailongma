@@ -22,21 +22,25 @@
 requires_approval == true 或 risk_level >= High → 默认需人工确认
 ```
 
-## 内置工具清单（11 个）
+## 内置工具清单（13 个）
 
 | 工具 | 风险 | 默认审批 | 说明 |
 |------|------|---------|------|
 | `get_timestamp` | Low | 否 | 只读时间，无副作用 |
-| `read_file` | Low | 否 | 只读，受 policy 路径约束 |
+| `read_file` | Medium | 否 | 只读，受 policy 路径约束 |
 | `list_dir` | Low | 否 | 只读目录 |
-| `write_file` | Low | 否 | 写文件，受路径约束 + 审计 |
+| `write_file` | Medium | 否 | 写文件，受路径约束 + 审计 |
 | `make_dir` | Low | 否 | 建目录 |
 | `delete_file` | High | **是** | 破坏性操作，需人工确认 |
 | `exec_command` | Critical | **是** | 执行外部进程，最高风险，默认全量审批 |
 | `search_memory` | Low | 否 | 记忆检索，只读 |
 | `send_message` | Medium | 否 | 外发消息，有副作用但可控 |
 | `collect_agents` | Low | 否 | 收集本机 Agent 信息（Phase 0 补齐） |
-| `remind` | Medium | 否 | 创建提醒（Phase 0 补齐） |
+| `matter_create` | Medium | 否 | 建事项（matter ledger，M5 落地） |
+| `matter_query` | Low | 否 | 查事项/幽灵信号/事件流（M5 落地） |
+| `delegate_to_agent` | High | **是** | 委托外部 AI Agent 执行（跨 agent 副作用，需人工确认） |
+| `grant_agent_delegation` | High | **是** | 授予/撤销委托权限（敏感授权，需人工确认） |
+| `remind` | Low | 否 | 查询到期提醒（Phase 0 补齐） |
 
 > 风险等级逐项以 `capability/mod.rs` 中 `builtin()` 声明为准，`builtin_table_sane` 测试断言关键约束
 > （exec_command 必须 Critical + approval；delete_file ≥ High；低风险工具免审批）。
@@ -59,12 +63,15 @@ requires_approval == true 或 risk_level >= High → 默认需人工确认
 
 ```
 LLM 工具循环
-  → NativeToolExecutor（tools/mod.rs，11 工具）
-  → PolicyEngine::check_tool_call（capability 匹配 → 决策）
-  → RequireApproval 时 → ApprovalGate（approval.rs）挂起
-      → WS /scene 推送 choice 卡片 → 用户四抉择 → POST /approval 回传
-      → 120s 超时按拒绝处理（fail-closed）
-  → 放行 → 真实执行 → llm_tool_calls 台账落库（含 attempt 幂等键）
+  → NativeToolExecutor::execute（tools/mod.rs，13 工具）
+     → validate::validate_args（P2-2 全参数 schema 校验，fail-closed）
+     → guard_approval（needs_approval 工具统一过 ApprovalGate，CallerTrust 分层：
+       System 免确认，User/Agent 需人工确认）
+         → RequireApproval 时 → ApprovalGate（approval.rs）挂起
+             → WS /scene 推送 choice 卡片 → 用户四抉择 → POST /approval 回传
+             → 120s 超时按拒绝处理（fail-closed）
+     → 放行 → 真实执行 → trace execute stage（全工具统一记录）
+  → llm_tool_calls 台账落库（含 attempt 幂等键）
 ```
 
 

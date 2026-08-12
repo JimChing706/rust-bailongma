@@ -321,6 +321,27 @@ const BUILTIN: &[ToolCapability] = &[
         deny_paths: &[],
         output_policy: OutputPolicy::Passthrough,
         requires_approval: false,
+    },
+
+    ToolCapability {
+        name: "delegate_to_agent",
+        risk_level: RiskLevel::High,
+        side_effects: &[SideEffect::Spawn],
+        scopes: &[Scope::Shell],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: true,
+    },
+    ToolCapability {
+        name: "grant_agent_delegation",
+        risk_level: RiskLevel::High,
+        side_effects: &[SideEffect::Write],
+        scopes: &[Scope::System],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: true,
     },];
 
 /// 工具信任分层（P2-2）：由能力声明推导，供 PolicyEngine 分层放行。
