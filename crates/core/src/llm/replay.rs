@@ -22,6 +22,7 @@ pub trait ToolReplayGuard: Send + Sync {
     /// 查询同一逻辑工具调用是否已有成功执行结果；命中返回记录的结果 JSON。
     fn find_result(&self, request_id: &str, round: usize, tool_name: &str) -> Option<String>;
     /// 同步记录一次工具执行（幂等：同键重复记录被 INSERT OR IGNORE 去重）。
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         request_id: &str,

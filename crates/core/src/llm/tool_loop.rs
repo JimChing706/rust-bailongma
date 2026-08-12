@@ -698,6 +698,7 @@ pub async fn call_llm(
 /// M2 台账助手：写一条工具执行记录（best-effort，经 round_ctx.metrics 入队）。
 /// `attempt` 固定 1：重试发生在 stream 层（round 内不可见），工具不会因重试重复执行；
 /// 唯一键含 attempt 维度是为将来「round 级重试」预留，且重放不误伤。
+#[allow(clippy::too_many_arguments)]
 fn record_tool_call(
     round_ctx: &StreamContext,
     round: usize,

@@ -362,7 +362,7 @@ fn proto_malformed_json_errors() {
     let mut child = spawn_sandbox(dir.path(), &[]);
     {
         let stdin = child.stdin.as_mut().unwrap();
-        writeln!(stdin, "{}", "{{{ not json").unwrap();
+        writeln!(stdin, "{{{{{{ not json").unwrap();
         stdin.flush().unwrap();
     }
     let stdout = child.stdout.as_mut().unwrap();

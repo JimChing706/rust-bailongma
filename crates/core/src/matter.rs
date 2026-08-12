@@ -415,7 +415,7 @@ pub fn expire_stale(db: &Db, stale_before: &str) -> Result<Vec<i64>> {
     for row in crate::db::repositories::matters::scan_active(db)? {
         // updated_at 为 SQLite datetime('now')（UTC "YYYY-MM-DD HH:MM:SS"），
         // stale_before 需按同样格式传入；字符串比较即时序比较。
-        if row.updated_at < stale_before.to_string() {
+        if row.updated_at.as_str() < stale_before {
             crate::db::repositories::matters::mark_finished(db, row.id, "expired", "expired")?;
             crate::db::repositories::matters::insert_event(
                 db,
@@ -432,14 +432,14 @@ pub fn expire_stale(db: &Db, stale_before: &str) -> Result<Vec<i64>> {
     Ok(dead)
 }
 
-/// 幽灵事项检测（命题4/7 兜底）：挂起无主（executor 空）+ 超过 stale_before 无进展
-/// + 无验收判据（老数据可能为空）→ 候选清单；只出 ghost_candidate 信号，
+/// 幽灵事项检测（命题4/7 兜底）：挂起无主（executor 空）、超过 stale_before 无进展、
+/// 无验收判据（老数据可能为空）→ 候选清单；只出 ghost_candidate 信号，
 /// 不自动终止，终止/搁置由人类决策。
 pub fn detect_ghosts(db: &Db, stale_before: &str) -> Result<Vec<GhostCandidate>> {
     let mut ghosts = Vec::new();
     for row in crate::db::repositories::matters::scan_active(db)? {
         let orphan = row.executor_id.is_none();
-        let idle = row.updated_at < stale_before.to_string();
+        let idle = row.updated_at.as_str() < stale_before;
         let no_criteria = row.acceptance_criteria.trim().is_empty();
         if orphan && idle && no_criteria {
             record_signal(

@@ -31,7 +31,7 @@ use bailongma_core::llm::tool_loop::{
 use bailongma_core::llm::types::{ChatMessage, ChatRole, StreamEvent};
 use bailongma_core::memory::injector::{ContextWindowConfig, InjectorContext};
 use bailongma_core::memory::messages::LlmRole;
-use bailongma_core::runtime::{init as runtime_init, run_user_turn, RuntimeState};
+use bailongma_core::runtime::{init as runtime_init, run_user_turn, RuntimeState, TurnRequest};
 use bailongma_core::tools::{all_tool_schemas, NativeToolExecutor, SendMessageFn};
 use bailongma_core::wakeup::{coalesced_wakeup, CoalescedWakeup};
 use serde_json::json;
@@ -305,21 +305,21 @@ impl AppRuntime {
 
         let turn = {
             let mut guard = self.state.lock().await;
-            match run_user_turn(
-                &self.db,
-                &embedder,
-                &mut guard,
-                &input,
-                &msg.channel,
-                "",
-                &ctx,
-                &window,
-                &self.agent_name,
-                false,
-                None,
-                "",
-                None,
-            )
+            match run_user_turn(TurnRequest {
+                db: &self.db,
+                embedder: &embedder,
+                state: &mut guard,
+                input: &input,
+                channel: &msg.channel,
+                input_hint: "",
+                ctx: &ctx,
+                window: &window,
+                agent_name: &self.agent_name,
+                has_active_task: false,
+                task: None,
+                system_prompt: "",
+                msg: None,
+            })
             .await
             {
                 Ok(t) => t,
@@ -372,8 +372,10 @@ impl AppRuntime {
         };
         let client = reqwest::Client::new();
         let stream = real_stream_fn();
-        let mut ctx = StreamContext::default();
-        ctx.on_stream = stream_cb;
+        let ctx = StreamContext {
+            on_stream: stream_cb,
+            ..Default::default()
+        };
 
         // 4) LLM 工具循环（真实流式调用 + 全量工具；P1-2 防重放台账统一启用）
         let replay_guard = DbToolReplayGuard::new(self.db.clone());
@@ -485,21 +487,21 @@ impl AppRuntime {
 
         let turn = {
             let mut guard = self.state.lock().await;
-            match run_user_turn(
-                &self.db,
-                &embedder,
-                &mut guard,
-                &input,
+            match run_user_turn(TurnRequest {
+                db: &self.db,
+                embedder: &embedder,
+                state: &mut guard,
+                input: &input,
                 channel,
-                "",
-                &ctx,
-                &window,
-                &self.agent_name,
-                false,
-                None,
-                "",
-                None,
-            )
+                input_hint: "",
+                ctx: &ctx,
+                window: &window,
+                agent_name: &self.agent_name,
+                has_active_task: false,
+                task: None,
+                system_prompt: "",
+                msg: None,
+            })
             .await
             {
                 Ok(t) => t,

@@ -31,6 +31,7 @@ pub struct TurnStateRow {
 }
 
 /// 新建一个 turn（state='received'，attempt=1）。返回 turn_id。
+#[allow(clippy::too_many_arguments)]
 pub fn create_turn(
     db: &Db,
     started_at: &str,

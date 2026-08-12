@@ -104,13 +104,11 @@ impl Sandbox {
         if command.is_empty() {
             return Err("参数非法: command 为空".into());
         }
-        if !self.allow_commands.is_empty() {
-            if !command_allowed(&command, &self.allow_commands) {
-                return Err(format!(
-                    "命令不在白名单内: {}",
-                    command.chars().take(80).collect::<String>()
-                ));
-            }
+        if !self.allow_commands.is_empty() && !command_allowed(&command, &self.allow_commands) {
+            return Err(format!(
+                "命令不在白名单内: {}",
+                command.chars().take(80).collect::<String>()
+            ));
         }
 
         let timeout_ms = params

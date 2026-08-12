@@ -458,6 +458,7 @@ pub async fn stream_once(
 /// 收尾：冲刷 think 状态机、结束文本流（若仍在进行则补发 End），
 /// 并把拼装好的工具调用（按 index 排序）写入结果。
 /// 对齐 Node llm.js:325-326 的收尾必发 end（UI 依赖 End 结束光标/动画）。
+#[allow(clippy::too_many_arguments)]
 fn finish_result(
     mut result: StreamOnceResult,
     cfg: &LlmConfig,

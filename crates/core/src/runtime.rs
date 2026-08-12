@@ -230,6 +230,26 @@ pub struct InjectedTurn {
     pub llm_messages: Vec<LlmMessage>,
 }
 
+/// [`run_user_turn`] 的输入打包（波2b：13 参数收敛为单个 struct，too_many_arguments 清零）。
+///
+/// 字段与旧参数一一对应：`db` / `embedder` / `state` 为运行时核心依赖；
+/// `msg` 为当前轮 user 行（None 时按 `input` 合成 user 消息）。
+pub struct TurnRequest<'a> {
+    pub db: &'a Db,
+    pub embedder: &'a dyn Embedder,
+    pub state: &'a mut RuntimeState,
+    pub input: &'a str,
+    pub channel: &'a str,
+    pub input_hint: &'a str,
+    pub ctx: &'a InjectorContext,
+    pub window: &'a ContextWindowConfig,
+    pub agent_name: &'a str,
+    pub has_active_task: bool,
+    pub task: Option<&'a str>,
+    pub system_prompt: &'a str,
+    pub msg: Option<CurrentMessage>,
+}
+
 /// 一轮完整注入闭包（对齐 Node runTurn：749 runInjector → 756 归属 → 1073 buildContextBlock
 /// → 1089 buildMessagesWithContext/buildLLMMessages）。
 ///
@@ -245,21 +265,22 @@ pub struct InjectedTurn {
 /// 返回后调用方只需把 `llm_messages` 交给 LLM 并处理工具循环。
 /// 参数个数对齐 Node runTurn 的调用面（上下文注入项较多），故豁免 too_many_arguments。
 #[allow(clippy::too_many_arguments)]
-pub async fn run_user_turn(
-    db: &Db,
-    embedder: &dyn Embedder,
-    state: &mut RuntimeState,
-    input: &str,
-    channel: &str,
-    input_hint: &str,
-    ctx: &InjectorContext,
-    window: &ContextWindowConfig,
-    agent_name: &str,
-    has_active_task: bool,
-    task: Option<&str>,
-    system_prompt: &str,
-    msg: Option<CurrentMessage>,
-) -> Result<InjectedTurn> {
+pub async fn run_user_turn(req: TurnRequest<'_>) -> Result<InjectedTurn> {
+    let TurnRequest {
+        db,
+        embedder,
+        state,
+        input,
+        channel,
+        input_hint,
+        ctx,
+        window,
+        agent_name,
+        has_active_task,
+        task,
+        system_prompt,
+        msg,
+    } = req;
     // 1) 归属判定 + 写时印章 + 落库 + 回填
     let outcome = process_message(db, state, input, channel)?;
 
@@ -709,21 +730,21 @@ mod tests {
         let input =
             "[ID:000001] 2026-08-09T10:00:00+08:00 [TUI] 帮我把前端轮子重做一遍，要支持多端复用";
 
-        let turn = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
+        let turn = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
             input,
-            "TUI",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            false,
-            None,
-            "你是白马，一只注重实效的 AI 助理。",
-            None,
-        )
+            channel: "TUI",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: false,
+            task: None,
+            system_prompt: "你是白马，一只注重实效的 AI 助理。",
+            msg: None,
+        })
         .await
         .unwrap();
 
@@ -772,21 +793,21 @@ mod tests {
         let window = ContextWindowConfig::default();
         let input = "[ID:000001] 2026-08-09T10:00:00+08:00 [TUI] 前端轮子重构记得保留原来的接口";
 
-        let turn = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
+        let turn = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
             input,
-            "TUI",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            true,
-            Some("重构前端轮子，支持多端复用"),
-            "你是白马，一只注重实效的 AI 助理。",
-            None,
-        )
+            channel: "TUI",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: true,
+            task: Some("重构前端轮子，支持多端复用"),
+            system_prompt: "你是白马，一只注重实效的 AI 助理。",
+            msg: None,
+        })
         .await
         .unwrap();
 
@@ -805,21 +826,21 @@ mod tests {
         let ctx = InjectorContext::default();
         let window = ContextWindowConfig::default();
         // 空 system_prompt → 走 build_default_system_prompt（buildSystemPrompt 投影）
-        let turn = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
-            "[ID:000001] 2026-08-09T10:00:00+08:00 [VOICE] 放首歌",
-            "VOICE",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            false,
-            None,
-            "",
-            None,
-        )
+        let turn = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
+            input: "[ID:000001] 2026-08-09T10:00:00+08:00 [VOICE] 放首歌",
+            channel: "VOICE",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: false,
+            task: None,
+            system_prompt: "",
+            msg: None,
+        })
         .await
         .unwrap();
 
@@ -869,21 +890,21 @@ mod tests {
         let ctx = InjectorContext::default();
         let window = ContextWindowConfig::default();
         // 空 system_prompt + 关键词命中 → 编排闭包内查库注入 AI Collaborators 块
-        let turn = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
-            "[ID:000001] 2026-08-09T10:00:00+08:00 [TUI] 让 claude code 帮我写个脚本",
-            "TUI",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            false,
-            None,
-            "",
-            None,
-        )
+        let turn = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
+            input: "[ID:000001] 2026-08-09T10:00:00+08:00 [TUI] 让 claude code 帮我写个脚本",
+            channel: "TUI",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: false,
+            task: None,
+            system_prompt: "",
+            msg: None,
+        })
         .await
         .unwrap();
 
@@ -895,21 +916,21 @@ mod tests {
         assert!(sys.content.contains("exec_command(\"claude ...\")"));
         // 无授权时不注入：撤销后重跑
         crate::db::repositories::agents::revoke_delegation(&db).unwrap();
-        let turn2 = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
-            "[ID:000001] 2026-08-09T10:00:00+08:00 [TUI] 让 claude code 帮我写个脚本",
-            "TUI",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            false,
-            None,
-            "",
-            None,
-        )
+        let turn2 = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
+            input: "[ID:000001] 2026-08-09T10:00:00+08:00 [TUI] 让 claude code 帮我写个脚本",
+            channel: "TUI",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: false,
+            task: None,
+            system_prompt: "",
+            msg: None,
+        })
         .await
         .unwrap();
         assert!(!turn2.llm_messages[0]
@@ -947,21 +968,21 @@ mod tests {
         let window = ContextWindowConfig::default();
 
         // 首个 TICK：发现文本进入 <directions>（对齐 Node unshift 语义）
-        let tick1 = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
-            "TICK 2026-08-09-11:00:00",
-            "SYSTEM",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            true,
-            Some("重构部署脚本"),
-            "",
-            None,
-        )
+        let tick1 = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
+            input: "TICK 2026-08-09-11:00:00",
+            channel: "SYSTEM",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: true,
+            task: Some("重构部署脚本"),
+            system_prompt: "",
+            msg: None,
+        })
         .await
         .unwrap();
         assert!(tick1.outcome.is_tick);
@@ -976,21 +997,21 @@ mod tests {
         assert!(crate::db::repositories::agents::has_delegation_been_asked(&db).unwrap());
 
         // 第二个 TICK：已 mark → 不再重复注入
-        let tick2 = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
-            "TICK 2026-08-09-12:00:00",
-            "SYSTEM",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            true,
-            Some("重构部署脚本"),
-            "",
-            None,
-        )
+        let tick2 = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
+            input: "TICK 2026-08-09-12:00:00",
+            channel: "SYSTEM",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: true,
+            task: Some("重构部署脚本"),
+            system_prompt: "",
+            msg: None,
+        })
         .await
         .unwrap();
         assert!(
@@ -1070,21 +1091,21 @@ mod tests {
         };
         let t1_input =
             "[ID:000001] 2026-08-09T10:00:00+08:00 [TUI] 让 claude code 帮我写个部署脚本，顺便看下今天上海天气";
-        let t1 = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
-            t1_input,
-            "TUI",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            true,
-            Some("重构部署脚本"),
-            "",
-            None,
-        )
+        let t1 = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
+            input: t1_input,
+            channel: "TUI",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: true,
+            task: Some("重构部署脚本"),
+            system_prompt: "",
+            msg: None,
+        })
         .await
         .unwrap();
 
@@ -1167,21 +1188,21 @@ mod tests {
         );
 
         // ── T2：同主题延续（归属 continued + 历史轮进入 LLM 消息） ──
-        let t2 = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
-            "[ID:000001] 2026-08-09T10:05:00+08:00 [TUI] 天气先放放，写个部署脚本的测试",
-            "TUI",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            true,
-            Some("重构部署脚本"),
-            "",
-            None,
-        )
+        let t2 = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
+            input: "[ID:000001] 2026-08-09T10:05:00+08:00 [TUI] 天气先放放，写个部署脚本的测试",
+            channel: "TUI",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: true,
+            task: Some("重构部署脚本"),
+            system_prompt: "",
+            msg: None,
+        })
         .await
         .unwrap();
 
@@ -1210,21 +1231,21 @@ mod tests {
         );
 
         // ── T3：TICK 心跳轮（无合成 user；system 走 heartbeat 包装 + TICK 段） ──
-        let tick = run_user_turn(
-            &db,
-            &embedder,
-            &mut state,
-            "TICK 2026-08-09-11:00:00",
-            "SYSTEM",
-            "",
-            &ctx,
-            &window,
-            "白马",
-            true,
-            Some("重构部署脚本"),
-            "",
-            None,
-        )
+        let tick = run_user_turn(TurnRequest {
+            db: &db,
+            embedder: &embedder,
+            state: &mut state,
+            input: "TICK 2026-08-09-11:00:00",
+            channel: "SYSTEM",
+            input_hint: "",
+            ctx: &ctx,
+            window: &window,
+            agent_name: "白马",
+            has_active_task: true,
+            task: Some("重构部署脚本"),
+            system_prompt: "",
+            msg: None,
+        })
         .await
         .unwrap();
 

@@ -5,10 +5,10 @@
 //! 无此文件则自动跳过。
 //!
 //! 契约更新：打开老库会幂等新增 7 张表——M1 的 3 张 LLM 指标表
-//! （llm_calls / llm_tool_calls / llm_metrics_daily）+ M3 的 2 张观测表
+//! llm_calls / llm_tool_calls / llm_metrics_daily，外加 M3 的 2 张观测表
 //! （llm_context_sections / llm_turns）+ P1 的 turn_state（显式 Turn 状态机）
 //! + 事项账本 matters / matter_events（PHILOSOPHY_MULTI_AGENT_MATTER 落地）。
-//! 除此之外零数据改动——这正是"观测层不碰用户数据"的承诺边界。
+//!   除此之外零数据改动——这正是"观测层不碰用户数据"的承诺边界。
 
 use bailongma_core::db::open_database;
 

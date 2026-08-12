@@ -145,9 +145,9 @@ fn attach_docs_hint(map: &mut serde_json::Map<String, Value>, agent: &KnownAgent
 /// - stdout/stderr 边跑边由读取线程排空，防止 64KB 管道缓冲把子进程堵死；
 /// - 主线程 50ms 粒度轮询 `try_wait`，超时先 kill 再 wait 回收；
 /// - 启动失败 / 等待失败返回 `{ok:false, exit_code:-1, error}`。
-/// 超时强杀：Windows 用 `taskkill /T /F` 杀整棵进程树（子进程会继承 stdout/stderr
-/// 句柄，只杀父进程会导致读线程阻塞到子进程自然结束）；其他平台直接 `kill`
-/// （进程组由外壳转发）。
+///
+/// 超时强杀：Windows 用 taskkill /T /F 杀整棵进程树（子进程会继承 stdout/stderr
+/// 句柄，只杀父进程会导致读线程阻塞到子进程自然结束）；其他平台直接 kill（进程组由外壳转发）。
 fn spawn_and_wait(program: &str, args: &[String], timeout_sec: u64) -> String {
     let mut builder = Command::new(program);
     builder.args(args);
@@ -698,11 +698,7 @@ mod tests {
 
     #[test]
     fn run_command_captures_output() {
-        let cmd = if cfg!(windows) {
-            "echo hello-from-bailongma"
-        } else {
-            "echo hello-from-bailongma"
-        };
+        let cmd = "echo hello-from-bailongma";
         let r = run_command_with_timeout(cmd, 5);
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["ok"], true);

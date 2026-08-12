@@ -223,11 +223,7 @@ impl PolicyEngine {
 
     /// 检查记忆访问：读放行；写默认需人工确认（系统级写例外由调用方以 `system:true` 传入）。
     pub fn check_memory_access(&mut self, op: &str, system: bool) -> PolicyDecision {
-        let decision = if op == "read" {
-            PolicyDecision::Allow
-        } else if system {
-            PolicyDecision::Allow
-        } else if MEMORY_WRITE_REQUIRES_APPROVAL {
+        let decision = if MEMORY_WRITE_REQUIRES_APPROVAL && !(op == "read" || system) {
             PolicyDecision::RequireApproval(format!("记忆写入（{op}）需人工确认"))
         } else {
             PolicyDecision::Allow

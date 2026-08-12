@@ -103,6 +103,10 @@ impl TraceStore {
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().buf.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().unwrap().buf.is_empty()
+    }
 }
 
 impl Default for TraceStore {

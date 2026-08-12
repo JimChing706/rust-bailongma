@@ -93,13 +93,16 @@ struct GateInner {
     session_approved: HashSet<String>,
 }
 
+/// 审批请求回调（API 层注入；None = 未接线 UI，仅超时拒绝）。
+pub type ApprovalCallback = Arc<dyn Fn(&ApprovalRequest) + Send + Sync>;
+
 /// 人工确认门。
 pub struct ApprovalGate {
     inner: Mutex<GateInner>,
     /// 等待超时（测试可缩短）
     timeout: Duration,
     /// 请求创建时的场景回调（API 层注入；None = 未接线 UI，仅超时拒绝）
-    on_request: Mutex<Option<Arc<dyn Fn(&ApprovalRequest) + Send + Sync>>>,
+    on_request: Mutex<Option<ApprovalCallback>>,
     /// id 序号（时间戳 + 自增）
     seq: Mutex<u64>,
 }
@@ -245,7 +248,7 @@ impl ApprovalGate {
     }
 
     /// 注入场景回调（API 层桥接 SceneStore；重复调用覆盖）。
-    pub fn set_on_request(&self, cb: Arc<dyn Fn(&ApprovalRequest) + Send + Sync>) {
+    pub fn set_on_request(&self, cb: ApprovalCallback) {
         *self.on_request.lock().unwrap() = Some(cb);
     }
 
@@ -277,7 +280,7 @@ pub fn global() -> Arc<ApprovalGate> {
 }
 
 /// 给全局门注入场景回调。
-pub fn set_global_on_request(cb: Arc<dyn Fn(&ApprovalRequest) + Send + Sync>) {
+pub fn set_global_on_request(cb: ApprovalCallback) {
     global().set_on_request(cb);
 }
 
