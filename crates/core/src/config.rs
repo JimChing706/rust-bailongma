@@ -50,6 +50,9 @@ pub struct Config {
     #[serde(rename = "minimax_api_key")]
     pub minimax_api_key: Option<String>,
 
+    // ── 人工介入硬通道（Q6）──
+    pub intervention: InterventionConfig,
+
     // ── 微信 clawbot ──
     pub clawbot: Option<ClawbotConfig>,
 
@@ -72,6 +75,13 @@ pub struct SecurityConfig {
 pub struct NetworkConfig {
     pub allow_lan_access: bool,
     pub updated_at: Option<String>,
+}
+
+/// 人工介入硬通道配置（Q6）：默认关闭；启用后人工可硬性暂停/回滚 agent 循环。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct InterventionConfig {
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +142,7 @@ impl Default for Config {
             context_rules: Vec::new(),
             minimax_api_key: None,
             clawbot: None,
+            intervention: InterventionConfig::default(),
             extra: serde_json::Map::new(),
         }
     }
@@ -442,6 +453,29 @@ mod tests {
             validate(&c)
         });
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn intervention_defaults_disabled_for_old_configs() {
+        let cfg = parse_config(r#"{"provider":"deepseek","schemaVersion":3}"#).unwrap();
+        assert!(!cfg.intervention.enabled);
+        let dir = tempdir().unwrap();
+        save_config(dir.path(), &cfg).unwrap();
+        let reloaded = load_config(dir.path()).unwrap();
+        assert!(!reloaded.intervention.enabled);
+    }
+
+    #[test]
+    fn intervention_enabled_parses_and_roundtrips() {
+        let cfg = parse_config(
+            r#"{"provider":"deepseek","schemaVersion":3,"intervention":{"enabled":true}}"#,
+        )
+        .unwrap();
+        assert!(cfg.intervention.enabled);
+        let dir = tempdir().unwrap();
+        save_config(dir.path(), &cfg).unwrap();
+        let reloaded = load_config(dir.path()).unwrap();
+        assert!(reloaded.intervention.enabled);
     }
 
     #[test]

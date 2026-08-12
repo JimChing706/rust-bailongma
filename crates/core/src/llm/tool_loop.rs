@@ -20,6 +20,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 
 use crate::error::Result;
+use crate::intervention::{InterventionGate, InterventionStatus};
 
 use super::caller::{LlmConfig, StreamContext};
 use super::retry::{stream_once_with_model_fallback, RetryInfo};
@@ -346,6 +347,8 @@ pub struct CallLlmArgs {
     /// P1-2 测试接缝：固定本轮逻辑请求 ID 前缀（`{seed}#{round}`，跨调用确定），
     /// 供「响应丢失 → 同逻辑请求重试」故障注入测试使用。None = 生产行为（每轮新 ID）。
     pub round_request_id_seed: Option<String>,
+    /// Q6 人工介入硬通道（None = 未接入，零侵入；生产经 AppRuntime 注入）。
+    pub intervention: Option<Arc<InterventionGate>>,
 }
 
 impl Default for CallLlmArgs {
@@ -363,6 +366,7 @@ impl Default for CallLlmArgs {
             must_reply: true,
             delegated_from: String::new(),
             round_request_id_seed: None,
+            intervention: None,
         }
     }
 }
@@ -381,6 +385,8 @@ pub struct LlmCallResult {
     pub aborted: bool,
     pub delivered: bool,
     pub total_calls: usize,
+    /// Q6 人工介入：本轮被硬暂停（check 命中 pause）。
+    pub intervened: bool,
 }
 
 /// 单次工具执行结果（内部）
@@ -422,12 +428,22 @@ pub async fn call_llm(
     // 工具结果回喂后的继续指令是否已发过（一 turn 一次的"不确定回退"检查点）
     let mut uncertainty_used = false;
     let aborted = ctx.is_aborted();
+    // Q6 人工介入：本轮是否被硬暂停（检查点命中）
+    let mut intervened = false;
 
     let mut round = 0usize;
     let mut last_round_ctx: Option<StreamContext> = None;
     while round < limits.max_rounds {
         if ctx.is_aborted() {
             break;
+        }
+        // ── Q6 人工介入：轮级检查点（暂停 → 立即停循环，不发起新 LLM 请求）──
+        if let Some(gate) = &args.intervention {
+            if let InterventionStatus::Paused { .. } = gate.check() {
+                tracing::warn!("[介入] 人工暂停命中轮级检查点，工具循环停止");
+                intervened = true;
+                break;
+            }
         }
 
         // ── M1 装配：每轮 = 一个逻辑请求；该轮内重试/降级共享同一 request_id ──
@@ -517,6 +533,14 @@ pub async fn call_llm(
         for tc in &effective_tool_calls {
             if ctx.is_aborted() {
                 break;
+            }
+            // ── Q6 人工介入：派发级检查点（暂停 → 不再执行任何新工具）──
+            if let Some(gate) = &args.intervention {
+                if let InterventionStatus::Paused { notice } = gate.check() {
+                    tracing::warn!("[介入] 人工暂停（{notice}），停止派发工具 {}", tc.name);
+                    intervened = true;
+                    break;
+                }
             }
             let args_value = tc.parse_args();
             let normalized = normalize_args(&tc.name, &args_value);
@@ -692,6 +716,7 @@ pub async fn call_llm(
         aborted,
         delivered,
         total_calls: state.total_calls,
+        intervened,
     })
 }
 
@@ -1029,6 +1054,51 @@ mod tests {
         assert_eq!(tr.name, "get_time");
         assert_eq!(tr.args["format"], "iso");
         assert_eq!(tr.result, r#"{"ok":true,"time":"2026-08-09T00:00:00Z"}"#);
+    }
+
+    #[tokio::test]
+    async fn intervention_pause_stops_tool_dispatch() {
+        // Q6：启用介入通道并暂停 → 工具循环不再派发任何工具，intervened=true
+        let gate = Arc::new(InterventionGate::new(true));
+        gate.request_pause("人工介入测试").unwrap();
+        let executed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        struct CountingExecutor(Arc<std::sync::atomic::AtomicUsize>);
+        impl ToolExecutor for CountingExecutor {
+            fn execute(&self, _name: &str, _args: &Value) -> Result<String> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(json!({"ok": true}).to_string())
+            }
+        }
+        let stream = mock_stream(vec![StreamOnceResult {
+            tool_calls: vec![tool("echo", r#"{"text":"a"}"#)],
+            ..Default::default()
+        }]);
+        let args = CallLlmArgs {
+            system_prompt: "助手".into(),
+            message: "echo".into(),
+            tools: vec![ToolSchema::new("echo", "回显")],
+            intervention: Some(gate.clone()),
+            ..Default::default()
+        };
+        let result = call_llm(
+            &Client::new(),
+            &cfg(),
+            stream.as_ref(),
+            &CountingExecutor(executed.clone()),
+            &args,
+            &test_ctx(),
+            None,
+            &ToolLoopLimits::default(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.intervened);
+        assert_eq!(result.total_calls, 0);
+        assert_eq!(executed.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // 恢复后可继续
+        gate.resume();
+        assert_eq!(gate.check(), InterventionStatus::Open);
     }
 
     #[tokio::test]

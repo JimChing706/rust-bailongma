@@ -23,6 +23,7 @@ use bailongma_core::db::repositories::{brain_ui_events, conversations, turn_stat
 use bailongma_core::db::Db;
 use bailongma_core::embedding::NoopEmbedder;
 use bailongma_core::error::Result;
+use bailongma_core::intervention::InterventionGate;
 use bailongma_core::llm::caller::{LlmConfig, StreamContext};
 use bailongma_core::llm::replay::DbToolReplayGuard;
 use bailongma_core::llm::tool_loop::{
@@ -63,6 +64,8 @@ pub struct AppRuntime {
     pub agent_name: String,
     /// chat 入口的 --api-key 临时覆盖（不写回 config.json；serve/desktop 恒 None）。
     pub api_key_override: Option<String>,
+    /// Q6 人工介入硬通道（config 开关；默认关闭零侵入）。
+    pub intervention: Arc<InterventionGate>,
 }
 
 /// 当前轮时间戳（本地时区 ISO，与 runtime 测试的消息格式一致）。
@@ -106,6 +109,8 @@ impl AppRuntime {
             .and_then(|v| v.as_str())
             .unwrap_or(compat::DEFAULT_AGENT_NAME)
             .to_string();
+        // Q6 人工介入硬通道：随 config 开关装配（默认关闭 = 零侵入）
+        let intervention = Arc::new(InterventionGate::new(cfg.intervention.enabled));
         Self {
             db,
             bus,
@@ -115,6 +120,7 @@ impl AppRuntime {
             sandbox_bin,
             agent_name,
             api_key_override: None,
+            intervention,
         }
     }
 
@@ -368,6 +374,7 @@ impl AppRuntime {
             tools: all_tool_schemas(),
             local_reply: false,
             must_reply: true,
+            intervention: Some(self.intervention.clone()),
             ..Default::default()
         };
         let client = reqwest::Client::new();
@@ -537,6 +544,7 @@ impl AppRuntime {
             tools: all_tool_schemas(),
             local_reply: false,
             must_reply: true,
+            intervention: Some(self.intervention.clone()),
             ..Default::default()
         };
         let client = reqwest::Client::new();

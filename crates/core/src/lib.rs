@@ -43,6 +43,7 @@ pub mod db;
 pub mod embedding;
 pub mod evolution;
 pub mod error;
+pub mod intervention;
 pub mod llm;
 pub mod logging;
 pub mod matter;
