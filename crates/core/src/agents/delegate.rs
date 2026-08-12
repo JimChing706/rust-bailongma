@@ -49,6 +49,10 @@ pub fn delegate_to_agent_schema() -> ToolSchema {
     .required("prompt", string_param("委托给 Agent 的任务提示词（其收到的唯一指令）"))
     .param("context", string_param("可选的附加上下文，会拼在 prompt 之前（Agent 同样可见）"))
     .param("timeout", number_param("超时秒数，默认 60，范围 5-300"))
+    .param("verify_hint", string_param(
+        "验证提示/断言：给出可客观核对的判据（如输出应出现的标志、文件应存在、期望的退出码等）。\
+         执行完成后结果会附带该提示与输出快照，供调用方复核 Agent 声称的完成，不要只信 done",
+    ))
 }
 
 /// `grant_agent_delegation` 的 OpenAI schema。
@@ -271,6 +275,12 @@ pub fn exec_delegate_to_agent(db: &Db, args: &Value) -> String {
     let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or("");
     let context = args.get("context").and_then(Value::as_str).unwrap_or("");
     let timeout = args.get("timeout").and_then(Value::as_f64);
+    let verify_hint = args
+        .get("verify_hint")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
 
     // 1) 鉴权：未授权直接拒绝（对齐 Node 1164-1166）
     match is_delegation_allowed(db) {
@@ -360,6 +370,39 @@ pub fn exec_delegate_to_agent(db: &Db, args: &Value) -> String {
                 if let Some(obj) = parsed.as_object() {
                     let mut merged = obj.clone();
                     attach_docs_hint(&mut merged, &agent);
+                    if !verify_hint.is_empty() {
+                        merged.insert("verify_hint".into(), Value::String(verify_hint.clone()));
+                        merged.insert("verify_status".into(), Value::String("failed_exit".into()));
+                        merged.insert(
+                            "verify_note".into(),
+                            Value::String("Agent 调用失败（非零退出码）。复核提示仍附上，供调用方判断失败是否符合预期。".into()),
+                        );
+                    }
+                    return tool_json(merged);
+                }
+            }
+            // 命题5 跨 agent 委托维度：语言承诺 != 世界事实。
+            // verify_hint 让调用方拿到可核对的判据 + 输出快照，复核后才算完成，
+            // 不再只信 Agent 的 done（对齐 matter.rs 的 evidence 非空约束）。
+            if !verify_hint.is_empty() {
+                if let Some(obj) = parsed.as_object() {
+                    let mut merged = obj.clone();
+                    let snapshot = parsed
+                        .get("stdout")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .chars()
+                        .take(500)
+                        .collect::<String>();
+                    merged.insert("verify_hint".into(), Value::String(verify_hint.clone()));
+                    merged.insert("verify_status".into(), Value::String("pending_manual_check".into()));
+                    merged.insert(
+                        "verify_note".into(),
+                        Value::String("Agent 声称已完成；请按 verify_hint 对照输出快照复核，不要只信 done".into()),
+                    );
+                    if !snapshot.is_empty() {
+                        merged.insert("output_snapshot".into(), Value::String(snapshot));
+                    }
                     return tool_json(merged);
                 }
             }
@@ -546,6 +589,38 @@ mod tests {
     }
 
     #[test]
+    fn cli_success_attaches_verify_hint() {
+        let db = test_db();
+        grant_delegation(&db).unwrap();
+        let (cmd, args) = echo_invoke();
+        upsert_agents(&db, &[agent("vh-agent", "cli", cmd, args)]).unwrap();
+        let r = exec_delegate_to_agent(
+            &db,
+            &json!({"agent_id": "vh-agent", "prompt": "hello", "verify_hint": "stdout 应包含 hello"}),
+        );
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], true, "result: {r}");
+        assert_eq!(v["verify_hint"], "stdout 应包含 hello");
+        assert_eq!(v["verify_status"], "pending_manual_check");
+        assert!(v["output_snapshot"].as_str().unwrap_or("").contains("hello"), "快照应含输出: {r}");
+    }
+
+    #[test]
+    fn cli_without_verify_hint_unchanged() {
+        let db = test_db();
+        grant_delegation(&db).unwrap();
+        let (cmd, args) = echo_invoke();
+        upsert_agents(&db, &[agent("nvh-agent", "cli", cmd, args)]).unwrap();
+        let r = exec_delegate_to_agent(
+            &db,
+            &json!({"agent_id": "nvh-agent", "prompt": "hello"}),
+        );
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], true, "result: {r}");
+        assert!(v.get("verify_hint").is_none(), "未提供 verify_hint 时不注入: {r}");
+    }
+
+    #[test]
     fn cli_failure_injects_docs_hint() {
         let db = test_db();
         grant_delegation(&db).unwrap();
@@ -694,6 +769,7 @@ mod tests {
         let props = &d["function"]["parameters"]["properties"];
         assert!(props.get("agent_id").is_some());
         assert!(props.get("prompt").is_some());
+        assert!(props.get("verify_hint").is_some(), "schema 必须声明 verify_hint");
         let g = grant_agent_delegation_schema().to_openai_value();
         assert_eq!(g["function"]["name"], "grant_agent_delegation");
         assert!(g["function"]["parameters"]["properties"]
