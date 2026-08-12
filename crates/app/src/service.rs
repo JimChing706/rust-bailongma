@@ -10,6 +10,12 @@
 //! - [`AppRuntime::spawn_wakeup_loop`]：后台提醒唤醒循环（TICK 轮）
 //!
 //! 波2a 验收：三 bin 共用装配函数；chat 不再维护独立 executor / tools / LLM 配置。
+//!
+//! 波3·片2（M1 装配收口）：`assemble` 时 `metrics::init(&db)` 挂载 LLM 观测层，
+//! 交互轮（stage='interactive'）/ 唤醒轮（stage='wakeup'）的 `StreamContext`
+//! 统一挂 `metrics` 采集句柄——埋点链路（CallStarted/TTFT/CallFinished/CallFailed/
+//! RetryDecision，caller/retry 已埋）从此开始写真实数据到 llm_calls 三表，
+//! M4 周报与唤醒成本账本获得前置输入。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +31,7 @@ use bailongma_core::embedding::NoopEmbedder;
 use bailongma_core::error::Result;
 use bailongma_core::intervention::InterventionGate;
 use bailongma_core::llm::caller::{LlmConfig, StreamContext};
+use bailongma_core::llm::metrics::{self, FlusherHandle, MetricsCollector};
 use bailongma_core::llm::replay::DbToolReplayGuard;
 use bailongma_core::llm::tool_loop::{
     call_llm, real_stream_fn, CallLlmArgs, OnToolCall, ToolLoopLimits,
@@ -66,6 +73,10 @@ pub struct AppRuntime {
     pub api_key_override: Option<String>,
     /// Q6 人工介入硬通道（config 开关；默认关闭零侵入）。
     pub intervention: Arc<InterventionGate>,
+    /// M1 观测：采集句柄（每轮 StreamContext 挂载；Clone 进流路径，只做 mpsc send）。
+    pub llm_metrics: MetricsCollector,
+    /// M1 观测：flusher 控制句柄（保活后台任务；优雅退出时 shutdown()，M1 可接受不调）。
+    pub llm_metrics_flusher: FlusherHandle,
 }
 
 /// 当前轮时间戳（本地时区 ISO，与 runtime 测试的消息格式一致）。
@@ -111,6 +122,10 @@ impl AppRuntime {
             .to_string();
         // Q6 人工介入硬通道：随 config 开关装配（默认关闭 = 零侵入）
         let intervention = Arc::new(InterventionGate::new(cfg.intervention.enabled));
+        // M1 装配收口：挂载 LLM 观测层（埋点链路已在 caller/retry 就位，此处补齐采集端）。
+        // init 需在 tokio runtime 内（内部 spawn flusher）；所有构造路径（chat/serve/desktop）
+        // 均从 async 入口进入，测试用 #[tokio::test]，满足该前提。
+        let (llm_metrics, llm_metrics_flusher) = metrics::init(db.clone());
         Self {
             db,
             bus,
@@ -121,6 +136,8 @@ impl AppRuntime {
             agent_name,
             api_key_override: None,
             intervention,
+            llm_metrics,
+            llm_metrics_flusher,
         }
     }
 
@@ -379,8 +396,11 @@ impl AppRuntime {
         };
         let client = reqwest::Client::new();
         let stream = real_stream_fn();
+        // M1 装配收口：交互轮挂采集句柄 + stage='interactive'（M3 阶段账本）
         let ctx = StreamContext {
             on_stream: stream_cb,
+            metrics: Some(self.llm_metrics.clone()),
+            stage: "interactive".into(),
             ..Default::default()
         };
 
@@ -549,9 +569,10 @@ impl AppRuntime {
         };
         let client = reqwest::Client::new();
         let stream = real_stream_fn();
-        // M3：唤醒轮显式标 stage='wakeup' → 唤醒成本账本（M4 周报）开始有真实数据
+        // M1 装配收口 + M3：唤醒轮挂采集句柄 + stage='wakeup'（唤醒成本账本真实数据）
         let ctx = StreamContext {
             stage: "wakeup".into(),
+            metrics: Some(self.llm_metrics.clone()),
             ..Default::default()
         };
 
@@ -667,6 +688,7 @@ impl AppRuntime {
 mod tests {
     use super::*;
     use bailongma_core::db::open_database;
+    use bailongma_core::llm::metrics::MetricEvent;
 
     fn test_runtime() -> AppRuntime {
         // app crate 无 tempfile dev-dep：用系统临时目录 + pid + 原子序号 + 时间戳隔离。
@@ -762,5 +784,67 @@ mod tests {
         assert!(rows[0].content.contains("LLM 未激活"));
         assert_eq!(rows[1].role, "user");
         assert_eq!(rows[1].content, "你好");
+    }
+
+    #[tokio::test]
+    async fn metrics_collector_wired_into_runtime_and_persists() {
+        // 波3·片2 验收：assemble 已挂载观测层 —— 采集句柄记录的事件
+        // 经 flusher 落库到 llm_calls / llm_metrics_daily（真实装配，非 core 单测）
+        let runtime = test_runtime();
+        let rid = format!(
+            "service-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+
+        runtime.llm_metrics.record(MetricEvent::CallStarted {
+            request_id: rid.clone(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+            started_at: "2026-08-12T10:00:00+08:00".into(),
+            stage: "interactive".into(),
+        });
+        runtime.llm_metrics.record(MetricEvent::CallFinished {
+            request_id: rid.clone(),
+            duration_ms: 900,
+            total_tokens: 64,
+            cached_tokens: 16,
+            usage_raw: "{}".into(),
+            aborted: false,
+        });
+        // 幂等验证：同 request_id 重放终态 → 仍只有一行
+        runtime.llm_metrics.record(MetricEvent::CallFinished {
+            request_id: rid.clone(),
+            duration_ms: 900,
+            total_tokens: 64,
+            cached_tokens: 16,
+            usage_raw: "{}".into(),
+            aborted: false,
+        });
+        runtime.llm_metrics_flusher.flush_now().await;
+
+        let (n, total, cached, reason): (i64, Option<i64>, Option<i64>, String) = runtime
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*), total_tokens, cached_tokens, finish_reason
+                 FROM llm_calls WHERE request_id = ?1",
+                [&rid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "同 request_id 必须只有一行（幂等）");
+        assert_eq!(total, Some(64));
+        assert_eq!(cached, Some(16));
+        assert_eq!(reason, "done");
+
+        let calls: i64 = runtime
+            .db
+            .conn()
+            .query_row("SELECT total_calls FROM llm_metrics_daily", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(calls, 1, "日聚合 total_calls 只计一次");
     }
 }
