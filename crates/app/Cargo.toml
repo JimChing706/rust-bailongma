@@ -3,6 +3,7 @@ name = "bailongma-app"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Bailongma desktop shell (Tauri). M0 阶段为最小骨架，M7 接入完整窗口/托盘。"
 
 [[bin]]

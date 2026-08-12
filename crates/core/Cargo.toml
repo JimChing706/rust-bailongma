@@ -3,6 +3,7 @@ name = "bailongma-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 description = "Bailongma (白龙马) core runtime: LLM loop, memory, tools, API — a continuously running digital consciousness framework."
 
 [lib]
