@@ -176,6 +176,10 @@ pub fn init_with(db: Db, interval: Duration, batch: usize) -> (MetricsCollector,
         let mut turn_rows: Vec<LlmTurnRow> = Vec::new();
         let mut last_prune: Option<String> = None; // 进程内记忆，重启后下一个自然日再 prune
         let mut pending = 0usize;
+        // M3（波3·片3 装配验收暴露）：ContextStats 可能先于 CallStarted 到达——
+        // TurnSession::begin → record_context_stats 在调 LLM 之前执行；未匹配到聚合
+        // entry 的 context_bytes 暂存于此，CallStarted 分支补挂到 llm_calls
+        let mut pending_ctx: HashMap<String, i64> = HashMap::new();
 
         loop {
             tokio::select! {
@@ -189,6 +193,7 @@ pub fn init_with(db: Db, interval: Duration, batch: usize) -> (MetricsCollector,
                         &mut tool_rows,
                         &mut section_rows,
                         &mut turn_rows,
+                        &mut pending_ctx,
                     );
                     pending += 1;
                     if pending >= batch {
@@ -288,6 +293,7 @@ fn apply_event(
     tool_rows: &mut Vec<LlmToolCallRow>,
     section_rows: &mut Vec<LlmContextSectionRow>,
     turn_rows: &mut Vec<LlmTurnRow>,
+    pending_ctx: &mut HashMap<String, i64>,
 ) {
     match ev {
         MetricEvent::CallStarted {
@@ -299,6 +305,7 @@ fn apply_event(
         } => {
             // 重试的第 2+ 次 attempt 也发 CallStarted：entry 已存在则保留首条（不覆盖）
             let day = started_at.get(..10).unwrap_or("").to_string();
+            let is_new = !agg.contains_key(request_id);
             agg.entry(request_id.clone())
                 .or_insert_with(|| {
                     let mut a = LlmCallAgg::new(request_id, provider, model, started_at, &day);
@@ -308,6 +315,15 @@ fn apply_event(
                         daily: DailyState::Open,
                     }
                 });
+            // M3（波3·片3）：ContextStats 先到时（真实装配顺序 record_context_stats →
+            // CallStarted）补挂暂存的 context_bytes
+            if is_new {
+                if let Some(bytes) = pending_ctx.remove(request_id) {
+                    if let Some(e) = agg.get_mut(request_id) {
+                        e.row.context_bytes = Some(bytes);
+                    }
+                }
+            }
         }
         MetricEvent::Ttft {
             request_id,
@@ -510,8 +526,16 @@ fn apply_event(
             sections,
             context_bytes,
         } => {
-            if let Some(e) = agg.get_mut(request_id) {
-                e.row.context_bytes = Some(*context_bytes as i64);
+            let bytes = *context_bytes as i64;
+            let attached = agg
+                .get_mut(request_id)
+                .map(|e| e.row.context_bytes = Some(bytes))
+                .is_some();
+            if !attached {
+                // M3（波3·片3 装配验收暴露）：真实装配顺序 record_context_stats →
+                // CallStarted（TurnSession::begin → 统计 → 调 LLM）；聚合 entry 未到
+                // 时暂存 context_bytes，CallStarted 分支补挂，绝不丢失
+                pending_ctx.insert(request_id.clone(), bytes);
             }
             for (name, bytes) in sections {
                 section_rows.push(LlmContextSectionRow {
@@ -1424,6 +1448,46 @@ mod tests {
         assert_eq!(is_tick, 0);
         assert_eq!(sections_hit, Some(3));
         assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn context_stats_before_started_still_attaches_bytes() {
+        // M3 回归（波3·片3 装配验收暴露）：真实装配顺序 record_context_stats →
+        // CallStarted（TurnSession::begin → 统计 → 调 LLM），context_bytes 不得丢失
+        let db = test_db();
+        let (col, flusher) = init_with(db.clone(), Duration::from_secs(60_000), 10_000);
+        let rid = new_request_id();
+        col.record(MetricEvent::ContextStats {
+            request_id: rid.clone(),
+            sections: vec![("directions".to_string(), 22), ("tools".to_string(), 14)],
+            context_bytes: 36,
+        });
+        col.record(MetricEvent::CallStarted {
+            request_id: rid.clone(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+            started_at: "2026-08-12T10:00:00+08:00".into(),
+            stage: "interactive".into(),
+        });
+        col.record(MetricEvent::CallFinished {
+            request_id: rid.clone(),
+            duration_ms: 1200,
+            total_tokens: 80,
+            cached_tokens: 20,
+            usage_raw: "{}".into(),
+            aborted: false,
+        });
+        flusher.flush_now().await;
+
+        let ctx_bytes: Option<i64> = db
+            .conn()
+            .query_row(
+                "SELECT context_bytes FROM llm_calls WHERE request_id = ?1",
+                [&rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ctx_bytes, Some(36), "先到的 ContextStats 必须补挂到 llm_calls");
     }
 
     #[tokio::test]

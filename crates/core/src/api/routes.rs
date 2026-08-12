@@ -5,6 +5,7 @@
 //! - `GET  /events/history`  brain-ui 观测历史（L1/L2）
 //! - `GET  /status`          状态快照（memory_count / running / 扩展字段）
 //! - `GET  /events`          SSE 实时流（在 server.rs 用 `sse_stream` 挂载）
+//! - `GET  /metrics/weekly`  M4 周报（六指标 + 阈值信号 + 唤醒成本，波3·片3）
 //!
 //! 意识循环尚未迁移的部分（pushMessage / 记忆 / 控制开关）通过注入的
 //! 回调对接，路由层与循环层解耦，可独立测试。
@@ -21,7 +22,7 @@ use serde_json::{json, Value};
 
 use super::events::{iso_now, EventBus};
 use super::security::RateLimiter;
-use crate::db::repositories::brain_ui_events;
+use crate::db::repositories::{brain_ui_events, llm_metrics};
 use crate::db::Db;
 use crate::scene::SceneStore;
 
@@ -476,6 +477,61 @@ pub async fn get_status(State(state): State<ApiState>) -> Json<Value> {
     Json(extra)
 }
 
+/// GET /metrics/weekly —— M4 周报（波3·片3 对外入口）。
+/// 六指标 + 派生率 + 阈值信号 + 唤醒成本；`days` 窗口默认 7（clamp 1..=90）。
+/// 数据源：llm_metrics_daily 日聚合（长期趋势）+ llm_calls stage='wakeup' 明细。
+#[derive(Debug, Deserialize)]
+pub struct WeeklyQuery {
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+pub async fn get_metrics_weekly(
+    State(state): State<ApiState>,
+    Query(q): Query<WeeklyQuery>,
+) -> (StatusCode, Json<Value>) {
+    let days = q.days.unwrap_or(7).clamp(1, 90);
+    match llm_metrics::weekly_report(&state.db, days) {
+        Ok(r) => {
+            let text = r.render();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "days": days,
+                    "total_calls": r.total_calls,
+                    "error_count": r.error_count,
+                    "retry_count": r.retry_count,
+                    "fallback_count": r.fallback_count,
+                    "aborted_count": r.aborted_count,
+                    "total_tokens": r.total_tokens,
+                    "cached_tokens": r.cached_tokens,
+                    "cache_rate_pct": r.cache_rate_pct(),
+                    "error_rate_pct": r.error_rate_pct(),
+                    "avg_ttft_ms": r.avg_ttft_ms(),
+                    "avg_duration_ms": r.avg_duration_ms(),
+                    "avg_tokens_per_call": r.avg_tokens_per_call(),
+                    "wakeup": {
+                        "calls": r.wakeup.calls,
+                        "total_tokens": r.wakeup.total_tokens,
+                        "cached_tokens": r.wakeup.cached_tokens,
+                        "share_pct": r.wakeup.share_of_total(r.total_tokens),
+                    },
+                    "signals": r.signals,
+                    "text": text,
+                })),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("[metrics/weekly] query failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -662,5 +718,66 @@ mod tests {
         assert_eq!(resp.0["running"], true);
         assert_eq!(resp.0["ok"], true);
         assert_eq!(resp.0["memory_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_weekly_empty_db_returns_signal() {
+        // M4 验收：空库 → ok=true + 「无 LLM 调用」信号 + 六指标全 0
+        let state = test_state();
+        let resp = get_metrics_weekly(State(state), Query(WeeklyQuery { days: None })).await;
+        let (status, Json(body)) = resp;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["days"], 7, "默认 7 天窗口");
+        assert_eq!(body["total_calls"], 0);
+        let signals = body["signals"].as_array().unwrap();
+        assert!(
+            signals.iter().any(|s| s.as_str().unwrap().contains("无 LLM 调用")),
+            "空窗口应提示无调用，实际: {signals:?}"
+        );
+        assert!(body["text"].as_str().unwrap().contains("LLM 周报"));
+    }
+
+    #[tokio::test]
+    async fn metrics_weekly_aggregates_daily() {
+        // M4 验收：插入日聚合 → 六指标 + 派生率 + 唤醒成本字段正确返回
+        let state = test_state();
+        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        llm_metrics::upsert_daily(
+            &state.db,
+            &today,
+            &llm_metrics::DailyDelta {
+                total_calls: 100,
+                error_count: 5,
+                retry_count: 10,
+                fallback_count: 2,
+                aborted_count: 1,
+                total_tokens: 200_000,
+                cached_tokens: 60_000,
+                ttft_sum_ms: 120_000,
+                ttft_count: 60,
+                duration_sum_ms: 800_000,
+            },
+        )
+        .unwrap();
+
+        let resp = get_metrics_weekly(
+            State(state),
+            Query(WeeklyQuery { days: Some(7) }),
+        )
+        .await;
+        let (_, Json(body)) = resp;
+        assert_eq!(body["total_calls"], 100);
+        assert_eq!(body["error_count"], 5);
+        assert_eq!(body["retry_count"], 10);
+        assert_eq!(body["fallback_count"], 2);
+        assert_eq!(body["aborted_count"], 1);
+        assert_eq!(body["total_tokens"], 200_000);
+        assert_eq!(body["cached_tokens"], 60_000);
+        assert!((body["cache_rate_pct"].as_f64().unwrap() - 30.0).abs() < 1e-9);
+        assert!((body["error_rate_pct"].as_f64().unwrap() - 5.0).abs() < 1e-9);
+        assert!((body["avg_ttft_ms"].as_f64().unwrap() - 2_000.0).abs() < 1e-9);
+        assert!((body["avg_duration_ms"].as_f64().unwrap() - 8_000.0).abs() < 1e-9);
+        assert_eq!(body["wakeup"]["calls"], 0, "无唤醒轮数据");
     }
 }

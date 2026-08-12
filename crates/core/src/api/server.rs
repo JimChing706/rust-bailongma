@@ -2,7 +2,8 @@
 //!
 //! 职责：
 //! - 安全中间件：origin 校验 → access 校验（回环 / Bearer token / LAN）→ CORS → OPTIONS
-//! - 路由挂载：`POST /message`、`GET /events`（SSE）、`GET /events/history`、`GET /status`
+//! - 路由挂载：`POST /message`、`GET /events`（SSE）、`GET /events/history`、`GET /status`、
+//!   `GET /metrics/weekly`（M4 周报，波3·片3）
 //! - WebSocket `/scene`：授权（authorize_ws_upgrade_with_credential）后建立连接
 //! - 启动时补发粘性事件（agent_name_updated，对齐 api.js）
 //! - `POST /message` 专属防护（第 1 轮审计修复）：来源限流 + token 强制校验
@@ -116,6 +117,7 @@ impl ApiServer {
             .route("/events/history", get(routes::get_events_history))
             .route("/message", post(routes::post_message))
             .route("/status", get(routes::get_status))
+            .route("/metrics/weekly", get(routes::get_metrics_weekly))
             .route("/scene", get(handle_scene_ws))
             .route("/approval", post(routes::post_approval))
         .route("/trace", get(routes::get_trace))
@@ -140,10 +142,11 @@ impl ApiServer {
         let addr = listener.local_addr()?;
         let router = self.router();
         tracing::info!("[API] Listening at http://{host}:{port}");
-        tracing::info!("[API]   POST /message  - send message to agent");
-        tracing::info!("[API]   GET  /events   - SSE real-time stream");
-        tracing::info!("[API]   GET  /status   - status");
-        tracing::info!("[API]   WS   /scene    - Scene channel");
+        tracing::info!("[API]   POST /message        - send message to agent");
+        tracing::info!("[API]   GET  /events         - SSE real-time stream");
+        tracing::info!("[API]   GET  /status         - status");
+        tracing::info!("[API]   GET  /metrics/weekly - M4 weekly LLM report");
+        tracing::info!("[API]   WS   /scene          - Scene channel");
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
@@ -434,6 +437,28 @@ mod tests {
         let _ = &mut req;
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn metrics_weekly_route_served() {
+        // 波3·片3 验收：M4 周报端点已挂载（回环无 token 直读；空库返回 ok + 无调用信号）
+        let server = test_server(test_state());
+        let router = server.router();
+        let resp = router.oneshot(local_req("/metrics/weekly")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["days"], 7);
+        assert_eq!(body["total_calls"], 0);
+        assert!(
+            body["signals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("无 LLM 调用"))
+        );
     }
 
     #[tokio::test]

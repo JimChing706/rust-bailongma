@@ -16,6 +16,12 @@
 //! 统一挂 `metrics` 采集句柄——埋点链路（CallStarted/TTFT/CallFinished/CallFailed/
 //! RetryDecision，caller/retry 已埋）从此开始写真实数据到 llm_calls 三表，
 //! M4 周报与唤醒成本账本获得前置输入。
+//!
+//! 波3·片3（M3 接线 + M4 前置）：两条 turn 管线（交互/唤醒）各挂一个
+//! [`TurnSession`]——注入后统计上下文（section 命中 + context_bytes）记入
+//! `llm_calls.context_bytes` / `llm_context_sections`，turn 收尾记 `llm_turns`；
+//! 生成的稳定 `request_id` 贯穿 StreamContext，使 llm_calls / llm_turns /
+//! llm_context_sections 三表可 JOIN（M4 周报的 context 与唤醒成本分析有真实数据）。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +37,7 @@ use bailongma_core::embedding::NoopEmbedder;
 use bailongma_core::error::Result;
 use bailongma_core::intervention::InterventionGate;
 use bailongma_core::llm::caller::{LlmConfig, StreamContext};
-use bailongma_core::llm::metrics::{self, FlusherHandle, MetricsCollector};
+use bailongma_core::llm::metrics::{self, FlusherHandle, MetricsCollector, TurnSession};
 use bailongma_core::llm::replay::DbToolReplayGuard;
 use bailongma_core::llm::tool_loop::{
     call_llm, real_stream_fn, CallLlmArgs, OnToolCall, ToolLoopLimits,
@@ -366,7 +372,15 @@ impl AppRuntime {
             }
         };
 
-        // 3) 真实工具执行器
+        // 3) M3 接线（片3）：turn 观测会话 —— 注入后统计上下文（section 命中 +
+        // context_bytes）记入 llm_calls.context_bytes / llm_context_sections，
+        // turn 收尾记 llm_turns；request_id 贯穿 StreamContext，
+        // 使 llm_calls / llm_turns / llm_context_sections 三表可 JOIN。
+        let mut session = TurnSession::begin(self.llm_metrics.clone());
+        session.record_context_stats(&turn.injection);
+        let rid = session.request_id().to_string();
+
+        // 4) 真实工具执行器
         let executor = self.build_executor();
 
         // 组装 LLM 消息：LlmMessage（运行期组装）→ ChatMessage（OpenAI 线协议）
@@ -396,15 +410,16 @@ impl AppRuntime {
         };
         let client = reqwest::Client::new();
         let stream = real_stream_fn();
-        // M1 装配收口：交互轮挂采集句柄 + stage='interactive'（M3 阶段账本）
+        // M1 装配收口 + M3：交互轮挂采集句柄 + stage='interactive' + turn 稳定 request_id
         let ctx = StreamContext {
             on_stream: stream_cb,
             metrics: Some(self.llm_metrics.clone()),
             stage: "interactive".into(),
+            request_id: Some(rid),
             ..Default::default()
         };
 
-        // 4) LLM 工具循环（真实流式调用 + 全量工具；P1-2 防重放台账统一启用）
+        // 5) LLM 工具循环（真实流式调用 + 全量工具；P1-2 防重放台账统一启用）
         let replay_guard = DbToolReplayGuard::new(self.db.clone());
         let result = call_llm(
             &client,
@@ -427,10 +442,12 @@ impl AppRuntime {
                     if r.total_calls == 0 {
                         tracing::warn!("[R3] LLM 空回复且无工具调用（{conversation_id}）");
                         finish_turn("failed", "empty reply, no tool calls".to_string());
+                        session.finish(turn.outcome.event, false, 0);
                         return reply(false, String::new(), r.total_calls, r.aborted, tool_name);
                     }
                     // 有工具调用但无文本：工具副作用已发生，按完成记账
                     finish_turn("completed", String::new());
+                    session.finish(turn.outcome.event, false, r.total_calls as u32);
                     return reply(true, String::new(), r.total_calls, r.aborted, tool_name);
                 }
                 let _ = conversations::insert(&self.db, "agent", &msg.from_id, &content);
@@ -451,6 +468,7 @@ impl AppRuntime {
                     content.chars().count()
                 );
                 finish_turn("completed", String::new());
+                session.finish(turn.outcome.event, false, r.total_calls as u32);
                 reply(true, content, r.total_calls, r.aborted, tool_name)
             }
             Err(e) => {
@@ -468,6 +486,7 @@ impl AppRuntime {
                     }),
                 );
                 finish_turn("failed", format!("call_llm: {e}"));
+                session.finish(turn.outcome.event, false, 0);
                 reply(false, text, 0, false, None)
             }
         }
@@ -539,7 +558,13 @@ impl AppRuntime {
             }
         };
 
-        // 3) 真实工具执行器（与交互轮一致）
+        // 3) M3 接线（片3）：唤醒轮同样挂 turn 观测会话（stage='wakeup' 成本账本 +
+        // 上下文统计；turn 收尾记 llm_turns.is_tick=1）
+        let mut session = TurnSession::begin(self.llm_metrics.clone());
+        session.record_context_stats(&turn.injection);
+        let rid = session.request_id().to_string();
+
+        // 4) 真实工具执行器（与交互轮一致）
         let executor = self.build_executor();
 
         // 组装 LLM 消息：LlmMessage → ChatMessage（OpenAI 线协议）
@@ -569,14 +594,15 @@ impl AppRuntime {
         };
         let client = reqwest::Client::new();
         let stream = real_stream_fn();
-        // M1 装配收口 + M3：唤醒轮挂采集句柄 + stage='wakeup'（唤醒成本账本真实数据）
+        // M1 装配收口 + M3：唤醒轮挂采集句柄 + stage='wakeup' + turn 稳定 request_id
         let ctx = StreamContext {
             stage: "wakeup".into(),
             metrics: Some(self.llm_metrics.clone()),
+            request_id: Some(rid),
             ..Default::default()
         };
 
-        // 4) LLM 工具循环（P1-2 防重放台账统一启用）
+        // 5) LLM 工具循环（P1-2 防重放台账统一启用）
         let replay_guard = DbToolReplayGuard::new(self.db.clone());
         let result = call_llm(
             &client,
@@ -607,6 +633,7 @@ impl AppRuntime {
                             "total_tool_calls": r.total_calls,
                         }),
                     );
+                    session.finish(turn.outcome.event, true, r.total_calls as u32);
                     return;
                 }
                 self.bus.emit(
@@ -620,6 +647,7 @@ impl AppRuntime {
                     }),
                 );
                 tracing::info!("[wakeup] 唤醒完成 tools={}", r.total_calls);
+                session.finish(turn.outcome.event, true, r.total_calls as u32);
             }
             Err(e) => {
                 tracing::error!("[wakeup] call_llm 失败: {e}");
@@ -632,6 +660,7 @@ impl AppRuntime {
                         "timestamp": now_input_ts(),
                     }),
                 );
+                session.finish(turn.outcome.event, true, 0);
             }
         }
     }
@@ -846,5 +875,82 @@ mod tests {
             .query_row("SELECT total_calls FROM llm_metrics_daily", [], |r| r.get(0))
             .unwrap();
         assert_eq!(calls, 1, "日聚合 total_calls 只计一次");
+    }
+
+    #[tokio::test]
+    async fn m3_turn_session_persists_context_and_turn_via_assembly() {
+        // 波3·片3 验收：TurnSession（两条 turn 管线实际使用的观测会话）在真实装配下
+        // 走完整 turn 事件链 → llm_calls / llm_context_sections / llm_turns 三表
+        // JOIN 可用（M3 验收核心：context_bytes 与 turn 归属可关联）。
+        let runtime = test_runtime();
+        let mut session = TurnSession::begin(runtime.llm_metrics.clone());
+        let rid = session.request_id().to_string();
+
+        // 模拟注入输出（含 2 个非空 section）
+        let mut injection = bailongma_core::memory::injector::InjectorOutput::default();
+        injection.directions.push("继续收口主链".into());
+        injection.tools.push("web_search".into());
+        let stats = session.record_context_stats(&injection);
+        assert!(stats.sections_hit >= 2, "2 个非空 section 应命中");
+        assert!(stats.context_bytes > 0);
+
+        // LLM 调用（stage=interactive，request_id 与 turn 一致——service 接线的形态）
+        runtime.llm_metrics.record(MetricEvent::CallStarted {
+            request_id: rid.clone(),
+            provider: "deepseek".into(),
+            model: "deepseek-v4-pro".into(),
+            started_at: "2026-08-12T10:00:00+08:00".into(),
+            stage: "interactive".into(),
+        });
+        runtime.llm_metrics.record(MetricEvent::CallFinished {
+            request_id: rid.clone(),
+            duration_ms: 1200,
+            total_tokens: 80,
+            cached_tokens: 20,
+            usage_raw: "{}".into(),
+            aborted: false,
+        });
+        session.finish("created", false, 1);
+        runtime.llm_metrics_flusher.flush_now().await;
+
+        // llm_calls.context_bytes 已关联
+        let ctx_bytes: Option<i64> = runtime
+            .db
+            .conn()
+            .query_row(
+                "SELECT context_bytes FROM llm_calls WHERE request_id = ?1",
+                [&rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ctx_bytes, Some(stats.context_bytes as i64));
+
+        // section 明细 JOIN llm_calls（M3 验收核心）
+        let joins: i64 = runtime
+            .db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM llm_context_sections s
+                 JOIN llm_calls c ON c.request_id = s.request_id
+                 WHERE c.request_id = ?1",
+                [&rid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(joins, stats.sections_hit as i64, "section 明细都应 JOIN 到 llm_calls");
+
+        // turn 级记录（attribution / is_tick / sections_hit）
+        let (attribution, is_tick, sections_hit): (String, i64, Option<i64>) = runtime
+            .db
+            .conn()
+            .query_row(
+                "SELECT attribution, is_tick, sections_hit FROM llm_turns WHERE turn_id = ?1",
+                [&rid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(attribution, "created");
+        assert_eq!(is_tick, 0, "交互轮 is_tick=0");
+        assert_eq!(sections_hit, Some(stats.sections_hit as i64));
     }
 }
