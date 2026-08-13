@@ -6,7 +6,8 @@
 //!   `GET /metrics/weekly`（M4 周报，波3·片3）
 //! - WebSocket `/scene`：授权（authorize_ws_upgrade_with_credential）后建立连接
 //! - 启动时补发粘性事件（agent_name_updated，对齐 api.js）
-//! - `POST /message` 专属防护（第 1 轮审计修复）：来源限流 + token 强制校验
+//! - `POST /message` 专属防护（第 1 轮审计修复 + 2026-08-13 界面回归修复）：
+//!   来源限流 + LAN 强制 token（回环来源豁免，桌面 UI 直连可用）
 //! - LAN 读路径强制 token（第 4 轮审计修复）：token 配置后所有远端请求
 //!   （/events/history、/events SSE、/status、静态资源）必须携带 Bearer token，对齐 WS /scene
 //! - token 缺失时远端全拒（第 5 轮审计修复）：fail-closed 不依赖启动检查单一路径，
@@ -216,10 +217,13 @@ async fn guard_request(
         }
     }
 
-    // 2.5 POST /message 专属防护（第 1 轮审计修复）：
+    // 2.5 POST /message 专属防护（第 1 轮审计修复 + 2026-08-13 界面回归修复）：
     // - 无论来源，先按来源地址限流（防刷接口烧额度 / 撑爆 DB）
-    // - token 已配置 → 强制校验（回环来源也不例外，堵死本机任意进程免 token 驱动）
-    // - token 未配置 → 仅回环来源可用（LAN 即使 lan_enabled 也拒绝 /message）
+    // - 非回环（LAN / 远端）来源必须携带有效 Bearer token（LAN 防护不降级）
+    // - 回环来源免 token（桌面 UI / 本机工具直连可用）；token 未配置时仅回环可用
+    // 背景：token 配置后曾对回环 /message 也强制校验，导致桌面 UI（renderer
+    // 是浏览器上下文，无法携带 BAILONGMA_API_TOKEN）发送消息被 403 forbidden。
+    // 回环请求本就被防火墙限制在本机，且仍受速率限制兜底，LAN 暴露面不变。
     let is_message = req.method() == Method::POST && req.uri().path() == "/message";
     if is_message {
         if !guard.message_rate.allow(&remote_addr) {
@@ -228,14 +232,7 @@ async fn guard_request(
                 json!({ "ok": false, "error": "rate limited" }),
             );
         }
-        if !guard.token.is_empty() {
-            if !has_token {
-                return json_response(
-                    StatusCode::FORBIDDEN,
-                    json!({ "ok": false, "error": "forbidden" }),
-                );
-            }
-        } else if !is_loopback {
+        if !is_loopback && !has_token {
             return json_response(
                 StatusCode::FORBIDDEN,
                 json!({ "ok": false, "error": "forbidden" }),
@@ -534,7 +531,9 @@ mod tests {
 
     #[tokio::test]
     async fn message_requires_token_when_configured() {
-        // 配置 token 后，回环来源也必须带 token（堵死「本机任意进程免 token 驱动 LLM 工具循环」）
+        // 2026-08-13 界面回归修复：token 配置后，回环来源 /message 免 token
+        // （桌面 UI renderer 无 process.env，无法携带 BAILONGMA_API_TOKEN）；
+        // 非回环（LAN/远端）来源必须带 token，LAN 防护不降级。
         let state = test_state();
         let guard = Guard {
             lan_enabled: false,
@@ -544,22 +543,39 @@ mod tests {
         let server = server_with_guard(state, guard);
         let router = server.router();
 
-        let no_token = router
+        // 回环 + 无 token → 放行（桌面 UI 依赖路径）
+        let no_token_loopback = router
             .clone()
             .oneshot(post_message_req())
             .await
             .unwrap();
         assert_eq!(
-            no_token.status(),
-            StatusCode::FORBIDDEN,
-            "配置 token 后无 token 的 /message 应被拒"
+            no_token_loopback.status(),
+            StatusCode::OK,
+            "回环无 token 的 /message 应放行（桌面 UI 直连依赖）"
         );
-
+        // 回环 + 正确 token → 放行
         let with_token = router
+            .clone()
             .oneshot(post_message_req_auth("secret"))
             .await
             .unwrap();
         assert_eq!(with_token.status(), StatusCode::OK);
+        // 非回环（LAN）+ 无 token → 403（防护不降级）
+        let mut req = HttpRequest::builder()
+            .method(Method::POST)
+            .uri("/message")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"content":"hello"}"#))
+            .unwrap();
+        req.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([192, 168, 1, 5], 9999))));
+        let lan_no_token = router.oneshot(req).await.unwrap();
+        assert_eq!(
+            lan_no_token.status(),
+            StatusCode::FORBIDDEN,
+            "LAN 无 token 的 /message 应 403"
+        );
     }
 
     #[tokio::test]
