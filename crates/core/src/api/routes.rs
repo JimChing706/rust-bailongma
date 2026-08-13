@@ -391,6 +391,15 @@ pub async fn post_message(
         meta: Value::Object(meta.clone()),
     };
 
+    // wait=true：先建立订阅（确保不丢后续 message_out），再入队并广播 message_in。
+    // 注意：订阅必须先于 inbound——inbound 会 spawn 意识轮，若 LLM 快速回复（或未激活
+    // 立即降级），message_out 可能在订阅建立前发出，导致 wait 模式丢失回复、干等超时。
+    let wait_rx = if query.wait.unwrap_or(false) {
+        Some(state.subscribe())
+    } else {
+        None
+    };
+
     let queued = (state.inbound)(inbound);
     let conversation_id = queued.as_ref().map(|q| q.conversation_id);
     if conversation_id.is_none() {
@@ -398,12 +407,8 @@ pub async fn post_message(
         state.deduper.lock().unwrap().release(&key);
     }
 
-    // wait=true：先建立订阅（确保不丢后续 message_out），再广播 message_in
-    let wait_rx = if query.wait.unwrap_or(false) && conversation_id.is_some() {
-        Some(state.subscribe())
-    } else {
-        None
-    };
+    // 入队失败（无 conversation_id）则无可等消息，丢弃订阅
+    let wait_rx = if conversation_id.is_some() { wait_rx } else { None };
 
     // 广播 message_in（对齐 emitEvent）
     let attachments = meta.get("attachments").cloned().unwrap_or(Value::Null);
