@@ -197,3 +197,20 @@
   - **回归门槛**：规则标注 ground truth 单测锁定（改规则必须同步改测试，防标注漂移）。
 - 新增测试 17 条（快照 3 + 收敛 4 + 迭代流程 5 + 蒸馏 5）；全量回归 **529 passed / 0 failed**（core 491 + api_e2e 8 + db_compat 1 + sandbox 12 + escape 17）。
 - 路线：**P4 ✅（多Agent增强四阶段 P0→P4 全部收官）**；接线日回访项（真实调用 SQL 检查）待 LLM 轮接线时执行。
+
+
+## 十五、波4 落地（提醒调度闭环：service 接线 + 合并唤醒，P1-1 后半）
+
+- **提醒调度闭环**（2026-08-13，commit 链 fcd9e34 之后）：`service.rs` 新增 `spawn_wakeup_loop`（TICK 轮）——周期（默认 60s）查到期提醒 → `coalesced_wakeup` 合并为 1 条 → `run_wakeup_turn`（stage='wakeup'，走 fast_model）→ `message_out` 广播；LLM 未激活时原文广播降级（不空转）。
+- **合并唤醒输入行**：`[system] ts [tick] 合并消息`，对齐 `parse_message_input` 约定。
+- **新增回归 2 条**：`wakeup_input_line_formats` / `wakeup_loop_broadcasts_merged_message_when_llm_disabled`。
+- ✅ **实证确认**：reminders 访问器（3 测试）+ wakeup 合并器（N→1 + 周预算闸门，6 测试）+ service 接线，12 测试全绿 1.55s；合并器风暴测试 8 触发器 → 1 次唤醒、8 条全部 fired 不重复唤醒。
+
+## 十六、波5 落地（唤醒可靠性：watchdog + 假死自愈，P1-1 收尾）
+
+- **新增 `crates/app/src/watchdog.rs`**（+549/-16）：`spawn_wakeup_loop` 外层监视——panic 自动重启（指数退避）、心跳超时强杀重启、`WatchdogState` 暴露探活（heartbeat_age / restart_count / snapshot）。
+- **接线**：`service.rs`（wakeup_watchdog 字段 + 心跳广播 + 重启路径）、`lib.rs`、`api_host.rs`（`/status` 暴露 watchdog 探活）。
+- **配置**：`wakeup_watchdog_timeout_secs`（默认 180s）、`wakeup_watchdog_backoff_secs`（默认 1s）。
+- ✅ **验证**：全量回归 `cargo test --workspace` 全绿（exit 0，含 wakeup 相关 12 测试）；`clippy --workspace --all-targets -D warnings` 零告警（1m05s）；提交 `0adfab8` 已推送 origin/master，工作区干净。
+
+## 十七、R4 收口（文档补齐 + 封装打包 + GitHub 推送）
