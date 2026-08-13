@@ -87,7 +87,7 @@ def main() -> int:
     # 4) llm_context_sections + JOIN
     n_sections = q(conn, "SELECT COUNT(*) FROM llm_context_sections")[0][0]
     n_join = q(conn, "SELECT COUNT(*) FROM llm_context_sections s "
-                     "JOIN llm_calls c ON c.request_id = s.request_id")[0][0]
+                     "JOIN llm_calls c ON c.request_id = s.request_id OR c.request_id LIKE s.request_id || '#%'")[0][0]
     print(f"4) llm_context_sections: {n_sections} 行；与 llm_calls JOIN 命中 {n_join}")
     if n_sections and n_join == 0:
         print("   [FAIL] section 明细与 llm_calls 无法 JOIN —— M3 关联断裂")
