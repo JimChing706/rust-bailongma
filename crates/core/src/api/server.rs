@@ -118,6 +118,8 @@ impl ApiServer {
             .route("/events/history", get(routes::get_events_history))
             .route("/message", post(routes::post_message))
             .route("/status", get(routes::get_status))
+            .route("/health", get(routes::get_health))
+            .route("/conversations", get(routes::get_conversations))
             .route("/metrics/weekly", get(routes::get_metrics_weekly))
             .route("/scene", get(handle_scene_ws))
             .route("/approval", post(routes::post_approval))

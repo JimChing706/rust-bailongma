@@ -510,6 +510,71 @@ pub async fn get_events_history(
     }
 }
 
+/// GET /health —— 轻量健康检查（Node 桥接 / 监控探针 / 运维自检）。
+/// 与 /status 的区别：只回最小固定字段，不触发扩展状态计算。
+pub async fn get_health(State(state): State<ApiState>) -> Json<Value> {
+    let memory_count = state
+        .db
+        .conn()
+        .query_row("SELECT COUNT(*) FROM memories", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap_or(0);
+    Json(json!({
+        "ok": true,
+        "running": true,
+        "memory_count": memory_count,
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
+}
+
+/// GET /conversations —— 最近会话（微信桥接观测面板数据源）。
+#[derive(Debug, Deserialize)]
+pub struct ConversationsQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+pub async fn get_conversations(
+    State(state): State<ApiState>,
+    Query(q): Query<ConversationsQuery>,
+) -> (StatusCode, Json<Value>) {
+    let limit = q.limit.unwrap_or(20).clamp(1, 100);
+    match crate::db::repositories::conversations::recent(&state.db, limit) {
+        Ok(rows) => {
+            let items: Vec<Value> = rows
+                .iter()
+                .map(|c| {
+                    json!({
+                        "id": c.id,
+                        "role": c.role,
+                        "from_id": c.from_id,
+                        "to_id": c.to_id,
+                        "content": c.content,
+                        "timestamp": c.timestamp,
+                        "channel": c.channel,
+                        "external_party_id": c.external_party_id,
+                        "delivery_status": c.delivery_status,
+                        "focus_topic": c.focus_topic,
+                        "open_question": c.open_question,
+                    })
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "count": items.len(), "conversations": items })),
+            )
+        }
+        Err(e) => {
+            tracing::warn!("[conversations] query failed: {e}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            )
+        }
+    }
+}
+
 /// GET /status —— 状态快照（对齐 memory.js /status + 扩展字段）。
 pub async fn get_status(State(state): State<ApiState>) -> Json<Value> {
     // 基础字段：memories 数量（表不存在时静默为 0）

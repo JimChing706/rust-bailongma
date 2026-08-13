@@ -649,6 +649,72 @@
       word-break: break-word;
     }
 
+    /* ===== Scene 高级 kind：progress / selfcheck / awakening / layout ===== */
+    .scene-progress { display: grid; gap: 8px; }
+    .sp-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; }
+    .sp-label { font-size: 13px; color: #dce8ff; font-weight: 600; }
+    .sp-pct { font-size: 13px; color: var(--muted); font-family: Consolas, "Courier New", monospace; }
+    .sp-track { height: 8px; border-radius: 999px; background: rgba(255,255,255,.08); overflow: hidden; }
+    .sp-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .45s ease; }
+    .sp-done .sp-fill { background: var(--ok); }
+    .sp-error .sp-fill { background: var(--danger); }
+    .sp-paused .sp-fill { background: var(--warn); }
+    .sp-note { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .sp-indet .sp-fill { width: 40% !important; animation: spSlide 1.2s ease-in-out infinite; }
+    @keyframes spSlide { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
+
+    .scene-selfcheck { display: grid; gap: 10px; }
+    .sc-head { display: flex; align-items: center; gap: 8px; }
+    .sc-icon { font-size: 14px; }
+    .sc-title { font-size: 13px; font-weight: 700; color: #dce8ff; }
+    .sc-counter { margin-left: auto; font-size: 12px; color: var(--muted); font-family: Consolas, monospace; }
+    .sc-running { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #bcd2ff; }
+    .sc-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); animation: scPulse 1s ease-in-out infinite; }
+    @keyframes scPulse { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+    .sc-scan { height: 4px; border-radius: 999px; background: rgba(255,255,255,.06); overflow: hidden; }
+    .sc-scan-bar { height: 100%; width: 40%; background: linear-gradient(90deg, transparent, var(--accent), transparent); animation: scScan 1.1s linear infinite; }
+    @keyframes scScan { from { transform: translateX(-100%); } to { transform: translateX(250%); } }
+    .sc-results { display: grid; gap: 6px; }
+    .sc-row { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 7px 10px; border-radius: 10px; background: rgba(255,255,255,.03); }
+    .sc-row.is-ok .sc-row-icon { color: var(--ok); }
+    .sc-row.is-error .sc-row-name { color: #ffb3c4; }
+    .sc-row.is-error .sc-row-icon { color: var(--danger); }
+    .sc-row.is-skipped .sc-row-icon { color: var(--warn); }
+    .sc-row-name { color: #dce8ff; }
+    .sc-row-note { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .sc-foot { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 700; padding: 8px 10px; border-radius: 10px; }
+    .sc-foot.is-ok { color: var(--ok); background: rgba(55,214,122,.1); }
+    .sc-foot.is-degraded { color: var(--warn); background: rgba(255,184,77,.1); }
+    .sc-foot.is-error { color: var(--danger); background: rgba(255,108,141,.1); }
+
+    .scene-awakening { display: grid; gap: 10px; }
+    .aw-head { display: flex; align-items: center; gap: 8px; }
+    .aw-emoji { font-size: 15px; }
+    .aw-title { font-size: 13px; font-weight: 700; color: #dce8ff; }
+    .aw-badge { margin-left: auto; font-size: 12px; color: var(--muted); font-family: Consolas, monospace; }
+    .aw-finding { font-size: 14px; line-height: 1.7; color: #dce8ff; white-space: pre-wrap; word-break: break-word; }
+    .aw-dots { display: flex; gap: 5px; }
+    .aw-dot { width: 7px; height: 7px; border-radius: 50%; background: rgba(255,255,255,.14); }
+    .aw-dot.done { background: var(--accent); }
+    .aw-dot.active { background: var(--accent); box-shadow: 0 0 10px rgba(118,168,255,.9); animation: awPulse .9s ease-in-out infinite; }
+    @keyframes awPulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.35); } }
+
+    /* layout 原语：stack 纵向 / row 横向 / col 网格列 */
+    .scene-layout { display: flex; gap: 10px; }
+    .scene-layout.lay-stack { flex-direction: column; }
+    .scene-layout.lay-row { flex-direction: row; flex-wrap: wrap; }
+    .scene-layout.lay-col { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); }
+    .scene-layout.gap-sm { gap: 6px; }
+    .scene-layout.gap-lg { gap: 16px; }
+    .scene-layout.align-start { align-items: flex-start; }
+    .scene-layout.align-center { align-items: center; }
+    .scene-layout.align-end { align-items: flex-end; }
+    .scene-child { flex: 1 1 auto; min-width: 0; border: 1px solid var(--line); border-radius: 12px; padding: 10px; background: rgba(255,255,255,.02); }
+    .scene-child-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .scene-child.scene-ambient { opacity: .62; border-style: dashed; }
+    .scene-child.scene-confront { border-color: rgba(118,168,255,.6); }
+    .scene-unknown { font-family: Consolas, monospace; font-size: 12px; color: var(--warn); padding: 10px; border: 1px dashed rgba(255,184,77,.4); border-radius: 10px; }
+
     @media (max-width: 1080px) {
       .hero,
       .content,
@@ -665,7 +731,31 @@
       .hero { padding: 22px; }
       .side-grid { grid-template-columns: 1fr; }
     }
-  </style>
+      /* ===== 接口面板实时探测徽标 ===== */
+    .ep-badge { display:inline-flex; align-items:center; gap:6px; margin-top:8px; padding:4px 10px; border-radius:999px; font-size:12px; border:1px solid var(--line); background:rgba(255,255,255,.04); }
+    .ep-dot { width:8px; height:8px; border-radius:50%; background:var(--muted); }
+    .ep-dot.ok { background:var(--ok); box-shadow:0 0 8px rgba(55,214,122,.5); }
+    .ep-dot.bad { background:var(--danger); box-shadow:0 0 8px rgba(255,108,141,.4); }
+    .ep-dot.unknown { background:var(--warn); }
+
+    /* ===== 微信桥接观测面板 ===== */
+    .wx-panel { display:grid; gap:10px; }
+    .wx-foot { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--muted); }
+    .wx-refresh { margin-left:auto; color:#a8c7ff; cursor:pointer; user-select:none; }
+    .wx-refresh:hover { text-decoration:underline; }
+    .wx-list { display:grid; gap:8px; }
+    .wx-row { display:flex; gap:10px; padding:10px 12px; border-radius:12px; background:rgba(255,255,255,.03); border:1px solid var(--line); }
+    .wx-avatar { width:28px; height:28px; border-radius:50%; display:grid; place-items:center; font-size:12px; font-weight:700; flex:none; }
+    .wx-avatar.user { background:rgba(118,168,255,.18); color:#a8c7ff; }
+    .wx-avatar.jarvis { background:rgba(142,123,255,.18); color:#c9bdff; }
+    .wx-body { min-width:0; flex:1; }
+    .wx-top { display:flex; gap:8px; align-items:center; font-size:12px; color:var(--muted); }
+    .wx-role { color:#dce8ff; font-weight:600; }
+    .wx-time { margin-left:auto; font-family:Consolas,monospace; }
+    .wx-text { font-size:13px; color:#e8f0ff; margin-top:4px; word-break:break-word; white-space:pre-wrap; max-height:96px; overflow:hidden; }
+    .wx-empty { color:var(--muted); font-size:13px; padding:12px; }
+
+</style>
 </head>
 <body>
   <div class="shell">
@@ -737,7 +827,7 @@
       <div class="panel-head">
         <div>
           <h2 class="panel-title">Agent 场景面板</h2>
-          <div class="panel-subtitle">实时消费 <span class="mono">WS /scene</span>：Agent 主动驱动的 UI 卡片（text / metric / weather / choice / image 等）。点击选项会作为 <span class="mono">select</span> intent 回传，进入意识循环。</div>
+          <div class="panel-subtitle">实时消费 <span class="mono">WS /scene</span>：Agent 主动驱动的 UI 卡片（text / metric / weather / choice / image / progress / selfcheck / awakening / stack·row·col）。点击选项会作为 <span class="mono">select</span> intent 回传，进入意识循环。</div>
         </div>
         <div class="badge-row">
           <span class="badge mono">WS /scene</span>
@@ -862,22 +952,35 @@
         <div class="endpoint-method">GET</div>
         <div class="endpoint-path mono">/status</div>
         <div class="endpoint-desc">返回服务运行状态与 `memory_count`，适合首页健康检查和启动自检。</div>
+          <span class="ep-badge"><span class="ep-dot" id="probe-status"></span><span id="probe-status-text">未探测</span></span>
       </article>
       <article class="endpoint-card">
         <div class="endpoint-method">POST</div>
         <div class="endpoint-path mono">/message</div>
         <div class="endpoint-desc">处理入站消息并广播 `message_in`。当前 Rust 版本已具备联调占位能力。</div>
+          <span class="ep-badge"><span class="ep-dot" id="probe-message"></span><span id="probe-message-text">未探测</span></span>
       </article>
       <article class="endpoint-card">
         <div class="endpoint-method">GET</div>
         <div class="endpoint-path mono">/events</div>
         <div class="endpoint-desc">SSE 实时流。页面可据此实现通知、事件中心、状态推送和日志窗格。</div>
+          <span class="ep-badge"><span class="ep-dot" id="probe-events"></span><span id="probe-events-text">未探测</span></span>
       </article>
       <article class="endpoint-card">
         <div class="endpoint-method">WS</div>
         <div class="endpoint-path mono">/scene</div>
         <div class="endpoint-desc">Agent 场景通道：surface 卡片渲染 + intent 回传闭环，已在本页面上方实时消费。</div>
+          <span class="ep-badge"><span class="ep-dot" id="probe-scene"></span><span id="probe-scene-text">未探测</span></span>
       </article>
+    </section>
+
+    <section class="panel wx-panel" id="wechat">
+      <h2 class="panel-title">微信桥接观测</h2>
+      <div class="wx-foot">
+        <span id="wxState">加载中…</span>
+        <span class="wx-refresh" id="wxRefresh">立即刷新</span>
+      </div>
+      <div id="wxList"><div class="wx-empty">正在拉取最近微信对话…</div></div>
     </section>
   </div>
 
@@ -1044,11 +1147,15 @@
       eventSource = new EventSource('/events');
 
       eventSource.onopen = () => {
+        sseRetry = 0;
+        lastSseEvent = Date.now();
         streamState.textContent = '已连接';
         streamMiniValue.textContent = '已连接';
+        startSseWatchdog();
       };
 
       eventSource.onmessage = (event) => {
+        lastSseEvent = Date.now();
         try {
           const parsed = JSON.parse(event.data);
           liveEvents.unshift(normalizeEvent(parsed, 'live'));
@@ -1064,12 +1171,23 @@
       };
 
       eventSource.onerror = () => {
-        streamState.textContent = '连接异常';
-        streamMiniValue.textContent = '异常';
+        sseRetry += 1;
+        stopSseWatchdog();
+        if (eventSource && eventSource.readyState === EventSource.CLOSED) {
+          streamState.textContent = sseRetry <= SSE_MAX_RETRY ? `已断开，自动重连（第 ${sseRetry} 次）` : '重连失败，请检查服务';
+          streamMiniValue.textContent = '重连中';
+          eventSource = null;
+          const delay = Math.min(1000 * Math.pow(2, Math.min(sseRetry, 5)), 15000);
+          setTimeout(connectEvents, delay);
+        } else {
+          streamState.textContent = '连接异常（等待自动重连）';
+          streamMiniValue.textContent = '异常';
+        }
       };
     }
 
     function disconnectEvents() {
+      stopSseWatchdog();
       if (!eventSource) return;
       eventSource.close();
       eventSource = null;
@@ -1077,120 +1195,440 @@
       streamMiniValue.textContent = '已断开';
     }
 
-    // ===== Scene 场景面板：WS 渲染端 =====
+    // ===== Scene 场景面板：WS 渲染端（对齐 Node scene-shell client.js）=====
     const sceneState = document.getElementById('sceneState');
     const sceneCount = document.getElementById('sceneCount');
     const sceneList = document.getElementById('sceneList');
     const sceneConnectBtn = document.getElementById('sceneConnectBtn');
     const sceneDisconnectBtn = document.getElementById('sceneDisconnectBtn');
 
-    let sceneWs = null;
-    const sceneSurfaces = new Map();
+    // 传输客户端：rev 跟踪 + patch 间隙检测 + 指数退避重连 + 心跳保活。
+    const sceneClient = (() => {
+      let ws = null;
+      let rev = -1;                 // 本地已对齐版本；-1 = 尚未收到首帧
+      const surfaces = new Map();   // id -> surface，用于就地合并 patch
+      let backoff = 500;            // 重连退避起点（ms）
+      const MAX_BACKOFF = 15000;
+      let closedByUser = false;
+      let reconnectTimer = null;
+      let heartbeatTimer = null;
+      let statusCb = () => {};
 
-    function connectScene() {
-      if (sceneWs) return;
-      sceneState.textContent = '连接中';
-      sceneWs = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/scene`);
-      sceneWs.onopen = () => {
-        sceneState.textContent = '已连接';
-        sceneWs.send(JSON.stringify({ v: 1, type: 'hello' }));
-      };
-      sceneWs.onmessage = (event) => {
-        try { handleSceneMessage(JSON.parse(event.data)); } catch (e) { /* 忽略非法帧 */ }
-      };
-      sceneWs.onclose = () => {
-        sceneWs = null;
-        sceneState.textContent = '已断开';
-      };
-      sceneWs.onerror = () => { sceneState.textContent = '异常'; };
-    }
+      const wsUrl = () =>
+        `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/scene`;
 
-    function disconnectScene() {
-      if (!sceneWs) return;
-      sceneWs.close();
-      sceneWs = null;
-      sceneState.textContent = '已断开';
-    }
-
-    function handleSceneMessage(msg) {
-      if (!msg || msg.v !== 1) return;
-      if (msg.type === 'scene') {
-        // 全量快照（hello welcome / resync / clear 回退）
-        sceneSurfaces.clear();
-        (msg.surfaces || []).forEach((s) => sceneSurfaces.set(s.id, s));
-        renderScene();
-      } else if (msg.type === 'scene.patch') {
-        // 增量补丁（upsert / remove / 批量 ops）
-        (msg.ops || []).forEach((op) => {
-          if (op.op === 'upsert' && op.surface) sceneSurfaces.set(op.surface.id, op.surface);
-          else if (op.op === 'remove') sceneSurfaces.delete(op.id);
-        });
-        renderScene();
+      function send(obj) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try { ws.send(JSON.stringify(obj)); } catch (e) { /* 断开由 close 处理 */ }
+        }
       }
-    }
 
-    function renderScene() {
-      const items = [...sceneSurfaces.values()].sort((a, b) => (a.order || 0) - (b.order || 0));
+      function emitScene() {
+        const items = [...surfaces.values()].sort((a, b) => (a.order || 0) - (b.order || 0));
+        renderScene(items);
+      }
+
+      function applyFullScene(msg) {
+        surfaces.clear();
+        for (const s of Array.isArray(msg.surfaces) ? msg.surfaces : []) {
+          if (s && typeof s.id === 'string') surfaces.set(s.id, s);
+        }
+        rev = typeof msg.rev === 'number' ? msg.rev : 0;
+        emitScene();
+      }
+
+      function applyPatch(msg) {
+        // 间隙检测：base 必须等于本地 rev，否则漏帧 → 丢弃 + resync。
+        if (msg.base !== rev) {
+          sendResync('gap');
+          return;
+        }
+        for (const op of Array.isArray(msg.ops) ? msg.ops : []) {
+          if (!op) continue;
+          if (op.op === 'upsert' && op.surface && typeof op.surface.id === 'string') {
+            surfaces.set(op.surface.id, op.surface);
+          } else if (op.op === 'remove' && typeof op.id === 'string') {
+            surfaces.delete(op.id);
+          }
+          // 未知 op：忽略（向前兼容）
+        }
+        rev = typeof msg.rev === 'number' ? msg.rev : rev;
+        emitScene();
+      }
+
+      function sendResync(reason) {
+        send({ v: 1, type: 'resync', reason });
+      }
+
+      function startHeartbeat() {
+        stopHeartbeat();
+        // 服务端空闲超时 60s，每 25s 发一次 pong 保活（服务端 pong 分支静默处理并重置计时）。
+        heartbeatTimer = setInterval(() => send({ v: 1, type: 'pong' }), 25000);
+      }
+
+      function stopHeartbeat() {
+        if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+      }
+
+      function scheduleReconnect() {
+        if (closedByUser || reconnectTimer) return;
+        const delay = backoff;
+        backoff = Math.min(backoff * 2, MAX_BACKOFF);
+        reconnectTimer = setTimeout(() => {
+          reconnectTimer = null;
+          open();
+        }, delay);
+      }
+
+      function open() {
+        statusCb('连接中');
+        let w;
+        try {
+          w = new WebSocket(wsUrl());
+        } catch (e) {
+          scheduleReconnect();
+          return;
+        }
+        ws = w;
+
+        w.addEventListener('open', () => {
+          backoff = 500;
+          statusCb('已连接');
+          startHeartbeat();
+          // 握手：声明身份与能力；重连后同样重发 hello。
+          send({ v: 1, type: 'hello', shell: 'console', shellVersion: '0.1.0', caps: ['scene', 'patch'] });
+        });
+
+        w.addEventListener('message', (ev) => {
+          let msg;
+          try { msg = JSON.parse(ev.data); } catch (e) { return; }
+          if (!msg || msg.v !== 1) return;
+          switch (msg.type) {
+            case 'welcome':
+              // Rust 服务端 hello 后总会跟一条全量快照，这里仅做 rev 对齐兜底。
+              if (rev >= 0 && typeof msg.rev === 'number' && msg.rev !== rev) sendResync('init');
+              break;
+            case 'scene':
+              applyFullScene(msg);
+              break;
+            case 'scene.patch':
+              applyPatch(msg);
+              break;
+            case 'ping':
+              send({ v: 1, type: 'pong' });
+              break;
+            default:
+              break; // 未知 type：忽略（向前兼容）
+          }
+        });
+
+        w.addEventListener('close', () => {
+          statusCb('已断开');
+          stopHeartbeat();
+          if (!closedByUser) scheduleReconnect();
+        });
+
+        w.addEventListener('error', () => {
+          try { w.close(); } catch (e) { /* close 会触发重连 */ }
+        });
+      }
+
+      return {
+        connect() {
+          closedByUser = false;
+          if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+          open();
+        },
+        disconnect() {
+          closedByUser = true;
+          if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+          stopHeartbeat();
+          if (ws) { try { ws.close(); } catch (e) { /* 已断 */ } }
+          ws = null;
+          statusCb('已断开');
+        },
+        onStatus(cb) { statusCb = cb; },
+        sendIntent({ surface, name, data }) {
+          send({ v: 1, type: 'intent', surface: surface ?? null, name, data: data || {}, ts: Date.now() });
+        }
+      };
+    })();
+
+    sceneClient.onStatus((t) => {
+      sceneState.textContent = t;
+      sceneProbeNote = t;
+      sceneProbeOk = (t === '已连接');
+    });
+
+    function connectScene() { sceneClient.connect(); }
+    function disconnectScene() { sceneClient.disconnect(); }
+
+    function renderScene(items) {
       sceneCount.textContent = `${items.length} 张卡片`;
       if (!items.length) {
         sceneList.innerHTML = `<div class="empty">暂无场景卡片 — Agent 主动展示内容时会出现在这里。</div>`;
         return;
       }
       sceneList.innerHTML = items.map(renderSurfaceCard).join('');
-      sceneList.querySelectorAll('.scene-choice-btn').forEach((btn) => {
-        btn.addEventListener('click', () => {
-          if (sceneWs && sceneWs.readyState === WebSocket.OPEN) {
-            sceneWs.send(JSON.stringify({
-              v: 1,
-              type: 'intent',
-              name: 'select',
-              surface: btn.dataset.surface,
-              data: { value: btn.dataset.value },
-              ts: Date.now()
-            }));
-          }
-        });
-      });
     }
 
+    // choice 选项点击：事件委托，覆盖顶层与嵌套（layout 子级）的选项。
+    sceneList.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('.scene-choice-btn');
+      if (!btn) return;
+      sceneClient.sendIntent({
+        surface: btn.dataset.surface,
+        name: 'select',
+        data: { value: btn.dataset.value }
+      });
+    });
+
     function renderSurfaceCard(s) {
-      const d = s.data || {};
+      const d = (s && typeof s.data === 'object' && s.data) ? s.data : {};
       const intent = s.intent || 'inform';
       const cls = ['scene-card', `scene-${intent}`];
       if (s.focus) cls.push('scene-focus');
       const head = `<div class="scene-card-head"><span class="scene-kind">${escapeHtml(s.kind)}</span><span class="scene-id">${escapeHtml(s.id)}</span></div>`;
-      let body = '';
-      switch (s.kind) {
-        case 'text':
-          body = `<div class="scene-text">${escapeHtml(String(d.body ?? d.title ?? d.text ?? ''))}</div>`;
-          break;
-        case 'metric':
-          body = `<div class="scene-metric"><div class="scene-metric-label">${escapeHtml(String(d.label ?? ''))}</div><div class="scene-metric-value">${escapeHtml(String(d.value ?? ''))}</div>${d.desc ? `<div class="scene-metric-desc">${escapeHtml(String(d.desc))}</div>` : ''}</div>`;
-          break;
-        case 'weather':
-          body = `<div class="scene-weather"><div class="scene-metric-value">${escapeHtml(String(d.temp ?? ''))}°</div><div class="scene-text">${escapeHtml(String(d.city ?? ''))} · ${escapeHtml(String(d.condition ?? ''))}</div></div>`;
-          break;
-        case 'choice': {
-          const opts = Array.isArray(d.options) ? d.options : [];
-          body = `<div class="scene-choice-prompt">${escapeHtml(String(d.prompt ?? '请选择'))}</div><div class="scene-choice-opts">${opts.map((o) => `<button class="scene-choice-btn" data-surface="${escapeHtml(s.id)}" data-value="${escapeHtml(String(o.value ?? o.label ?? ''))}">${escapeHtml(String(o.label ?? o.value ?? ''))}</button>`).join('')}</div>`;
-          break;
-        }
-        case 'image': {
-          const src = d.url || d.path || d.image_path;
-          body = src ? `<img class="scene-img" src="${escapeHtml(String(src))}" alt="" loading="lazy" />` : `<div class="scene-json">${escapeHtml(pretty(d))}</div>`;
-          break;
-        }
-        case 'media': {
-          const src = d.url || d.path || d.media_path;
-          body = src ? `<a class="scene-media-link" href="${escapeHtml(String(src))}" target="_blank" rel="noopener">打开媒体 ↗</a>` : `<div class="scene-json">${escapeHtml(pretty(d))}</div>`;
-          break;
-        }
-        default:
-          // 未知 kind：降级为 JSON 卡片（向前兼容）
-          body = `<div class="scene-json">${escapeHtml(pretty(d))}</div>`;
-      }
+      const body = renderSurfaceBody(s, 0);
       return `<article class="${cls.join(' ')}">${head}${body}</article>`;
     }
+
+    // 渲染单个 surface 主体；布局原语递归渲染其 children。
+    function renderSurfaceBody(surface, depth) {
+      const d = (surface && typeof surface.data === 'object' && surface.data) ? surface.data : {};
+      const kind = surface.kind || 'unknown';
+      const sid = surface.id || '';
+      if (depth > 4) return `<div class="scene-json">${escapeHtml(pretty(d))}</div>`;
+
+      switch (kind) {
+        case 'text':
+          return `<div class="scene-text">${escapeHtml(String(d.body ?? d.title ?? d.text ?? ''))}</div>`;
+
+        case 'metric':
+          return `<div class="scene-metric"><div class="scene-metric-label">${escapeHtml(String(d.label ?? ''))}</div><div class="scene-metric-value">${escapeHtml(String(d.value ?? ''))}</div>${d.desc ? `<div class="scene-metric-desc">${escapeHtml(String(d.desc))}</div>` : ''}</div>`;
+
+        case 'weather': {
+          const temp = d.temp != null ? d.temp : '';
+          const city = d.city != null ? d.city : '';
+          const condition = d.condition != null ? d.condition : '';
+          const high = d.high != null ? d.high : '';
+          const low = d.low != null ? d.low : '';
+          const feel = d.feel != null ? d.feel : '';
+          const wind = d.wind != null ? d.wind : '';
+          const desc = d.desc != null ? d.desc : '';
+          const forecast = Array.isArray(d.forecast) ? d.forecast : [];
+          const hilo = (high !== '' || low !== '')
+            ? `<div class="scene-text">${high !== '' ? '最高 ' + escapeHtml(String(high)) + '°' : ''}${high !== '' && low !== '' ? ' · ' : ''}${low !== '' ? '最低 ' + escapeHtml(String(low)) + '°' : ''}</div>`
+            : '';
+          const extras = [feel !== '' ? '体感 ' + escapeHtml(String(feel)) + '°' : '', wind ? escapeHtml(String(wind)) : ''].filter(Boolean).join(' · ');
+          const fc = forecast.map((f) => {
+            if (typeof f === 'string') return `<div class="scene-text">${escapeHtml(f)}</div>`;
+            const day = f.day || f.date || '';
+            const cond = f.condition || f.text || '';
+            const hi = f.high != null ? f.high : '';
+            const lo = f.low != null ? f.low : '';
+            return `<div class="scene-text">${escapeHtml(String(day))} ${escapeHtml(String(cond))}${hi !== '' ? ' ' + escapeHtml(String(hi)) + '°' : ''}${lo !== '' ? '/' + escapeHtml(String(lo)) + '°' : ''}</div>`;
+          }).join('');
+          return `<div class="scene-weather"><div class="scene-metric-value">${escapeHtml(String(temp))}°</div><div class="scene-text">${escapeHtml(String(city))}${condition ? ' · ' + escapeHtml(String(condition)) : ''}</div>${hilo}${extras ? `<div class="scene-text">${extras}</div>` : ''}${desc ? `<div class="scene-text">${escapeHtml(String(desc))}</div>` : ''}${fc}</div>`;
+        }
+
+        case 'choice': {
+          const opts = Array.isArray(d.options) ? d.options : [];
+          const prompt = d.prompt != null ? d.prompt : '请选择';
+          const buttons = opts.map((o) => {
+            const label = typeof o === 'string' ? o : (o.label ?? o.value ?? '');
+            const value = typeof o === 'string' ? o : (o.value ?? o.label ?? '');
+            return `<button class="scene-choice-btn" data-surface="${escapeHtml(sid)}" data-value="${escapeHtml(String(value))}">${escapeHtml(String(label))}</button>`;
+          }).join('');
+          return `<div class="scene-choice-prompt">${escapeHtml(String(prompt))}</div><div class="scene-choice-opts">${buttons}</div>`;
+        }
+
+        case 'image': {
+          const src = d.url || d.path || d.image_path;
+          return src
+            ? `<img class="scene-img" src="${escapeHtml(String(src))}" alt="" loading="lazy" />`
+            : `<div class="scene-json">${escapeHtml(pretty(d))}</div>`;
+        }
+
+        case 'media': {
+          const src = d.url || d.path || d.media_path;
+          return src
+            ? `<a class="scene-media-link" href="${escapeHtml(String(src))}" target="_blank" rel="noopener">打开媒体 ↗</a>`
+            : `<div class="scene-json">${escapeHtml(pretty(d))}</div>`;
+        }
+
+        case 'progress': {
+          const max = (typeof d.max === 'number' && d.max > 0) ? d.max : 100;
+          const v = typeof d.value === 'number' ? d.value : 0;
+          const pct = Math.max(0, Math.min(100, Math.round((v / max) * 100)));
+          const status = ['active', 'done', 'error', 'paused'].includes(d.status)
+            ? d.status
+            : (pct >= 100 ? 'done' : 'active');
+          const indet = d.indeterminate === true && status === 'active';
+          const label = d.label != null ? d.label : '';
+          const note = d.note != null ? d.note : '';
+          const fill = indet ? '' : ` style="width:${pct}%"`;
+          return `<div class="scene-progress sp-${status}${indet ? ' sp-indet' : ''}"><div class="sp-head"><span class="sp-label">${escapeHtml(String(label))}</span><span class="sp-pct">${indet ? '' : pct + '%'}</span></div><div class="sp-track"><div class="sp-fill"${fill}></div></div>${note ? `<div class="sp-note">${escapeHtml(String(note))}</div>` : ''}</div>`;
+        }
+
+        case 'selfcheck': {
+          const isDone = d.phase === 'done' || Array.isArray(d.results);
+          if (!isDone) {
+            const step = d.step != null ? d.step : 1;
+            const total = d.total != null ? d.total : 3;
+            const name = d.name != null ? d.name : '';
+            const icon = d.icon || '🔍';
+            return `<div class="scene-selfcheck"><div class="sc-head"><span class="sc-icon">${escapeHtml(String(icon))}</span><span class="sc-title">能力自检</span><span class="sc-counter">${step} / ${total}</span></div><div class="sc-running"><span class="sc-dot"></span><span class="sc-name">正在检查${escapeHtml(String(name))}</span></div><div class="sc-scan"><div class="sc-scan-bar"></div></div></div>`;
+          }
+          const results = Array.isArray(d.results) ? d.results : [];
+          const infer = results.some(r => r.status === 'error')
+            ? 'error'
+            : (results.some(r => r.status === 'skipped') ? 'degraded' : 'ok');
+          const overallKey = ['ok', 'degraded', 'error'].includes(d.overall) ? d.overall : infer;
+          const overallMeta = {
+            ok: ['⚡', '系统就绪', 'is-ok'],
+            degraded: ['⚠', '部分能力受限', 'is-degraded'],
+            error: ['✗', '检测到问题', 'is-error']
+          }[overallKey];
+          const rows = results.map((r) => {
+            const st = { ok: ['✓', 'is-ok'], error: ['✗', 'is-error'], skipped: ['—', 'is-skipped'] }[r.status] || ['—', 'is-skipped'];
+            return `<div class="sc-row ${st[1]}"><span class="sc-row-icon">${st[0]}</span><span class="sc-row-name">${escapeHtml(String(r.name || ''))}</span>${r.note ? `<span class="sc-row-note">${escapeHtml(String(r.note))}</span>` : ''}</div>`;
+          }).join('');
+          return `<div class="scene-selfcheck"><div class="sc-head"><span class="sc-icon">${overallMeta[0]}</span><span class="sc-title">自检完成</span></div><div class="sc-results">${rows}</div><div class="sc-foot ${overallMeta[2]}"><span class="sc-overall-icon">${overallMeta[0]}</span><span class="sc-overall">${overallMeta[1]}</span></div></div>`;
+        }
+
+        case 'awakening': {
+          const total = Math.max(1, Number(d.total) || 2);
+          const index = Math.max(1, Math.min(Number(d.index) || 1, total));
+          const title = d.title != null ? d.title : '探索中';
+          const finding = d.finding != null ? d.finding : '';
+          const emoji = d.emoji || '🔍';
+          const n = Math.min(total, 15);
+          const dots = Array.from({ length: n }, (_, i) => {
+            const k = i + 1;
+            return `<span class="aw-dot${k < index ? ' done' : k === index ? ' active' : ''}"></span>`;
+          }).join('');
+          return `<div class="scene-awakening"><div class="aw-head"><span class="aw-emoji">${escapeHtml(String(emoji))}</span><span class="aw-title">${escapeHtml(String(title))}</span><span class="aw-badge">${index} / ${total}</span></div><div class="aw-finding">${escapeHtml(String(finding || '…'))}</div><div class="aw-dots">${dots}</div></div>`;
+        }
+
+        case 'stack':
+        case 'row':
+        case 'col': {
+          const children = Array.isArray(d.children) ? d.children : [];
+          const gap = ['sm', 'md', 'lg'].includes(d.gap) ? d.gap : 'md';
+          const align = ['start', 'center', 'end'].includes(d.align) ? d.align : 'stretch';
+          const kids = children.map((c) => {
+            if (!c || !c.id || !c.kind) return '';
+            const childIntent = c.intent || 'inform';
+            const inner = renderSurfaceBody(c, depth + 1);
+            return `<div class="scene-child scene-${childIntent}"><div class="scene-child-head"><span class="scene-kind">${escapeHtml(c.kind)}</span><span class="scene-id">${escapeHtml(c.id)}</span></div>${inner}</div>`;
+          }).join('');
+          return `<div class="scene-layout lay-${kind} gap-${gap} align-${align}">${kids || '<div class="scene-json">空布局</div>'}</div>`;
+        }
+
+        default:
+          // 未知 kind：优雅降级为占位（绝不崩溃，向前兼容）。
+          return `<div class="scene-unknown">⚠ 未知 kind: ${escapeHtml(kind)}</div>`;
+      }
+    }
+
+    // ===== 接口面板实时探测（status / message / events / scene）=====
+    let sceneProbeOk = false;
+    let sceneProbeNote = '未连接';
+    let lastSseEvent = Date.now();
+    let sseWatchdog = null;
+    let sseRetry = 0;
+    const SSE_MAX_RETRY = 5;
+
+    const endpointProbes = [
+      { name: 'status', check: async () => {
+          const t0 = performance.now();
+          const r = await fetch('/status');
+          const j = await r.json().catch(() => ({}));
+          return { ok: r.ok && j.ok !== false, ms: Math.round(performance.now() - t0), note: j.ok !== false ? '运行中' : '异常' };
+      }},
+      { name: 'message', check: async () => {
+          const t0 = performance.now();
+          const r = await fetch('/message', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+          const j = await r.json().catch(() => ({}));
+          const ms = Math.round(performance.now() - t0);
+          // 空 body → 400：路由可达即证明链路通（无副作用，不产生会话）
+          return { ok: r.status === 400 && j.error !== undefined, ms, note: `HTTP ${r.status}` };
+      }},
+      { name: 'events', check: async () => {
+          const st = eventSource ? eventSource.readyState : -1;
+          return { ok: st === EventSource.OPEN, ms: 0, note: st === 0 ? '连接中' : st === 1 ? '已连接' : st === 2 ? '已断开' : '未连接' };
+      }},
+      { name: 'scene', check: async () => ({ ok: sceneProbeOk, ms: 0, note: sceneProbeNote }) },
+    ];
+
+    function setProbe(name, result) {
+      const dot = document.getElementById('probe-' + name);
+      const text = document.getElementById('probe-' + name + '-text');
+      if (!dot || !text) return;
+      dot.className = 'ep-dot ' + (result.ok === true ? 'ok' : result.ok === false ? 'bad' : 'unknown');
+      text.textContent = result.note + (result.ms ? ` · ${result.ms}ms` : '');
+    }
+
+    async function runProbes() {
+      for (const p of endpointProbes) {
+        try { setProbe(p.name, await p.check()); }
+        catch (e) { setProbe(p.name, { ok: false, ms: 0, note: '不可达' }); }
+      }
+    }
+
+    // ===== 微信桥接观测面板（/conversations 数据源）=====
+    async function loadWechat() {
+      const list = document.getElementById('wxList');
+      const stateEl = document.getElementById('wxState');
+      if (!list || !stateEl) return;
+      stateEl.textContent = '刷新中…';
+      try {
+        const res = await fetch('/conversations?limit=12');
+        const json = await res.json();
+        const rows = Array.isArray(json.conversations) ? json.conversations : [];
+        const wx = rows.filter((r) => String(r.channel || '').toLowerCase().startsWith('wechat'));
+        stateEl.textContent = `最近 ${wx.length} 条微信对话 · 数据源 /conversations`;
+        if (!wx.length) {
+          list.innerHTML = '<div class="wx-empty">暂无微信对话 —— 微信消息经桥接落库后会自动出现在这里。</div>';
+          return;
+        }
+        list.innerHTML = '<div class="wx-list">' + wx.map((r) => {
+          const isUser = r.role === 'user';
+          const time = r.timestamp ? new Date(r.timestamp).toLocaleString('zh-CN', { hour12: false }) : '';
+          const content = escapeHtml(String(r.content || ''));
+          const status = r.delivery_status ? `<span class="wx-role">· ${escapeHtml(r.delivery_status)}</span>` : '';
+          return `<div class="wx-row">
+            <div class="wx-avatar ${isUser ? 'user' : 'jarvis'}">${isUser ? '微' : '龙'}</div>
+            <div class="wx-body">
+              <div class="wx-top"><span class="wx-role">${isUser ? '用户' : '小白龙'}</span>${status}<span class="wx-time">${escapeHtml(time)}</span></div>
+              <div class="wx-text">${content}</div>
+            </div>
+          </div>`;
+        }).join('') + '</div>';
+      } catch (e) {
+        stateEl.textContent = '加载失败';
+        list.innerHTML = `<div class="wx-empty">微信观测加载失败：${escapeHtml(String(e))}</div>`;
+      }
+    }
+
+    function startSseWatchdog() {
+      stopSseWatchdog();
+      sseWatchdog = setInterval(() => {
+        if (eventSource && eventSource.readyState === EventSource.OPEN && Date.now() - lastSseEvent > 90000) {
+          console.warn('[SSE] 90s 无事件，强制重建连接');
+          const old = eventSource;
+          eventSource = null;
+          try { old.close(); } catch (e) { /* ignore */ }
+          connectEvents();
+        }
+      }, 30000);
+    }
+    function stopSseWatchdog() {
+      if (sseWatchdog) { clearInterval(sseWatchdog); sseWatchdog = null; }
+    }
+
+    document.getElementById('wxRefresh')?.addEventListener('click', loadWechat);
 
     refreshBtn.addEventListener('click', loadStatus);
     refreshHistoryBtn.addEventListener('click', loadHistory);
@@ -1204,6 +1642,10 @@
     loadHistory();
     connectEvents();
     connectScene();
+    loadWechat();
+    runProbes();
+    setInterval(loadWechat, 30000);
+    setInterval(runProbes, 15000);
   </script>
 </body>
 </html>
