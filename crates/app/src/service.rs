@@ -410,6 +410,7 @@ impl AppRuntime {
             local_reply: false,
             must_reply: true,
             intervention: Some(self.intervention.clone()),
+            round_request_id_seed: Some(rid.clone()),
             ..Default::default()
         };
         let client = reqwest::Client::new();
@@ -594,6 +595,7 @@ impl AppRuntime {
             local_reply: false,
             must_reply: true,
             intervention: Some(self.intervention.clone()),
+            round_request_id_seed: Some(rid.clone()),
             ..Default::default()
         };
         let client = reqwest::Client::new();
