@@ -57,6 +57,14 @@ pub type StatusFn = Arc<dyn Fn() -> Value + Send + Sync>;
 // 请求 / 响应体
 // ─────────────────────────────────────────────────────────────
 
+/// POST /message 查询参数：`wait=true` 时同步等待该会话的 LLM 回复并直接返回。
+/// （微信网桥用：Node 侧转发微信消息后无需解析 SSE 即可拿到回复文本）
+#[derive(Debug, Default, Deserialize)]
+pub struct MessageQuery {
+    #[serde(default)]
+    pub wait: Option<bool>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct InboundBody {
     #[serde(default = "default_from_id")]
@@ -320,6 +328,7 @@ pub async fn post_approval(
 
 pub async fn post_message(
     State(state): State<ApiState>,
+    Query(query): Query<MessageQuery>,
     Json(body): Json<InboundBody>,
 ) -> (StatusCode, Json<Value>) {
     let content = body.content.trim().to_string();
@@ -389,6 +398,13 @@ pub async fn post_message(
         state.deduper.lock().unwrap().release(&key);
     }
 
+    // wait=true：先建立订阅（确保不丢后续 message_out），再广播 message_in
+    let wait_rx = if query.wait.unwrap_or(false) && conversation_id.is_some() {
+        Some(state.subscribe())
+    } else {
+        None
+    };
+
     // 广播 message_in（对齐 emitEvent）
     let attachments = meta.get("attachments").cloned().unwrap_or(Value::Null);
     state.bus.emit(
@@ -402,6 +418,41 @@ pub async fn post_message(
             "attachments": attachments,
         }),
     );
+
+    // wait=true：同步等待该会话的 LLM 回复（按 conversation_id 匹配，300s 超时）
+    if let Some(mut rx) = wait_rx {
+        let cid = conversation_id.unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return (
+                    StatusCode::OK,
+                    Json(json!({ "ok": true, "reply": null, "timed_out": true })),
+                );
+            }
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(ev))
+                    if ev.r#type == "message_out"
+                        && ev.data["conversation_id"].as_i64() == Some(cid) =>
+                {
+                    let reply = ev.data["content"].as_str().unwrap_or("").to_string();
+                    return (
+                        StatusCode::OK,
+                        Json(json!({ "ok": true, "reply": reply, "timed_out": false })),
+                    );
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => {
+                    return (
+                        StatusCode::OK,
+                        Json(json!({ "ok": true, "reply": null, "timed_out": true })),
+                    );
+                }
+            }
+        }
+    }
 
     (
         StatusCode::OK,
@@ -599,6 +650,7 @@ mod tests {
         let mut rx = state.subscribe();
         let resp = post_message(
             State(state.clone()),
+            Query(MessageQuery::default()),
             Json(InboundBody {
                 from_id: "ID:000001".into(),
                 content: "  你好  ".into(),
@@ -627,6 +679,7 @@ mod tests {
         let state = test_state();
         let resp = post_message(
             State(state),
+            Query(MessageQuery::default()),
             Json(InboundBody {
                 from_id: "ID:000001".into(),
                 content: "   ".into(),
@@ -657,18 +710,69 @@ mod tests {
         };
         let first = post_message(
             State(state.clone()),
+            Query(MessageQuery::default()),
             Json(body(Some("msg_12345678".into()))),
         )
         .await;
         assert_eq!(first.0, StatusCode::OK);
         let second = post_message(
             State(state.clone()),
+            Query(MessageQuery::default()),
             Json(body(Some("msg_12345678".into()))),
         )
         .await;
         let (_, Json(b)) = second;
         assert_eq!(b["duplicate"], true);
         assert_eq!(b["conversation_id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn wait_mode_returns_reply_from_message_out() {
+        // wait=true：订阅在入队后建立 → 等 message_in 确认订阅就绪 → 发射 message_out → 直接返回 reply
+        let state = test_state();
+        let state2 = state.clone();
+        let handle = tokio::spawn(async move {
+            post_message(
+                State(state2),
+                Query(MessageQuery { wait: Some(true) }),
+                Json(InboundBody {
+                    from_id: "ID:000001".into(),
+                    content: "hello".into(),
+                    channel: "WECHAT".into(),
+                    client_message_id: None,
+                    strict_evaluation: None,
+                    evaluation_mode: None,
+                    forbidden_tools: None,
+                    extra: Default::default(),
+                }),
+            )
+            .await
+        });
+        // 等 stub inbound 入队 + message_in 广播（wait 订阅已建立），再发射回复事件
+        let mut rx = state.subscribe();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while let Ok(ev) = rx.recv().await {
+                if ev.r#type == "message_in" {
+                    break;
+                }
+            }
+        })
+        .await;
+        state.bus.emit(
+            "message_out",
+            json!({
+                "from_id": "ID:000001",
+                "content": "你好，收到",
+                "channel": "WECHAT",
+                "timestamp": iso_now(),
+                "conversation_id": 5, // "hello" 字节数 = 5
+            }),
+        );
+        let (status, Json(body)) = handle.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["reply"], "你好，收到");
+        assert_eq!(body["timed_out"], false);
     }
 
     #[test]

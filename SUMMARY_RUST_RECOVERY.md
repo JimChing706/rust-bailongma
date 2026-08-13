@@ -214,3 +214,14 @@
 - ✅ **验证**：全量回归 `cargo test --workspace` 全绿（exit 0，含 wakeup 相关 12 测试）；`clippy --workspace --all-targets -D warnings` 零告警（1m05s）；提交 `0adfab8` 已推送 origin/master，工作区干净。
 
 ## 十七、R4 收口（文档补齐 + 封装打包 + GitHub 推送）
+- **文档补齐**：SUMMARY 补波4（提醒调度闭环）/波5（唤醒可靠性）/波6 三章；全量回归全绿（commit 链 0adfab8 → eab29ee）。
+- **release 全量构建**：2m41s 零错误，5 个产物（bailongma / serve / chat / scan_agents / bailongma-sandbox）更新至 `_dist/bin`；新发布包 `bailongma-rust-20260813.zip` 生成（`_dist` 在 .gitignore 内，发布产物不进仓库）。
+- **GitHub 推送**：origin/master 已对齐（0 ahead / 0 behind），工作区干净。
+
+## 十八、wave6.5/6.6 M4 接线日回访（观测数据实证，2026-08-13，commit 链 6e52d44 → f6ae0e0 → 3b63058）
+
+- **回访工具**：`scripts/revisit_m4_metrics.py` 对任意 jarvis.db 跑六项 M4 验收 SQL（llm_calls / llm_turns / llm_tool_calls / llm_context_sections / llm_metrics_daily + JOIN 核对 + 覆盖率），有数据 PASS(0)、空表/缺表/JOIN 断裂 FAIL(2)；附测试夹具（种子库/空库）三分支实测通过。
+- **真实 E2E 验证 PASS**：serve API 直调「JOIN OK」→ 观测表真实落数——llm_calls 8 行（stage=interactive、finish=done）、llm_turns 8 行、llm_context_sections 16 行、llm_metrics_daily calls=8 / err=0 / retry=1 / tokens=59582；JOIN 命中 2（rid#round 格式对上）。
+- **修复**：`service.rs` 注入 `round_request_id_seed`，request_id 以 `rid#round` 贯穿 llm_calls / llm_turns / llm_context_sections 三表（commit 3b63058）；回访脚本 JOIN 前缀匹配 + 括号语法修复（commit f6ae0e0）。
+- **覆盖统计**：conversations 分母 1300 轮健康（user 620 / jarvis 680）；5 张观测表全部建好。
+- **遗留缺口**：真实微信对话仍走 Node 桥接直连 LLM，绕开 Rust 观测层（channel=WECHAT 的 llm_calls 为 0）→ 波7 微信网关切换（进行中）。
