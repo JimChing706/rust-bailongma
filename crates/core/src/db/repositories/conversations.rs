@@ -179,7 +179,7 @@ pub fn find_unanswered_delivered_outbound(
     let conn = db.conn();
     let mut stmt = conn.prepare(
         r#"
-        SELECT id, timestamp, channel, external_party_id
+        SELECT *
         FROM conversations
         WHERE role = 'jarvis'
           AND to_id = ?1
@@ -451,5 +451,39 @@ mod tests {
 
         // 空参数 → 不动
         assert_eq!(reassign_conversations_thread(&db, "", "x").unwrap(), 0);
+    }
+
+    #[test]
+    fn find_unanswered_delivered_outbound_reads_full_row() {
+        // 回归：SELECT 列必须覆盖 Conversation::from_row 的全部列，否则这里会 Err
+        let db = test_db();
+        insert_conversation(
+            &db,
+            &NewConversation {
+                role: "jarvis".into(),
+                from_id: "jarvis".into(),
+                to_id: Some("ID:000001".into()),
+                content: "你好".into(),
+                timestamp: now_iso(),
+                channel: "wechat".into(),
+                external_party_id: "wx:abc".into(),
+                focus_topic: String::new(),
+                open_question: false,
+                thread_id: String::new(),
+                delivery_status: "delivered".into(),
+            },
+        )
+        .unwrap();
+
+        let found = find_unanswered_delivered_outbound(
+            &db,
+            "ID:000001",
+            "你好",
+            "wechat",
+            "wx:abc",
+        )
+        .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().content, "你好");
     }
 }
