@@ -48,6 +48,7 @@ use bailongma_core::memory::messages::LlmRole;
 use bailongma_core::runtime::{init as runtime_init, run_user_turn, RuntimeState, TurnRequest};
 use bailongma_core::tools::{all_tool_schemas, NativeToolExecutor, SendMessageFn};
 use bailongma_core::wakeup::{coalesced_wakeup, CoalescedWakeup};
+use crate::watchdog::{LoopSupervisor, WatchdogState};
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -83,6 +84,8 @@ pub struct AppRuntime {
     pub llm_metrics: MetricsCollector,
     /// M1 观测：flusher 控制句柄（保活后台任务；优雅退出时 shutdown()，M1 可接受不调）。
     pub llm_metrics_flusher: FlusherHandle,
+    /// 波5：唤醒循环守护状态（心跳/重启计数；/status 探活数据源）。
+    pub wakeup_watchdog: WatchdogState,
 }
 
 /// 当前轮时间戳（本地时区 ISO，与 runtime 测试的消息格式一致）。
@@ -144,6 +147,7 @@ impl AppRuntime {
             intervention,
             llm_metrics,
             llm_metrics_flusher,
+            wakeup_watchdog: WatchdogState::default(),
         }
     }
 
@@ -671,6 +675,10 @@ impl AppRuntime {
     ///   wakeup_interval_secs：轮询间隔（默认 60s，最小 1s）
     ///   wakeup_days：周窗口天数（默认 7）
     ///   wakeup_budget_tokens：周窗口唤醒预算（默认 0 = 闸门关闭，纯观测不拦截）
+    /// 波5（唤醒可靠性）：外层套 LoopSupervisor 守护——panic/退出自动重启
+    /// （指数退避）、心跳超时假死自愈（abort+重启）、/status 探活。
+    /// 新增配置：wakeup_watchdog_timeout_secs（心跳超时，默认 180s，最小 5s）、
+    /// wakeup_watchdog_backoff_secs（重启退避基数，默认 1s）。
     pub fn spawn_wakeup_loop(&self) -> tokio::task::JoinHandle<()> {
         let runtime = self.clone();
         let interval_secs = self
@@ -692,24 +700,70 @@ impl AppRuntime {
             .get("wakeup_budget_tokens")
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
-            loop {
-                interval.tick().await;
-                let now = now_input_ts();
-                match coalesced_wakeup(&runtime.db, &now, days, budget) {
-                    Ok(Some(wake)) => {
-                        tracing::info!(
-                            "[wakeup] {} 条到期提醒合并为 1 次唤醒",
-                            wake.trigger_count
-                        );
-                        runtime.run_wakeup_turn(wake).await;
+        let watchdog_timeout = Duration::from_secs(
+            self.cfg
+                .extra
+                .get("wakeup_watchdog_timeout_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(180)
+                .max(5),
+        );
+        let backoff_base = Duration::from_secs(
+            self.cfg
+                .extra
+                .get("wakeup_watchdog_backoff_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1),
+        );
+
+        let worker = {
+            let runtime = runtime.clone();
+            move |wstate: WatchdogState| {
+                let runtime = runtime.clone();
+                async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+                    loop {
+                        interval.tick().await;
+                        wstate.beat();
+                        let now = now_input_ts();
+                        match coalesced_wakeup(&runtime.db, &now, days, budget) {
+                            Ok(Some(wake)) => {
+                                tracing::info!(
+                                    "[wakeup] {} 条到期提醒合并为 1 次唤醒",
+                                    wake.trigger_count
+                                );
+                                runtime.run_wakeup_turn(wake).await;
+                            }
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!("[wakeup] 唤醒轮失败: {e}"),
+                        }
                     }
-                    Ok(None) => {}
-                    Err(e) => tracing::warn!("[wakeup] 唤醒轮失败: {e}"),
                 }
             }
-        })
+        };
+
+        // 波5：每次重启落 brain_ui_events（自愈事件可观测）+ error 日志
+        let on_restart = {
+            let db = runtime.db.clone();
+            move |reason: &str| {
+                tracing::error!("[wakeup] 循环重启（{reason}），watchdog 已拉起新循环");
+                brain_ui_events::insert_brain_ui_event(
+                    &db,
+                    &now_input_ts(),
+                    "l2",
+                    "wakeup_restart",
+                    &json!({ "reason": reason }),
+                );
+            }
+        };
+
+        LoopSupervisor::spawn(
+            self.wakeup_watchdog.clone(),
+            worker,
+            watchdog_timeout,
+            backoff_base,
+            on_restart,
+        )
     }
 }
 
@@ -761,6 +815,24 @@ mod tests {
         );
         assert!(line.starts_with("[system] 2026-08-11T08:00:00+08:00 [tick] "));
         assert!(line.contains("喂猫"));
+    }
+
+    #[tokio::test]
+    async fn wakeup_watchdog_heartbeat_visible_after_first_tick() {
+        // 波5：健康循环心跳新鲜、零重启；快照可探活
+        let runtime = test_runtime();
+        insert_due_reminder(&runtime.db, "2026-08-11T08:00:00+08:00", "探活测试");
+        let mut rx = runtime.bus.subscribe();
+        let _handle = runtime.spawn_wakeup_loop();
+        let _ = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("首个 tick 应广播")
+            .expect("channel 不应关闭");
+        assert_eq!(runtime.wakeup_watchdog.restart_count(), 0);
+        assert!(runtime.wakeup_watchdog.heartbeat_age() < Duration::from_secs(5));
+        let snap = runtime.wakeup_watchdog.snapshot();
+        assert_eq!(snap["restart_count"], 0);
+        assert!(snap["last_heartbeat"].is_string());
     }
 
     #[tokio::test]

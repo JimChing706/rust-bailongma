@@ -153,7 +153,24 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
     let _wakeup_loop = runtime.spawn_wakeup_loop();
     tracing::info!("[wakeup] 后台唤醒循环已启动");
 
-    let status = Arc::new(|| json!({ "running": true }));
+    // 波5：/status 探活 —— wakeup 守护状态（心跳/重启计数/待处理提醒数）
+    let wakeup_state = runtime.wakeup_watchdog.clone();
+    let status_db = runtime.db.clone();
+    let status = Arc::new(move || {
+        let pending = status_db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM reminders WHERE status = 'pending'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0);
+        let mut wakeup = wakeup_state.snapshot();
+        if let Some(obj) = wakeup.as_object_mut() {
+            obj.insert("pending_reminders".into(), json!(pending));
+        }
+        json!({ "running": true, "wakeup": wakeup })
+    });
 
     let agent_name = runtime.agent_name.clone();
     let state = ApiState::new(
