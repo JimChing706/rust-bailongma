@@ -11,8 +11,6 @@
 //! 已存在），增量应为 0；绝不少表、不动用户数据——这正是"观测层不碰
 //! 用户数据"的承诺边界。
 
-use std::collections::HashSet;
-
 use bailongma_core::db::open_database;
 
 /// 候选真实用户库路径（Windows 开发机）：
