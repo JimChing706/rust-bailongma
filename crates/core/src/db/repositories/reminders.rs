@@ -141,12 +141,12 @@ mod tests {
         // 文本序会得出完全错误的先后。
         let db = test_db();
         // 同一时刻的三条（三种书写方式）
-        let a = insert_reminder(&db, "2026-08-10T00:00:00Z", "UTC写法", "pending");
-        let b = insert_reminder(&db, "2026-08-10T08:00:00+08:00", "东八写法", "pending");
+        insert_reminder(&db, "2026-08-10T00:00:00Z", "UTC写法", "pending");
+        insert_reminder(&db, "2026-08-10T08:00:00+08:00", "东八写法", "pending");
         // 晚于该时刻 1 小时的提醒（+09:00 偏移的同一时刻等价写法也算到期）
-        let c = insert_reminder(&db, "2026-08-10T01:00:00+09:00", "晚1h", "pending");
+        insert_reminder(&db, "2026-08-10T01:00:00+09:00", "晚1h", "pending");
         // 早于该时刻的提醒
-        let d = insert_reminder(&db, "2026-08-09T23:30:00Z", "早0.5h", "pending");
+        insert_reminder(&db, "2026-08-09T23:30:00Z", "早0.5h", "pending");
 
         let due = due_reminders(&db, "2026-08-10T00:30:00Z").unwrap();
         // 到期：d（早）、a、b、c（2026-08-10T00:00:00+08:00 实际是 08-10T00:00Z，晚于 00:30Z？——不对，需复核）

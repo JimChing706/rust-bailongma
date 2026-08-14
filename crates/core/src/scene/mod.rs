@@ -7,4 +7,4 @@
 
 pub mod store;
 
-pub use store::{SceneOp, SceneStore, Surface};
+pub use store::{SceneOp, SceneOpEvent, SceneStore, Surface};

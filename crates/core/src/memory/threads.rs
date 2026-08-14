@@ -438,6 +438,36 @@ pub fn latest_open_commitment<'a>(ts: &'a ThreadState, channel: &str) -> Option<
 
 // ── 承诺生命周期（行动者写入路径之一：set_task / clear_task 钩子调这里） ────
 
+/// M5（审计修复）：commitments 容量上限——closed 承诺（done/cancelled）按
+/// 创建序淘汰最老项，open（活动）承诺永不淘汰。阈值远高于真实长会话用量，
+/// 仅防无界累积。
+fn enforce_commitments_cap(ts: &mut ThreadState) {
+    const COMMITMENTS_CAP: usize = 256;
+    if ts.commitments.len() <= COMMITMENTS_CAP {
+        return;
+    }
+    let overflow = ts.commitments.len() - COMMITMENTS_CAP;
+    let mut removed: Vec<usize> = Vec::new();
+    for (i, c) in ts.commitments.iter().enumerate() {
+        if removed.len() >= overflow {
+            break;
+        }
+        if c.status != "open" {
+            removed.push(i);
+        }
+    }
+    if removed.is_empty() {
+        return; // 全为 open（理论不会：open 单例）→ 保留
+    }
+    let mut keep = Vec::with_capacity(ts.commitments.len() - removed.len());
+    for (i, c) in ts.commitments.drain(..).enumerate() {
+        if !removed.contains(&i) {
+            keep.push(c);
+        }
+    }
+    ts.commitments = keep;
+}
+
 /// "好的我去做" = 开承诺，钉住线索温度。thread_id 缺省挂到前台线索；
 /// 前台为空就为这个承诺开一条新线索（对齐 openCommitment）。
 pub fn open_commitment<'a>(
@@ -472,6 +502,10 @@ pub fn open_commitment<'a>(
         }
     };
     let thread_id = ts.threads[thread_idx].id.clone();
+    // M5（审计修复）：commitments 有界——closed（done/cancelled）承诺无限累积
+    // 会造成长会话内存膨胀；超上限时按创建序淘汰最老已关闭项，open（活动）
+    // 承诺是单例且钉住线索，永不淘汰。
+    enforce_commitments_cap(ts);
     {
         // 同一线索上已有开放承诺 → 更新文本而不是叠加（task 是单例的）
         if let Some(existing) = ts

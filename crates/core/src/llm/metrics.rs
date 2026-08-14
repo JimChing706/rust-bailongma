@@ -541,6 +541,14 @@ fn apply_event(
                 // M3（波3·片3 装配验收暴露）：真实装配顺序 record_context_stats →
                 // CallStarted（TurnSession::begin → 统计 → 调 LLM）；聚合 entry 未到
                 // 时暂存 context_bytes，CallStarted 分支补挂，绝不丢失
+                // L5（审计修复）：有界——孤儿 request（CallStarted 永不出现，如
+                // 崩溃/事件丢失）不清理会无限增长；满上限淘汰任一旧暂存腾位。
+                const MAX_PENDING_CTX: usize = 4096;
+                if pending_ctx.len() >= MAX_PENDING_CTX {
+                    if let Some(stale) = pending_ctx.keys().next().cloned() {
+                        pending_ctx.remove(&stale);
+                    }
+                }
                 pending_ctx.insert(request_id.clone(), bytes);
             }
             for (name, bytes) in sections {
@@ -620,36 +628,51 @@ async fn flush(
         }
     }
 
-    // 2) 日聚合：增量累加（ON CONFLICT +=；失败即丢本次增量，可接受）
+    // 2) 日聚合：增量累加（ON CONFLICT +=；L4 修复：失败保留 pending 待下轮重试——
+    // 日聚合是预算闸门的账本，失败即丢会使 budget 闸门失守；同 day 后续有新增量时合并累加）
     let days: Vec<(String, DailyDelta)> = daily.drain().collect();
     for (day, delta) in days {
         if let Err(err) = upsert_daily(db, &day, &delta) {
-            tracing::warn!(%err, "[llm_metrics] 日聚合落库失败（best-effort，跳过）");
+            tracing::warn!(%err, "[llm_metrics] 日聚合落库失败（保留待重试）");
+            let merged = daily.entry(day).or_default();
+            merged.total_calls += delta.total_calls;
+            merged.error_count += delta.error_count;
+            merged.retry_count += delta.retry_count;
+            merged.fallback_count += delta.fallback_count;
+            merged.aborted_count += delta.aborted_count;
+            merged.total_tokens += delta.total_tokens;
+            merged.cached_tokens += delta.cached_tokens;
+            merged.ttft_sum_ms += delta.ttft_sum_ms;
+            merged.ttft_count += delta.ttft_count;
+            merged.duration_sum_ms += delta.duration_sum_ms;
         }
     }
 
-    // 3) 工具台账（M2）
+    // 3) 工具台账（M2；L4：失败保留 pending 待重试，成功才清空）
     if !tool_rows.is_empty() {
         if let Err(err) = upsert_tool_calls_batch(db, tool_rows) {
-            tracing::warn!(%err, "[llm_metrics] 工具台账落库失败（best-effort，跳过）");
+            tracing::warn!(%err, "[llm_metrics] 工具台账落库失败（保留待重试）");
+        } else {
+            tool_rows.clear();
         }
-        tool_rows.clear();
     }
 
-    // 3.5) 上下文 section 明细（M3；INSERT OR IGNORE 防重放）
+    // 3.5) 上下文 section 明细（M3；INSERT OR IGNORE 防重放；L4：失败保留待重试）
     if !section_rows.is_empty() {
         if let Err(err) = upsert_context_sections_batch(db, section_rows) {
-            tracing::warn!(%err, "[llm_metrics] section 明细落库失败（best-effort，跳过）");
+            tracing::warn!(%err, "[llm_metrics] section 明细落库失败（保留待重试）");
+        } else {
+            section_rows.clear();
         }
-        section_rows.clear();
     }
 
-    // 3.6) turn 级记录（M3）
+    // 3.6) turn 级记录（M3；L4：失败保留待重试）
     if !turn_rows.is_empty() {
         if let Err(err) = upsert_turns_batch(db, turn_rows) {
-            tracing::warn!(%err, "[llm_metrics] turn 记录落库失败（best-effort，跳过）");
+            tracing::warn!(%err, "[llm_metrics] turn 记录落库失败（保留待重试）");
+        } else {
+            turn_rows.clear();
         }
-        turn_rows.clear();
     }
 
     // 4) 每日一次明细滚动淘汰（对齐 2 万行上限；聚合永久）
@@ -1317,8 +1340,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn round_limit_overwrites_done_across_flush() {
-        // 跨 flush：done 先落库，round_limit 后到 → UPSERT 必须把终态改为 round_limit
+    async fn round_limit_does_not_downgrade_done_across_flush() {
+        // L6（审计修复）：done 先落库，round_limit 后到 → 成功终态不可被异常截断降级
         let db = test_db();
         let (col, flusher) = init_with(db.clone(), Duration::from_secs(60_000), 10_000);
         let rid = new_request_id();
@@ -1361,7 +1384,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(after, "round_limit", "跨 flush 的 round_limit 必须覆盖已落库的 done");
+        assert_eq!(after, "done", "跨 flush 的 round_limit 不得把已落库的 done 降级（L6）");
         assert_eq!(err_count, 1, "日聚合错误计数必须 +1");
     }
 

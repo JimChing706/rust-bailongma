@@ -58,6 +58,18 @@ pub enum SceneOp {
     Clear,
 }
 
+/// 变更通知 + **锁内版本快照**（R4 审计修复）：
+/// rev/base 在变更发生时绑定，避免构建协议消息时读取已被后续变更推进的
+/// rev → 并发下乐观锁失效（丢更新/脏覆盖）。传输层直接用快照值。
+#[derive(Debug, Clone)]
+pub struct SceneOpEvent {
+    pub op: SceneOp,
+    /// 本次变更后的版本号
+    pub rev: u64,
+    /// 本次变更前的版本号（增量补丁的乐观锁基线）
+    pub base: u64,
+}
+
 struct SceneInner {
     /// 插入序保持的 surfaces（id -> surface）
     surfaces: Vec<(String, Surface)>,
@@ -70,7 +82,7 @@ struct SceneInner {
 pub struct SceneStore {
     inner: Arc<Mutex<SceneInner>>,
     /// 变更通知通道（无订阅者时 send 失败可忽略）
-    tx: broadcast::Sender<SceneOp>,
+    tx: broadcast::Sender<SceneOpEvent>,
 }
 
 impl Default for SceneStore {
@@ -92,7 +104,7 @@ impl SceneStore {
     }
 
     /// 订阅场景变更，返回接收端（对齐 subscribe / _emit）。
-    pub fn subscribe(&self) -> broadcast::Receiver<SceneOp> {
+    pub fn subscribe(&self) -> broadcast::Receiver<SceneOpEvent> {
         self.tx.subscribe()
     }
 
@@ -117,8 +129,13 @@ impl SceneStore {
             }
             inner.surfaces.retain(|(i, _)| i != id);
             inner.rev += 1;
-            let op = SceneOp::Remove(id.to_string());
-            let _ = self.tx.send(op.clone());
+            // R4：锁内快照 rev/base 绑定到事件上（并发安全基线）
+            let ev = SceneOpEvent {
+                op: SceneOp::Remove(id.to_string()),
+                rev: inner.rev,
+                base: inner.rev - 1,
+            };
+            let _ = self.tx.send(ev);
             return Ok(true);
         }
 
@@ -143,8 +160,13 @@ impl SceneStore {
             inner.surfaces.push((id.to_string(), next.clone()));
         }
         inner.rev += 1;
-        let op = SceneOp::Upsert(next);
-        let _ = self.tx.send(op.clone());
+        // R4：锁内快照 rev/base 绑定到事件上
+        let ev = SceneOpEvent {
+            op: SceneOp::Upsert(next),
+            rev: inner.rev,
+            base: inner.rev - 1,
+        };
+        let _ = self.tx.send(ev);
         Ok(true)
     }
 
@@ -208,8 +230,13 @@ impl SceneStore {
             return Ok(false); // 全部幂等命中，无变化
         }
         inner.rev += 1;
-        let op = SceneOp::Patch(ops);
-        let _ = self.tx.send(op.clone());
+        // R4：锁内快照 rev/base 绑定到事件上
+        let ev = SceneOpEvent {
+            op: SceneOp::Patch(ops),
+            rev: inner.rev,
+            base: inner.rev - 1,
+        };
+        let _ = self.tx.send(ev);
         Ok(true)
     }
 
@@ -259,30 +286,39 @@ impl SceneStore {
         }
         inner.surfaces.clear();
         inner.rev += 1;
-        let _ = self.tx.send(SceneOp::Clear);
+        // R4：Clear 走全量快照，版本快照仍绑定（快照内部读当前 rev，语义一致）
+        let ev = SceneOpEvent {
+            op: SceneOp::Clear,
+            rev: inner.rev,
+            base: inner.rev - 1,
+        };
+        let _ = self.tx.send(ev);
         true
     }
 
     /// 把一次变更转成协议消息（对齐 scene-server 的 ensureSubscribed 回调）：
     /// upsert / remove / patch → 增量补丁 `scene.patch`；其他（clear）→ 全量快照。
-    pub fn protocol_message(&self, op: &SceneOp) -> Value {
-        match op {
+    ///
+    /// R4（审计修复）：rev/base 取事件携带的**锁内快照**，而非此时读取 `self.rev()`——
+    /// 变更经通道排队期间 rev 可能已被后续变更推进，构建消息时读取会给出错误基线
+    /// （并发下乐观锁失效：客户端 base 对不上真实历史 → 丢更新/脏覆盖）。
+    pub fn protocol_message(&self, ev: &SceneOpEvent) -> Value {
+        match &ev.op {
             SceneOp::Upsert(surface) => json!({
                 "v": 1,
                 "type": "scene.patch",
-                "rev": self.rev(),
-                "base": self.rev().saturating_sub(1),
+                "rev": ev.rev,
+                "base": ev.base,
                 "ops": [json!({ "op": "upsert", "surface": surface })],
             }),
             SceneOp::Remove(id) => json!({
                 "v": 1,
                 "type": "scene.patch",
-                "rev": self.rev(),
-                "base": self.rev().saturating_sub(1),
+                "rev": ev.rev,
+                "base": ev.base,
                 "ops": [json!({ "op": "remove", "id": id })],
             }),
             SceneOp::Patch(ops) => {
-                let base = self.rev().saturating_sub(1);
                 let json_ops: Vec<Value> = ops
                     .iter()
                     .map(|o| match o {
@@ -294,8 +330,8 @@ impl SceneStore {
                 json!({
                     "v": 1,
                     "type": "scene.patch",
-                    "rev": self.rev(),
-                    "base": base,
+                    "rev": ev.rev,
+                    "base": ev.base,
                     "ops": json_ops,
                 })
             }
@@ -454,26 +490,28 @@ mod tests {
         let s = store();
         let mut rx = s.subscribe();
         s.set("a", Some(&json!({ "kind": "text" }))).unwrap();
-        let op = rx.try_recv().unwrap();
-        match op {
+        let ev = rx.try_recv().unwrap();
+        match ev.op {
             SceneOp::Upsert(_) => {}
             _ => panic!("expected upsert"),
         }
-        let msg = s.protocol_message(&op);
+        // R4：事件携带锁内版本快照
+        assert_eq!((ev.rev, ev.base), (1, 0));
+        let msg = s.protocol_message(&ev);
         assert_eq!(msg["type"], "scene.patch");
         assert_eq!(msg["rev"], 1);
         assert_eq!(msg["base"], 0);
         assert_eq!(msg["ops"][0]["op"], "upsert");
         // remove → patch；clear → 全量快照
         s.set("a", None).unwrap();
-        let op = rx.try_recv().unwrap();
-        let msg = s.protocol_message(&op);
+        let ev = rx.try_recv().unwrap();
+        let msg = s.protocol_message(&ev);
         assert_eq!(msg["ops"][0]["op"], "remove");
         s.set("b", Some(&json!({ "kind": "x" }))).unwrap();
         let _ = rx.try_recv().unwrap();
         s.clear();
-        let op = rx.try_recv().unwrap();
-        let msg = s.protocol_message(&op);
+        let ev = rx.try_recv().unwrap();
+        let msg = s.protocol_message(&ev);
         assert_eq!(msg["type"], "scene");
         assert_eq!(msg["rev"], 4); // set a(1) + remove(2) + set b(3) + clear(4)
     }
@@ -500,7 +538,7 @@ mod tests {
         let mut rx = s.subscribe();
         s.set_many(&[("d".into(), Some(json!({ "kind": "x" })))])
             .unwrap();
-        match rx.try_recv().unwrap() {
+        match rx.try_recv().unwrap().op {
             SceneOp::Patch(ops) => assert_eq!(ops.len(), 1),
             _ => panic!("expected Patch"),
         }
@@ -541,8 +579,8 @@ mod tests {
             ("b".into(), Some(json!({ "kind": "metric", "order": 1 }))),
         ])
         .unwrap();
-        let op = rx.try_recv().unwrap();
-        let msg = s.protocol_message(&op);
+        let ev = rx.try_recv().unwrap();
+        let msg = s.protocol_message(&ev);
         assert_eq!(msg["type"], "scene.patch");
         assert_eq!(msg["rev"], 1);
         assert_eq!(msg["base"], 0);

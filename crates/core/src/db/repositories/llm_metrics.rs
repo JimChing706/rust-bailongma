@@ -160,7 +160,6 @@ pub fn upsert_calls_batch(db: &Db, rows: &[LlmCallAgg]) -> Result<()> {
                usage_raw     = CASE WHEN excluded.finish_reason = 'done' OR llm_calls.finish_reason != 'done'
                                     THEN excluded.usage_raw ELSE llm_calls.usage_raw END,
                finish_reason = CASE WHEN excluded.finish_reason = 'done' OR llm_calls.finish_reason != 'done'
-                                    OR excluded.finish_reason = 'round_limit'
                                     THEN excluded.finish_reason ELSE llm_calls.finish_reason END,
                error_stage   = CASE WHEN excluded.finish_reason = 'done' OR llm_calls.finish_reason != 'done'
                                     THEN excluded.error_stage ELSE llm_calls.error_stage END,
@@ -173,7 +172,8 @@ pub fn upsert_calls_batch(db: &Db, rows: &[LlmCallAgg]) -> Result<()> {
                retryable     = CASE WHEN excluded.finish_reason = 'done' OR llm_calls.finish_reason != 'done'
                                     THEN excluded.retryable ELSE llm_calls.retryable END,
                attempt       = MAX(llm_calls.attempt, excluded.attempt),
-               last_error    = excluded.last_error,
+               last_error    = CASE WHEN excluded.last_error IS NOT NULL AND excluded.last_error != ''
+                                    THEN excluded.last_error ELSE llm_calls.last_error END,
                fallback_used = CASE WHEN excluded.finish_reason = 'done' OR llm_calls.finish_reason != 'done'
                                     THEN excluded.fallback_used ELSE llm_calls.fallback_used END,
                context_bytes = COALESCE(excluded.context_bytes, llm_calls.context_bytes),
@@ -747,6 +747,43 @@ mod tests {
             .unwrap();
         assert_eq!(reason, "done", "错误不得覆盖成功");
         assert_eq!(attempt, 2, "attempt 仍取 MAX（审计不丢）");
+    }
+
+    #[test]
+    fn upsert_round_limit_does_not_downgrade_done() {
+        // L6（审计修复）：round_limit 是异常截断终态，不得把已落库的 done 降级
+        let db = test_db();
+        upsert_calls_batch(&db, &[agg("r3", "done", 1)]).unwrap();
+        upsert_calls_batch(&db, &[agg("r3", "round_limit", 2)]).unwrap();
+        let reason: String = db
+            .conn()
+            .query_row(
+                "SELECT finish_reason FROM llm_calls WHERE request_id = 'r3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reason, "done", "round_limit 不得覆盖成功终态");
+    }
+
+    #[test]
+    fn upsert_keeps_error_text_across_success_overwrite() {
+        // L6（审计修复）：错误链只增不清——done 行 last_error 为空不得清掉历史错误文本
+        let db = test_db();
+        let mut a1 = agg("r4", "error", 1);
+        a1.last_error = "boom: timeout".into();
+        upsert_calls_batch(&db, &[a1]).unwrap();
+        upsert_calls_batch(&db, &[agg("r4", "done", 2)]).unwrap();
+        let (reason, last_error): (String, String) = db
+            .conn()
+            .query_row(
+                "SELECT finish_reason, last_error FROM llm_calls WHERE request_id = 'r4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(reason, "done", "成功终态保持");
+        assert_eq!(last_error, "boom: timeout", "错误链保留（L6）");
     }
 
     #[test]

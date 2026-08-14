@@ -47,7 +47,7 @@ use bailongma_core::memory::injector::{ContextWindowConfig, InjectorContext};
 use bailongma_core::memory::messages::LlmRole;
 use bailongma_core::runtime::{init as runtime_init, run_user_turn, RuntimeState, TurnRequest};
 use bailongma_core::tools::{all_tool_schemas, NativeToolExecutor, SendMessageFn};
-use bailongma_core::wakeup::{coalesced_wakeup, CoalescedWakeup};
+use bailongma_core::wakeup::{due_wakeup, CoalescedWakeup};
 use crate::watchdog::{LoopSupervisor, WatchdogState};
 use serde_json::json;
 use tokio::sync::Mutex;
@@ -86,6 +86,12 @@ pub struct AppRuntime {
     pub llm_metrics_flusher: FlusherHandle,
     /// 波5：唤醒循环守护状态（心跳/重启计数；/status 探活数据源）。
     pub wakeup_watchdog: WatchdogState,
+    /// 审计 A2：唤醒交付中的提醒 id（防重复唤醒）。
+    /// 轮询查到到期提醒 → 置入本集合 → 交付（LLM 唤醒/广播）→ 成功后 mark_fired；
+    /// 交付失败仅清集合（提醒保持 pending，下轮重试）。非空时跳过本轮轮询，
+    /// 串行化保证同一批提醒不会并发唤醒。
+    /// 同步 std Mutex：临界区仅 id 列表增删查，且需在同步 helper 中使用。
+    pub wake_inflight: Arc<std::sync::Mutex<Vec<i64>>>,
 }
 
 /// 当前轮时间戳（本地时区 ISO，与 runtime 测试的消息格式一致）。
@@ -153,6 +159,7 @@ impl AppRuntime {
             llm_metrics,
             llm_metrics_flusher,
             wakeup_watchdog: WatchdogState::default(),
+            wake_inflight: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -279,10 +286,46 @@ impl AppRuntime {
         tool_cb: Option<OnToolCall>,
     ) -> TurnReply {
         // 0) Phase 1：turn_state 建行（received）；失败仅告警，不阻断主流程
+        // A4（审计修复）：消息级幂等——客户端/网桥可通过 meta.idempotency_key 声明
+        // 消息唯一标识；入口校验：同 key 已存在且终态 → 直接返回已处理结果，
+        // 不重复执行（重复发消息/重复扣费）。缺省 key 时保持现状（会话级占位）。
+        let idem_key: String = msg
+            .meta
+            .get("idempotency_key")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        if !idem_key.is_empty() {
+            if let Ok(Some(existing)) = turn_state::find_by_idempotency_key(&self.db, &idem_key) {
+                if matches!(
+                    existing.state.as_str(),
+                    "completed" | "failed" | "cancelled"
+                ) {
+                    tracing::info!(
+                        key = %idem_key,
+                        state = %existing.state,
+                        "[A4] 幂等命中：消息已处理，跳过重复执行"
+                    );
+                    return TurnReply {
+                        conversation_id,
+                        ok: true,
+                        content: format!("（幂等命中：消息 {idem_key} 已处理，跳过重复执行）"),
+                        total_calls: 0,
+                        aborted: false,
+                        tool_name: None,
+                    };
+                }
+            }
+        }
+        let turn_key = if idem_key.is_empty() {
+            format!("conv-{conversation_id}")
+        } else {
+            idem_key
+        };
         let turn_id = match turn_state::create_turn(
             &self.db,
             &now_input_ts(),
-            &format!("conv-{conversation_id}"),
+            &turn_key,
             &msg.channel,
             &msg.from_id,
             &msg.content,
@@ -523,6 +566,23 @@ impl AppRuntime {
         }
     }
 
+    /// 审计 A2：唤醒交付成功 → 消费提醒（mark_fired）+ 清 in-flight。
+    /// 广播/LLM 内容已送达即视为交付成功（原文兜底也算送达，提醒不丢）。
+    fn wakeup_delivered(&self, wake: &CoalescedWakeup) {
+        if let Err(e) =
+            bailongma_core::db::repositories::reminders::mark_fired(&self.db, &wake.reminder_ids, &now_input_ts())
+        {
+            // mark_fired 失败：提醒仍是 pending，下轮会重复唤醒（可接受，不丢消息）
+            tracing::warn!("[wakeup] mark_fired 失败（下轮可能重复唤醒）: {e}");
+        }
+        self.wake_inflight.lock().unwrap().clear();
+    }
+
+    /// 审计 A2：交付失败 → 仅清 in-flight，提醒保持 pending（下轮自动重试）。
+    fn wakeup_dropped(&self) {
+        self.wake_inflight.lock().unwrap().clear();
+    }
+
     /// 唤醒轮输入行（`[system] ts [tick] 内容`，对齐 parse_message_input 约定）。
     pub fn wakeup_input_line(ts: &str, message: &str) -> String {
         format!("[system] {ts} [tick] {message}")
@@ -552,6 +612,7 @@ impl AppRuntime {
                         "timestamp": now_input_ts(),
                     }),
                 );
+                self.wakeup_delivered(&wake); // 审计 A2：原文已送达 → 消费提醒
                 return;
             }
         };
@@ -584,6 +645,8 @@ impl AppRuntime {
                 Ok(t) => t,
                 Err(e) => {
                     tracing::error!("[wakeup] run_user_turn 失败: {e}");
+                    // 审计 A2：交付失败 → 不消费提醒（保持 pending 下轮重试）
+                    self.wakeup_dropped();
                     return;
                 }
             }
@@ -666,6 +729,7 @@ impl AppRuntime {
                         }),
                     );
                     session.finish(turn.outcome.event, true, r.total_calls as u32);
+                    self.wakeup_delivered(&wake); // 审计 A2：原文兜底已送达 → 消费
                     return;
                 }
                 self.bus.emit(
@@ -680,6 +744,7 @@ impl AppRuntime {
                 );
                 tracing::info!("[wakeup] 唤醒完成 tools={}", r.total_calls);
                 session.finish(turn.outcome.event, true, r.total_calls as u32);
+                self.wakeup_delivered(&wake); // 审计 A2：LLM 内容已送达 → 消费
             }
             Err(e) => {
                 tracing::error!("[wakeup] call_llm 失败: {e}");
@@ -693,6 +758,7 @@ impl AppRuntime {
                     }),
                 );
                 session.finish(turn.outcome.event, true, 0);
+                self.wakeup_delivered(&wake); // 审计 A2：原文兜底已送达 → 消费
             }
         }
     }
@@ -754,12 +820,23 @@ impl AppRuntime {
                         interval.tick().await;
                         wstate.beat();
                         let now = now_input_ts();
-                        match coalesced_wakeup(&runtime.db, &now, days, budget) {
+                        // 审计 A2：上一批提醒仍在交付中 → 跳过本轮（串行化防重复唤醒）。
+                        // due_wakeup 只查询不消费，交付成功后才 mark_fired。
+                        if !runtime.wake_inflight.lock().unwrap().is_empty() {
+                            tracing::debug!("[wakeup] 上一批提醒仍在交付中，跳过本轮");
+                            continue;
+                        }
+                        match due_wakeup(&runtime.db, &now, days, budget) {
                             Ok(Some(wake)) => {
                                 tracing::info!(
                                     "[wakeup] {} 条到期提醒合并为 1 次唤醒",
                                     wake.trigger_count
                                 );
+                                runtime
+                                    .wake_inflight
+                                    .lock()
+                                    .unwrap()
+                                    .extend(wake.reminder_ids.iter().copied());
                                 runtime.run_wakeup_turn(wake).await;
                             }
                             Ok(None) => {}

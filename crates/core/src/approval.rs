@@ -12,13 +12,14 @@
 //!   Allow 直接放行、RequireApproval 才挂起、未知工具 fail-closed 拒绝。
 //! - **场景广播解耦**：`on_request` 回调由 API 层注入（server.rs 桥接 SceneStore），
 //!   本模块不依赖 scene。
-//! - **全局单例**：进程级 `global()`（OnceLock），执行器与 HTTP 处理器共享；
+//! - **全局单例**：进程级 `global()`（可变槽：未初始化时 fail-closed 隔离门 +
+//!   告警，init_global 总是覆盖替换，生产顺序无关），执行器与 HTTP 处理器共享；
 //!   实例 API 保留给单元测试独立构造。
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::capability::CallerTrust;
@@ -271,20 +272,38 @@ impl ApprovalGate {
 
 // ── 进程级全局单例（执行器与 HTTP 处理器共享） ──
 
-static GLOBAL: OnceLock<Arc<ApprovalGate>> = OnceLock::new();
+/// S2（审计修复）：全局门改为**可变槽**（Mutex<Option<..>>）。
+/// 旧实现 OnceLock：若 `global()` 先被调用（如 server.rs:73 set_global_on_request
+/// 早于 assemble 的 init_global），会以 temp_dir 悄悄创建兜底门并**永久占位**，
+/// 之后的 init_global(tool_root) 失效 → 生产审批文件边界错误且无任何告警。
+/// 现实现：init_global 总是覆盖替换（生产顺序无关）；未初始化时 global() 返回
+/// fail-closed 隔离门（无 on_request 回调 → 挂起至 120s 超时拒绝）+ 显式 error 日志。
+static GLOBAL: std::sync::Mutex<Option<Arc<ApprovalGate>>> = std::sync::Mutex::new(None);
 
-/// 初始化全局门（幂等；workspace_root 用于内部 PolicyEngine 的文件边界）。
+/// 初始化全局门（幂等语义保留：可重复调用，覆盖替换为最新 workspace_root）。
+/// workspace_root 用于内部 PolicyEngine 的文件边界。
 pub fn init_global(workspace_root: PathBuf) -> Arc<ApprovalGate> {
-    GLOBAL
-        .get_or_init(|| Arc::new(ApprovalGate::new(workspace_root)))
-        .clone()
+    let gate = Arc::new(ApprovalGate::new(workspace_root));
+    let mut slot = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    *slot = Some(gate.clone());
+    gate
 }
 
-/// 取全局门（未初始化时用临时目录兜底，防御性；生产路径应先 `init_global`）。
+/// 取全局门。未初始化时（配置缺失）创建 **fail-closed 隔离门**并显式告警：
+/// 不静默兜底 temp_dir 造成「提交与执行分裂 / 文件边界错误」，而是让所有审批
+/// 挂起至 120s 超时拒绝（安全默认）；随后 init_global 会覆盖替换为真实门。
 pub fn global() -> Arc<ApprovalGate> {
-    GLOBAL
-        .get_or_init(|| Arc::new(ApprovalGate::new(std::env::temp_dir())))
-        .clone()
+    let mut slot = GLOBAL.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(g) = slot.as_ref() {
+        return g.clone();
+    }
+    tracing::error!(
+        "[S2] approval::global() 在 init_global() 之前被调用（初始化缺失）——\
+         已创建 fail-closed 隔离门，审批挂起至 120s 超时拒绝；init_global 将替换之"
+    );
+    let g = Arc::new(ApprovalGate::new(std::env::temp_dir()));
+    *slot = Some(g.clone());
+    g
 }
 
 /// 给全局门注入场景回调。

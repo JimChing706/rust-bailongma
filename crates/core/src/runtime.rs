@@ -1258,8 +1258,8 @@ mod tests {
         );
         assert_eq!(
             tick.llm_messages[1].role,
-            LlmRole::System,
-            "TICK 轮 [runtime context] 用 System role"
+            LlmRole::User,
+            "M3（审计修复）：TICK 轮 [runtime context] 保持 User role——历史浓缩混入 System 会放大提示注入影响力"
         );
         assert!(
             !tick

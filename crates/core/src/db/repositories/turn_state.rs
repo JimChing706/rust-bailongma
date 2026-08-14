@@ -132,6 +132,26 @@ pub fn get_turn(db: &Db, turn_id: i64) -> Result<Option<TurnStateRow>> {
     }
 }
 
+/// 按幂等键取一行（无则 None）。A4（审计修复）：消息级幂等入口校验用——
+/// 客户端/网桥携带的 idempotency_key 命中终态行时，入口直接返回已处理结果，
+/// 避免重复消息重复执行（重复发消息/重复扣费）。
+pub fn find_by_idempotency_key(db: &Db, key: &str) -> Result<Option<TurnStateRow>> {
+    if key.is_empty() {
+        return Ok(None);
+    }
+    let conn = db.conn();
+    let mut stmt = conn.prepare(
+        "SELECT turn_id, state, round, attempt, idempotency_key, conversation_id, channel,
+                from_id, input_snapshot, trace_id, last_error, recover_policy, started_at, finished_at
+         FROM turn_state WHERE idempotency_key = ?1 LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map([key], row_from)?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
 /// 扫描未终态 turn（state NOT IN 终态集合），按 started_at 升序。
 /// 启动恢复用：对返回的每一行按 recover_policy 决策（`crate::turn::decide_recovery`）。
 pub fn scan_unfinished(db: &Db) -> Result<Vec<TurnStateRow>> {
@@ -240,5 +260,20 @@ mod tests {
         assert_eq!(bump_attempt(&db, id).unwrap(), 3);
         let t = get_turn(&db, id).unwrap().unwrap();
         assert_eq!(t.attempt, 3);
+    }
+
+    #[test]
+    fn find_by_idempotency_key_roundtrip() {
+        // A4（审计修复）：入口幂等校验的数据层支撑
+        let db = test_db();
+        let id = create_turn(&db, "2026-08-10T18:00:00+08:00", "k-e", "TUI", "ID:000001", "e", None, "retry").unwrap();
+        mark_finished(&db, id, "completed", "2026-08-10T18:01:00+08:00").unwrap();
+
+        let hit = find_by_idempotency_key(&db, "k-e").unwrap().unwrap();
+        assert_eq!(hit.turn_id, id);
+        assert_eq!(hit.state, "completed");
+
+        assert!(find_by_idempotency_key(&db, "k-absent").unwrap().is_none());
+        assert!(find_by_idempotency_key(&db, "").unwrap().is_none());
     }
 }

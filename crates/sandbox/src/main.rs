@@ -132,8 +132,8 @@ impl Sandbox {
         };
 
         let start = Instant::now();
-        let mut child = Command::new(program)
-            .args(&args)
+        let mut cmd = Command::new(program);
+        cmd.args(&args)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -145,41 +145,67 @@ impl Sandbox {
             .env("TMP", std::env::temp_dir().display().to_string())
             .env_remove("BAILONGMA_API_TOKEN")
             .env_remove("OPENAI_API_KEY")
-            .env_remove("DEEPSEEK_API_KEY")
+            .env_remove("DEEPSEEK_API_KEY");
+        // B2（审计修复）：Unix 下把子进程放入独立进程组——超时才能 kill 整组
+        // （含孙进程）。否则孙进程继承管道句柄 → 管道不关 → join 永久挂死。
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd
             .spawn()
             .map_err(|e| format!("命令启动失败: {e}"))?;
 
         // 立即用读线程排空 stdout/stderr：进程运行期间不读管道的话，
         // 输出超过 pipe 缓冲时子进程写阻塞，与父进程互相等待 → 超时死锁。
-        let out_handle = {
+        // B2 修复：读线程结果经 mpsc 回传，主循环轮询时 try_recv；
+        // 收尾用有界 recv_timeout——孙进程拖住管道时不再无限 join 等待。
+        let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (err_tx, err_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        {
             let mut o = child.stdout.take().expect("stdout 管道缺失");
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
                 let _ = o.read_to_end(&mut buf);
-                buf
-            })
-        };
-        let err_handle = {
+                let _ = out_tx.send(buf); // rx 已丢（超时放弃）时 send 失败可忽略
+            });
+        }
+        {
             let mut e = child.stderr.take().expect("stderr 管道缺失");
             std::thread::spawn(move || {
                 let mut buf = Vec::new();
                 let _ = e.read_to_end(&mut buf);
-                buf
-            })
-        };
+                let _ = err_tx.send(buf);
+            });
+        }
 
         let deadline = start + Duration::from_millis(timeout_ms);
         let mut timed_out = false;
+        let mut stdout: Vec<u8> = Vec::new();
+        let mut stderr: Vec<u8> = Vec::new();
+        let mut out_done = false;
+        let mut err_done = false;
         loop {
             match child.try_wait() {
                 Ok(Some(_status)) => break,
                 Ok(None) => {
                     if Instant::now() >= deadline {
                         timed_out = true;
-                        // 强杀：Windows 用 taskkill /T 杀进程树，Unix 直接 kill
-                        if cfg!(windows) {
+                        // 强杀整个进程组/树：Windows taskkill /T，Unix kill -9 -<pid>
+                        #[cfg(windows)]
+                        {
                             let _ = Command::new("taskkill")
                                 .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status();
+                        }
+                        #[cfg(unix)]
+                        {
+                            // 负 PID = 进程组（spawn 时 process_group(0) 建立）
+                            let _ = Command::new("kill")
+                                .args(["-9", &format!("-{}", child.id())])
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
                                 .status();
@@ -192,10 +218,42 @@ impl Sandbox {
                 }
                 Err(e) => return Err(format!("命令执行失败: {e}")),
             }
+            // 轮询读线程结果（不阻塞；退出循环后统一有界收尾）
+            if !out_done {
+                match out_rx.try_recv() {
+                    Ok(b) => {
+                        stdout = b;
+                        out_done = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => out_done = true,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
+            if !err_done {
+                match err_rx.try_recv() {
+                    Ok(b) => {
+                        stderr = b;
+                        err_done = true;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => err_done = true,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+            }
         }
 
-        let stdout = out_handle.join().unwrap_or_default();
-        let stderr = err_handle.join().unwrap_or_default();
+        // 有界收尾：进程树已杀，正常情况下管道 1.5s 内关闭、读线程回传；
+        // 孙进程脱离进程树仍存活时放弃等待（读线程 detached 随进程消亡）。
+        let recv_grace = Duration::from_millis(1500);
+        if !out_done {
+            if let Ok(b) = out_rx.recv_timeout(recv_grace) {
+                stdout = b;
+            }
+        }
+        if !err_done {
+            if let Ok(b) = err_rx.recv_timeout(recv_grace) {
+                stderr = b;
+            }
+        }
 
         let stdout_str = String::from_utf8_lossy(&stdout);
         let stderr_str = String::from_utf8_lossy(&stderr);
@@ -463,6 +521,13 @@ fn command_allowed(command: &str, allow_commands: &[String]) -> bool {
         && !command.contains('`')
         && !command.contains('$')
         && !command.contains('%')
+        // B5（审计修复）：补齐 Windows cmd 转义/子命令元字符——
+        // '^' 是 cmd 转义符（可构造 && 等分隔符），'!' 是延迟变量扩展，
+        // '(' ')' 是 cmd 块/子命令作用域（可包裹任意命令）。
+        && !command.contains('^')
+        && !command.contains('!')
+        && !command.contains('(')
+        && !command.contains(')')
         && !command.contains('\n')
         && !command.contains('\r');
     if !clean {

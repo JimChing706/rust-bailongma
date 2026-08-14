@@ -81,10 +81,14 @@ pub fn wakeup_budget_gate(db: &Db, days: i64, budget_tokens: i64) -> Result<Gate
     }
 }
 
-/// 唤醒闭环入口：查到期提醒 → 合并 → 预算闸门 → 标记 fired。
+/// 唤醒闭环查询（审计 A2 修复）：查到期 → 合并 → 预算闸门，**不消费提醒**。
+///
+/// 原实现（`coalesced_wakeup`）先 `mark_fired` 再返回，交付方广播/LLM 失败时
+/// 提醒已置 fired 永久丢失。现拆出查询态：交付方在**成功广播后**再 `mark_fired`，
+/// 失败时提醒保持 pending，下轮轮询自动重试（最多重复唤醒一次，可接受）。
 /// 闸门拦截时：不唤醒、不消费提醒（保持 pending，等待预算恢复或人工放行）。
 /// 无到期提醒时返回 `Ok(None)`。
-pub fn coalesced_wakeup(
+pub fn due_wakeup(
     db: &Db,
     now: &str,
     days: i64,
@@ -97,12 +101,24 @@ pub fn coalesced_wakeup(
     let decision = wakeup_budget_gate(db, days, budget_tokens)?;
     match decision {
         GateDecision::Blocked { .. } => Ok(None),
-        GateDecision::Allow { .. } => {
-            let wake = coalesce(&due);
-            mark_fired(db, &wake.reminder_ids, now)?;
-            Ok(Some(wake))
-        }
+        GateDecision::Allow { .. } => Ok(Some(coalesce(&due))),
     }
+}
+
+/// 唤醒闭环入口（查询 + 闸门 + **立即 mark_fired** 消费）。
+/// ⚠️ 消费前置的语义缺陷见 [`due_wakeup`]（审计 A2）——生产唤醒循环
+/// 已改用 `due_wakeup` 后置标记；本函数保留供测试/兼容旧调用。
+pub fn coalesced_wakeup(
+    db: &Db,
+    now: &str,
+    days: i64,
+    budget_tokens: i64,
+) -> Result<Option<CoalescedWakeup>> {
+    let wake = due_wakeup(db, now, days, budget_tokens)?;
+    if let Some(w) = &wake {
+        mark_fired(db, &w.reminder_ids, now)?;
+    }
+    Ok(wake)
 }
 
 #[cfg(test)]
@@ -261,5 +277,43 @@ mod tests {
         insert_reminder(&db, "2026-08-11T08:00:00+08:00", "未来提醒");
         let out = coalesced_wakeup(&db, "2026-08-10T08:00:00+08:00", 7, 100_000).unwrap();
         assert!(out.is_none(), "未到期不应唤醒");
+    }
+
+    #[test]
+    fn due_wakeup_does_not_consume_reminders() {
+        // 审计 A2：查询态不消费——交付失败后提醒保持 pending，下轮可重试，
+        // 不再出现「先 mark_fired 后广播，广播失败即永久丢失」。
+        let db = test_db();
+        let id = insert_reminder(&db, "2026-08-10T08:00:00+08:00", "到期提醒");
+        let now = "2026-08-10T08:30:00+08:00";
+
+        let w = due_wakeup(&db, now, 7, 100_000).unwrap().expect("有到期提醒");
+        assert_eq!(w.trigger_count, 1);
+        assert_eq!(w.reminder_ids, vec![id]);
+
+        // 未消费：due_reminders 仍返回该提醒（可再次唤醒）
+        let due = due_reminders(&db, now).unwrap();
+        assert_eq!(due.len(), 1, "查询不消费，提醒仍是 pending");
+
+        // 交付成功后再消费 → 不再返回
+        mark_fired(&db, &w.reminder_ids, now).unwrap();
+        assert!(due_wakeup(&db, now, 7, 100_000).unwrap().is_none(), "消费后不再唤醒");
+    }
+
+    #[test]
+    fn due_wakeup_respects_budget_gate() {
+        // 审计 A2：闸门拦截时查询同样不消费（与 coalesced_wakeup 语义一致）
+        let db = test_db();
+        let id = insert_reminder(&db, "2026-08-10T08:00:00+08:00", "被闸门拦截");
+        insert_wakeup_call(&db, "w1", "2026-08-09T09:00:00+08:00", 200_000);
+
+        let out = due_wakeup(&db, "2026-08-10T08:00:00+08:00", 7, 100_000).unwrap();
+        assert!(out.is_none(), "超预算不应返回唤醒");
+
+        let conn = db.conn();
+        let status: String = conn
+            .query_row("SELECT status FROM reminders WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(status, "pending");
     }
 }

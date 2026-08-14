@@ -345,6 +345,13 @@ pub fn verify(db: &Db, id: i64, actor: &str) -> Result<()> {
     let row = crate::db::repositories::matters::get(db, id)?
         .ok_or_else(|| crate::error::CoreError::NotFound(format!("事项不存在: {id}")))?;
 
+    // R3（审计修复）：可加性收口校验**前置**到状态转移之前执行。旧实现在
+    // completed 已提交之后才跑 check_additivity_on_complete——校验/记信号失败
+    // （record_signal 的 DB 错误）会让 verify 返回 Err 却留下已完成的账。
+    // 前置后：校验失败 → verify 中止，状态保持 awaiting_verification，账不被污染；
+    // 信号先于 completed 记录，语义等价（信号本就在完成时点评估）。
+    check_additivity_on_complete(db, id)?;
+
     match &row.verifier_id {
         // 命题4/7：未登记独立验证者 → verifier 缺省=执行者，执行者自证完成（可信等级降级）
         None => {
@@ -388,7 +395,6 @@ pub fn verify(db: &Db, id: i64, actor: &str) -> Result<()> {
             })?;
         }
     }
-    check_additivity_on_complete(db, id)?;
     Ok(())
 }
 

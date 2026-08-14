@@ -123,12 +123,23 @@ where
 
     loop {
         let description = format!("自动迭代第 {} 轮变更（tag={tag}）", rounds + 1);
-        // 人工介入硬通道：拒绝即中止，无变更落库
-        if !approval_gate(&description)? {
-            snapshot.cleanup().ok();
-            return Err(CoreError::State(
-                "变更未获人工批准，本轮自动迭代中止（快照已清理）".to_string(),
-            ));
+        // 人工介入硬通道：拒绝即中止，无变更落库。
+        // R2（审计修复）：approval_gate 返回 Err（门异常）同样先清理快照再返回——
+        // 旧实现 `?` 提前返回跳过 cleanup，快照文件泄漏在磁盘上。
+        match approval_gate(&description) {
+            Ok(true) => {}
+            Ok(false) => {
+                snapshot.cleanup().ok();
+                return Err(CoreError::State(
+                    "变更未获人工批准，本轮自动迭代中止（快照已清理）".to_string(),
+                ));
+            }
+            Err(e) => {
+                snapshot.cleanup().ok();
+                return Err(CoreError::State(format!(
+                    "人工批准门异常，自动迭代中止（快照已清理）：{e}"
+                )));
+            }
         }
 
         match apply_change() {

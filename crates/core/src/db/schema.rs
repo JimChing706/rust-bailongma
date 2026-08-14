@@ -8,7 +8,7 @@
 //! - LLM 指标三表（M1 观测层）为 Rust 新增（Node 版无对应表），全部走
 //!   `CREATE TABLE IF NOT EXISTS` + 唯一索引，老库零数据改动。
 
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use tracing::info;
 
 use crate::error::Result;
@@ -77,6 +77,69 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Res
 /// 幂等建索引。
 fn ensure_index(conn: &Connection, sql: &str) -> Result<()> {
     conn.execute_batch(sql)?;
+    Ok(())
+}
+
+/// D2（审计修复）：建唯一索引前先处理老库重复数据。
+///
+/// 旧实现直接 `CREATE UNIQUE INDEX IF NOT EXISTS`：老库若已存在重复键（历史脏数据，
+/// 如同 mem_id 多行 / 同 source / 同 url），建索引直接失败 → **启动中断**。
+/// 策略（幂等）：索引尚不存在时——
+/// 1. 按键分组找出重复键（`HAVING COUNT(*)>1`）；
+/// 2. 逐键保留最小 id 行、删除其余重复行；
+/// 3. 再建唯一索引。
+/// `extra_where` 用于部分唯一索引（如 `WHERE mem_id IS NOT NULL`，原样拼 SQL，
+/// 仅内部常量，无注入面）。
+fn ensure_unique_index_dedup(
+    conn: &Connection,
+    name: &str,
+    table: &str,
+    column: &str,
+    extra_where: &str,
+) -> Result<()> {
+    // 已存在（含老库降级为普通索引的情况）→ 跳过，不重复迁移
+    let exists: i64 = conn
+        .prepare("SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1")?
+        .query_row([name], |r| r.get(0))?;
+    if exists > 0 {
+        return Ok(());
+    }
+    // 1) 查重（extra_where 为完整条件子句，如 `WHERE mem_id IS NOT NULL`；空串则全列）
+    let dup_sql = format!(
+        "SELECT {column} FROM {table} {extra} GROUP BY {column} HAVING COUNT(*) > 1",
+        extra = extra_where,
+    );
+    let mut dup_keys: Vec<String> = Vec::new();
+    {
+        let mut stmt = conn.prepare(&dup_sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let Some(v) = row.get::<_, Option<String>>(0)? {
+                dup_keys.push(v);
+            }
+        }
+    }
+    if !dup_keys.is_empty() {
+        tracing::warn!(
+            "[db schema] {} 发现 {} 个重复键（保留最小 id，删除其余 {} 行前迁移）",
+            name,
+            dup_keys.len(),
+            table
+        );
+        // 2) 去重：保留每个键最小 id 的行
+        let del_sql = format!(
+            "DELETE FROM {table} WHERE {column} = ?1 AND id NOT IN \
+             (SELECT MIN(id) FROM {table} WHERE {column} = ?1)"
+        );
+        for key in &dup_keys {
+            conn.execute(&del_sql, params![key])?;
+        }
+    }
+    // 3) 建唯一索引
+    conn.execute_batch(&format!(
+        "CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {table}({column}) {extra}",
+        extra = extra_where,
+    ))?;
     Ok(())
 }
 
@@ -244,10 +307,11 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_memories_timestamp  ON memories(timestamp);
         CREATE INDEX IF NOT EXISTS idx_memories_event_type ON memories(event_type);
         CREATE INDEX IF NOT EXISTS idx_memories_parent_id  ON memories(parent_id);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_mem_id ON memories(mem_id) WHERE mem_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS idx_memories_visibility ON memories(visibility);
         "#,
     )?;
+    // D2（审计修复）：mem_id 唯一索引先去重老库重复行，防启动中断
+    ensure_unique_index_dedup(conn, "idx_memories_mem_id", "memories", "mem_id", "WHERE mem_id IS NOT NULL")?;
 
     // ── memories_fts：FTS5 trigram 外部内容表 + 3 触发器 ──
     conn.execute_batch(
@@ -554,10 +618,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_reminders_due_at ON reminders(status, due_at);
         CREATE INDEX IF NOT EXISTS idx_prefetch_tasks_enabled ON prefetch_tasks(enabled);
         CREATE INDEX IF NOT EXISTS idx_prefetch_expires ON prefetch_cache(expires_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_prefetch_source ON prefetch_cache(source);
         CREATE INDEX IF NOT EXISTS idx_ui_signals_unconsumed ON ui_signals(consumed, ts);
         CREATE INDEX IF NOT EXISTS idx_media_history_played_at ON media_history(played_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_media_history_url ON media_history(url);
         CREATE INDEX IF NOT EXISTS idx_music_title  ON music_library(title);
         CREATE INDEX IF NOT EXISTS idx_music_artist ON music_library(artist);
         CREATE INDEX IF NOT EXISTS idx_music_added  ON music_library(added_at);
@@ -569,6 +631,9 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_extract_audit_from_id    ON extract_audit(from_id);
         "#,
     )?;
+    // D2（审计修复）：prefetch_cache.source / media_history.url 唯一索引先做去重迁移
+    ensure_unique_index_dedup(conn, "idx_prefetch_source", "prefetch_cache", "source", "")?;
+    ensure_unique_index_dedup(conn, "idx_media_history_url", "media_history", "url", "")?;
 
     // ── LLM 指标表（P0 观测层，M1；幂等建表，老库零改动） ──
     // 评审修订：llm_calls 终态语义 = UPSERT（成功覆盖错误、attempt 取 MAX，见 §5.2 #1）；
@@ -754,7 +819,19 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     migrate_canonical_user(conn)?;
 
     // ── 重建 FTS 索引（覆盖已有历史数据；对老库是幂等全量重建） ──
-    conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")?;
+    // D3（审计修复）：不再每次启动无条件全量 rebuild——大库启动慢（分钟级）且磨损磁盘。
+    // 用 config flag 标记重建版本：仅在首次（新库/老库首次升级）重建一次，
+    // 之后由 memories_ai/ad/au 三触发器增量维护。
+    let fts_done: i64 = conn
+        .prepare("SELECT COUNT(*) FROM config WHERE key = 'migration_fts_rebuild_v1'")?
+        .query_row([], |r| r.get(0))?;
+    if fts_done == 0 {
+        conn.execute_batch("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")?;
+        conn.execute_batch(
+            "INSERT INTO config(key, value) VALUES('migration_fts_rebuild_v1', '1') \
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+        )?;
+    }
 
     info!("[db schema] 迁移完成 ({} 张业务表)", BUSINESS_TABLES.len());
     Ok(())
@@ -1007,5 +1084,98 @@ mod tests {
         let _ = conn
             .prepare("SELECT COUNT(*) FROM memories_fts WHERE memories_fts MATCH ?1")
             .map(|mut s| s.query_row(["喜欢喝咖啡"], |r| r.get::<_, i64>(0)));
+    }
+
+    #[test]
+    fn legacy_db_with_duplicate_mem_id_gets_deduped_unique_index() {
+        // D2（审计修复）：老库重复 mem_id 不再导致启动中断——去重迁移 + 建唯一索引
+        let conn = Connection::open_in_memory().unwrap();
+        // 模拟老库：memories 表已存在且含重复 mem_id（历史脏数据）
+        conn.execute_batch(
+            r#"
+            CREATE TABLE memories (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              event_type TEXT NOT NULL,
+              content TEXT NOT NULL,
+              detail TEXT NOT NULL DEFAULT '',
+              title TEXT DEFAULT '',
+              mem_id TEXT,
+              entities TEXT DEFAULT '[]',
+              concepts TEXT DEFAULT '[]',
+              tags TEXT DEFAULT '[]',
+              links TEXT DEFAULT '[]',
+              salience INTEGER DEFAULT 3,
+              source_ref TEXT,
+              timestamp TEXT NOT NULL,
+              parent_id INTEGER,
+              embedding BLOB,
+              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              visibility INTEGER NOT NULL DEFAULT 1,
+              hidden_at TEXT,
+              merged_into TEXT
+            );
+            INSERT INTO memories(event_type, content, detail, mem_id, timestamp) VALUES
+              ('obs', 'a', 'a', 'dup-1', '2026-01-01T00:00:00Z'),
+              ('obs', 'b', 'b', 'dup-1', '2026-01-01T00:00:01Z'),
+              ('obs', 'c', 'c', 'dup-1', '2026-01-01T00:00:02Z'),
+              ('obs', 'd', 'd', 'uniq-1', '2026-01-01T00:00:03Z');
+            "#,
+        )
+        .unwrap();
+        // 老库初始化不得中断
+        initialize(&conn).unwrap();
+        // 唯一索引已建
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_memories_mem_id'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "去重迁移后唯一索引必须建成");
+        // 重复键保留最小 id 行，其余删除
+        let (n, min_id): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(id) FROM memories WHERE mem_id = 'dup-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "重复键必须只剩一行");
+        assert_eq!(min_id, 1, "保留最小 id 行");
+        // 唯一键其余数据不受影响
+        let uniq: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE mem_id = 'uniq-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(uniq, 1);
+    }
+
+    #[test]
+    fn fts_rebuild_runs_once_and_flags() {
+        // D3（审计修复）：FTS 全量重建只跑一次（config flag 守卫），后续启动零重建
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        let flag: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config WHERE key = 'migration_fts_rebuild_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, 1, "首次初始化后 flag 必须落库");
+        // 二次初始化：flag 命中跳过 rebuild，初始化仍成功（幂等）
+        initialize(&conn).unwrap();
+        let flag2: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config WHERE key = 'migration_fts_rebuild_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag2, 1, "flag 保持为 1（不重复重建）");
     }
 }

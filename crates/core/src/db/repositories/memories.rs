@@ -21,77 +21,83 @@ pub struct InsertMemoryOutcome {
 /// 插入一条记忆（对齐 `insertMemory`）。
 /// mem_id 去重：同 mem_id 已存在时直接更新 content/detail/title/entities/tags/links/timestamp，
 /// 不新增行（对齐 Node db.js:442-461）。`detail` 缺省时与 `content` 相同；`timestamp` 缺省取当前 UTC ISO。
+///
+/// 审计 D4 修复：check-then-act（SELECT mem_id → UPDATE/INSERT）整体包进事务。
+/// 此前 SELECT 与写入是两次独立 `conn()`（中间释放 Mutex），并发下两线程可同时
+/// 通过 SELECT（都不见已存在行）→ 产生重复/悬空记忆；事务内 conn guard 全程持有，
+/// `Db` 的单连接 Mutex 串行化保证检查与写入原子。
 pub fn insert_memory(db: &Db, m: &NewMemory) -> Result<InsertMemoryOutcome> {
-    let conn = db.conn();
     let entities_json = serde_json::to_string(&m.entities).unwrap_or_else(|_| "[]".into());
     let concepts_json = serde_json::to_string(&m.concepts).unwrap_or_else(|_| "[]".into());
     let tags_json = serde_json::to_string(&m.tags).unwrap_or_else(|_| "[]".into());
     let links_json = serde_json::to_string(&m.links).unwrap_or_else(|_| "[]".into());
 
-    // mem_id 去重：已存在 → 更新（对齐 Node：只更新内容类字段，不动 event_type/salience/embedding）
-    if let Some(mem_id) = m.mem_id.as_deref() {
-        if !mem_id.trim().is_empty() {
-            let existing: Option<i64> = conn
-                .query_row(
-                    "SELECT id FROM memories WHERE mem_id = ?1 LIMIT 1",
-                    params![mem_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(id) = existing {
-                conn.execute(
-                    r#"
-                    UPDATE memories SET
-                      content = ?1, detail = ?2, title = ?3,
-                      entities = ?4, tags = ?5, links = ?6, timestamp = ?7
-                    WHERE id = ?8
-                    "#,
-                    params![
-                        m.content,
-                        m.detail,
-                        m.title,
-                        entities_json,
-                        tags_json,
-                        links_json,
-                        m.timestamp,
-                        id
-                    ],
-                )?;
-                return Ok(InsertMemoryOutcome { id, updated: true });
+    db.transaction(|tx| {
+        // mem_id 去重：已存在 → 更新（对齐 Node：只更新内容类字段，不动 event_type/salience/embedding）
+        if let Some(mem_id) = m.mem_id.as_deref() {
+            if !mem_id.trim().is_empty() {
+                let existing: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM memories WHERE mem_id = ?1 LIMIT 1",
+                        params![mem_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                if let Some(id) = existing {
+                    tx.execute(
+                        r#"
+                        UPDATE memories SET
+                          content = ?1, detail = ?2, title = ?3,
+                          entities = ?4, tags = ?5, links = ?6, timestamp = ?7
+                        WHERE id = ?8
+                        "#,
+                        params![
+                            m.content,
+                            m.detail,
+                            m.title,
+                            entities_json,
+                            tags_json,
+                            links_json,
+                            m.timestamp,
+                            id
+                        ],
+                    )?;
+                    return Ok(InsertMemoryOutcome { id, updated: true });
+                }
             }
         }
-    }
 
-    conn.execute(
-        r#"
-        INSERT INTO memories
-          (event_type, content, detail, title, mem_id, entities, concepts, tags,
-           links, salience, source_ref, timestamp, parent_id, embedding,
-           embedding_dim, embedding_model)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
-        "#,
-        params![
-            m.event_type,
-            m.content,
-            m.detail,
-            m.title,
-            m.mem_id,
-            entities_json,
-            concepts_json,
-            tags_json,
-            links_json,
-            m.salience,
-            m.source_ref,
-            m.timestamp,
-            m.parent_id,
-            m.embedding,
-            m.embedding_dim,
-            m.embedding_model,
-        ],
-    )?;
-    Ok(InsertMemoryOutcome {
-        id: conn.last_insert_rowid(),
-        updated: false,
+        tx.execute(
+            r#"
+            INSERT INTO memories
+              (event_type, content, detail, title, mem_id, entities, concepts, tags,
+               links, salience, source_ref, timestamp, parent_id, embedding,
+               embedding_dim, embedding_model)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            "#,
+            params![
+                m.event_type,
+                m.content,
+                m.detail,
+                m.title,
+                m.mem_id,
+                entities_json,
+                concepts_json,
+                tags_json,
+                links_json,
+                m.salience,
+                m.source_ref,
+                m.timestamp,
+                m.parent_id,
+                m.embedding,
+                m.embedding_dim,
+                m.embedding_model,
+            ],
+        )?;
+        Ok(InsertMemoryOutcome {
+            id: tx.last_insert_rowid(),
+            updated: false,
+        })
     })
 }
 
