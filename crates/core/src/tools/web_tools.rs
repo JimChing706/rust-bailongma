@@ -18,15 +18,17 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
-use std::io::Write;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use futures_util::future::join_all;
 use futures_util::StreamExt;
 use regex::Regex;
+use scraper::{Html, Node, Selector};
 use serde_json::{json, Value};
 use std::sync::LazyLock;
 
@@ -388,11 +390,6 @@ pub fn web_read_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
     if !["auto", "http", "browser"].contains(&render) {
         return Err(CoreError::Tool(format!("invalid render mode: {render}")));
     }
-    if render == "browser" {
-        return Err(CoreError::Tool(
-            "web_read: render=browser 需要本地 Playwright，Rust 版未接线；请用 render=auto 或 render=http".into(),
-        ));
-    }
     let remote_fallback = args
         .get("remote_fallback")
         .and_then(Value::as_bool)
@@ -428,6 +425,34 @@ pub fn web_read_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
 
     let jina_key = ex.web_keys.as_ref().and_then(|k| k.jina_key.clone());
     let mut failures: Vec<Value> = Vec::new();
+
+    // 策略零：本地浏览器渲染（仅 render=browser 时启用；对齐 Node 历史 browser_read 路径）
+    if render == "browser" {
+        let br = render_with_browser(&url, timeout_ms, max_chars);
+        if br.ok && !is_low_value_page_text(&br.text) {
+            let outcome = ReadOutcome {
+                url: &url,
+                final_url: &br.final_url,
+                status: None,
+                source: "browser",
+                title: &br.title,
+                text: &br.text,
+                is_json: false,
+            };
+            let payload = build_read_payload(ex, &outcome, max_chars);
+            READ_CACHE
+                .lock()
+                .expect("read cache poisoned")
+                .insert(cache_key.clone(), (payload.clone(), Instant::now()));
+            return Ok(payload);
+        }
+        failures.push(json!({
+            "strategy": "browser",
+            "code": br.error.as_ref().map(|e| if e.contains("未找到") { "NO_BROWSER" } else { "BROWSER_FAILED" }),
+            "error": br.error,
+            "low_value": br.ok && is_low_value_page_text(&br.text),
+        }));
+    }
 
     // 策略一：受保护直连 HTTP
     let allow_lan = ex.allow_lan_access;
@@ -1333,6 +1358,210 @@ fn redirect_policy(allow_lan: bool) -> reqwest::redirect::Policy {
     })
 }
 
+// ─────────────────────────────────────────────────────────────
+// 本地浏览器渲染（对齐 Node browser_read 的 Playwright 路径）
+// ─────────────────────────────────────────────────────────────
+
+/// 可读文本候选选择器（对齐 Node snapshot.js `extractReadablePage`）。
+const READABLE_SELECTOR: &str = "article, main, [role=\"main\"], .article, .post, .content, .entry-content, #content, #main";
+/// 提取文本上限（对齐 Node readOnce `extract_max_chars=500_000`）。
+const BROWSER_EXTRACT_MAX: usize = 500_000;
+/// dump-dom 输出读取上限（防止巨页撑爆内存）。
+const BROWSER_DOM_MAX: usize = 3_000_000;
+
+/// 浏览器渲染结果（对齐 Node readOnce 返回的字段）。
+struct BrowserRender {
+    ok: bool,
+    title: String,
+    text: String,
+    final_url: String,
+    error: Option<String>,
+}
+
+/// 浏览器可执行文件候选（env 优先，随后常见安装路径）。
+fn browser_candidates() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = Vec::new();
+    for key in ["CHROME_PATH", "EDGE_PATH", "BROWSER_PATH"] {
+        if let Some(p) = std::env::var_os(key) {
+            v.push(PathBuf::from(p));
+        }
+    }
+    for p in [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Users\ADMIN\AppData\Local\Google\Chrome\Application\chrome.exe",
+        r"C:\Users\ADMIN\AppData\Local\Microsoft\Edge\Application\msedge.exe",
+    ] {
+        v.push(PathBuf::from(p));
+    }
+    v.into_iter().filter(|p| p.exists()).collect()
+}
+
+fn find_browser_exe() -> Option<PathBuf> {
+    browser_candidates().into_iter().next()
+}
+
+/// 文本清洗（对齐 Node `clean`：压缩水平空白、合并多空行）。
+fn clean_text(s: &str) -> String {
+    let mid = Regex::new(r"[ \t]+").unwrap().replace_all(s, " ");
+    Regex::new(r"\n{3,}").unwrap().replace_all(&mid, "\n\n").trim().to_string()
+}
+
+/// 近似 innerText：收集元素后代文本，跳过 script/style/noscript/template 等嵌入文本。
+fn element_text(el: &scraper::ElementRef) -> String {
+    el.descendants()
+        .filter_map(|node| match node.value() {
+            Node::Text(t) => {
+                let parent_tag = node
+                    .parent()
+                    .and_then(|p| p.value().as_element())
+                    .map(|e| e.name().to_string());
+                if matches!(parent_tag.as_deref(), Some("script" | "style" | "noscript" | "template")) {
+                    None
+                } else {
+                    Some(t.text.to_string())
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// 从渲染 DOM 提取可读文本（对齐 Node snapshot.js `extractReadablePage`：
+/// 候选容器中 innerText 最长者，>300 字符取用，否则回落 body 文本）。
+fn extract_readable_text(dom: &str) -> (String, String) {
+    let doc = Html::parse_document(dom);
+    let title = Selector::parse("title")
+        .ok()
+        .and_then(|sel| doc.select(&sel).next())
+        .map(|e| element_text(&e).trim().to_string())
+        .unwrap_or_default();
+    let sel = Selector::parse(READABLE_SELECTOR).unwrap();
+    let mut best: Option<String> = None;
+    for el in doc.select(&sel) {
+        let text = clean_text(&element_text(&el));
+        if best.as_ref().is_none_or(|b| text.len() > b.len()) {
+            best = Some(text);
+        }
+    }
+    let body = doc
+        .select(&Selector::parse("body").unwrap())
+        .next()
+        .map(|e| clean_text(&element_text(&e)))
+        .unwrap_or_default();
+    let text = match best {
+        Some(b) if b.len() > 300 => b,
+        _ => body,
+    };
+    (title, text.chars().take(BROWSER_EXTRACT_MAX).collect())
+}
+
+/// 用本机 Chrome/Edge headless `--dump-dom` 渲染页面（对齐 Node Playwright
+/// `readOnce` 的文本提取语义；不做滚动懒加载，final_url 回落请求 URL）。
+fn render_with_browser(url: &str, timeout_ms: u64, _extract_max: usize) -> BrowserRender {
+    let Some(exe) = find_browser_exe() else {
+        return BrowserRender {
+            ok: false, title: String::new(), text: String::new(),
+            final_url: url.to_string(),
+            error: Some(
+                "未找到本机 Chrome/Edge，浏览器渲染不可用（可用 CHROME_PATH/EDGE_PATH 环境变量指定）".into(),
+            ),
+        };
+    };
+    // 独立 user-data-dir，避免与用户浏览器实例冲突
+    let profile = std::env::temp_dir().join(format!(
+        "bailongma-headless-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let profile_str = profile.to_string_lossy().to_string();
+    let mut child = match Command::new(&exe)
+        .arg("--headless=new")
+        .arg("--disable-gpu")
+        .arg("--no-first-run")
+        .arg("--no-default-browser-check")
+        .arg("--disable-extensions")
+        .arg("--disable-background-networking")
+        .arg("--disable-component-update")
+        .arg("--disable-features=TranslateUI")
+        .arg(format!("--user-data-dir={profile_str}"))
+        .arg(format!("--virtual-time-budget={timeout_ms}"))
+        .arg("--dump-dom")
+        .arg(url)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&profile);
+            return BrowserRender {
+                ok: false, title: String::new(), text: String::new(),
+                final_url: url.to_string(),
+                error: Some(format!("启动浏览器失败: {e}")),
+            };
+        }
+    };
+
+    // 收集 stdout（上限 BROWSER_DOM_MAX），同时轮询子进程退出，超时则 kill
+    let mut buf: Vec<u8> = Vec::new();
+    let mut exited = false;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms + 8_000);
+    let mut stdout = child.stdout.take();
+    while Instant::now() < deadline && !exited {
+        match child.try_wait() {
+            Ok(Some(_)) => exited = true,
+            Ok(None) => {}
+            Err(_) => {
+                exited = true;
+                break;
+            }
+        }
+        if let Some(s) = stdout.as_mut() {
+            let mut chunk = [0u8; 65536];
+            match s.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(n) => {
+                    if buf.len() < BROWSER_DOM_MAX {
+                        let take = n.min(BROWSER_DOM_MAX - buf.len());
+                        buf.extend_from_slice(&chunk[..take]);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        if !exited {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    if !exited {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let _ = std::fs::remove_dir_all(&profile);
+
+    if buf.is_empty() {
+        return BrowserRender {
+            ok: false, title: String::new(), text: String::new(),
+            final_url: url.to_string(),
+            error: Some("浏览器未返回渲染 DOM（可能超时或页面无输出）".into()),
+        };
+    }
+    let dom = String::from_utf8_lossy(&buf);
+    let (title, text) = extract_readable_text(&dom);
+    BrowserRender {
+        ok: true, title, text,
+        final_url: url.to_string(),
+        error: None,
+    }
+}
+
 fn has_cjk(s: &str) -> bool {
     s.chars()
         .any(|c| matches!(c, '\u{3400}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'))
@@ -1627,7 +1856,7 @@ mod tests {
 
     /// 起一个一次性 mock HTTP server，返回基础 URL。
     fn mock_server(
-        handler: impl Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + 'static,
+        handler: impl Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + Sync + 'static,
     ) -> String {
         mock_server_with_headers(move |req| {
             let (status, ctype, body) = handler(req);
@@ -1635,40 +1864,47 @@ mod tests {
         })
     }
 
-    /// 支持自定义响应头的 mock server（重定向测试用）。
+    /// 支持自定义响应头的 mock server（重定向测试用）。循环 accept 处理多次连接
+    /// （浏览器渲染 + 直连回落可能各请求一次）。
     fn mock_server_with_headers(
-        handler: impl Fn(&str) -> (u16, &'static str, Vec<u8>, Vec<(&'static str, &'static str)>) + Send + 'static,
+        handler: impl Fn(&str) -> (u16, &'static str, Vec<u8>, Vec<(&'static str, &'static str)>) + Send + Sync + 'static,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
+        let handler = std::sync::Arc::new(handler);
         thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = vec![0u8; 65536];
-                let _ = stream.read(&mut buf);
-                let req = String::from_utf8_lossy(&buf).to_string();
-                let (status, ctype, body, headers) = handler(&req);
-                let reason = match status {
-                    200 => "OK",
-                    301 => "Moved Permanently",
-                    302 => "Found",
-                    307 => "Temporary Redirect",
-                    308 => "Permanent Redirect",
-                    404 => "Not Found",
-                    403 => "Forbidden",
-                    503 => "Service Unavailable",
-                    _ => "Custom",
-                };
-                let mut head = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
-                    body.len()
-                );
-                for (k, v) in headers {
-                    head.push_str(&format!("{k}: {v}\r\n"));
-                }
-                head.push_str("Connection: close\r\n\r\n");
-                let _ = stream.write_all(head.as_bytes());
-                let _ = stream.write_all(&body);
-                let _ = stream.flush();
+            loop {
+                let Ok((stream, _)) = listener.accept() else { break };
+                let h = handler.clone();
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = vec![0u8; 65536];
+                    let _ = stream.read(&mut buf);
+                    let req = String::from_utf8_lossy(&buf).to_string();
+                    let (status, ctype, body, headers) = h(&req);
+                    let reason = match status {
+                        200 => "OK",
+                        301 => "Moved Permanently",
+                        302 => "Found",
+                        307 => "Temporary Redirect",
+                        308 => "Permanent Redirect",
+                        404 => "Not Found",
+                        403 => "Forbidden",
+                        503 => "Service Unavailable",
+                        _ => "Custom",
+                    };
+                    let mut head = format!(
+                        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
+                        body.len()
+                    );
+                    for (k, v) in headers {
+                        head.push_str(&format!("{k}: {v}\r\n"));
+                    }
+                    head.push_str("Connection: close\r\n\r\n");
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&body);
+                    let _ = stream.flush();
+                });
             }
         });
         format!("http://{addr}")
@@ -1853,12 +2089,53 @@ mod tests {
     }
 
     #[test]
-    fn web_read_browser_render_unwired() {
+    fn web_read_browser_render_falls_back_to_http() {
+        // render=browser：浏览器可用则渲染提取，否则回落 http 直连；均应产出可读内容
+        // 注意：页面需带 charset 声明，否则 headless Chrome 无 charset 时按系统
+        // 默认编码猜测导致 dump-dom 输出乱码（真实站点普遍有 meta charset）
+        let body = r#"<!doctype html><html><head><meta charset="utf-8"><title>Test</title></head><body><article><p>这是浏览器渲染的可读正文内容示例。长度足够绕过低价值判定阈值，用于验证 render=browser 策略的完整执行链路，包括页面导航、等待渲染完成、DOM 文本提取以及最终的回落行为。该段落还包含足够的字符数量，确保渲染结果不会被误判为低价值页面。</p></article></body></html>"#;
+        let payload = body.as_bytes().to_vec();
+        let url = mock_server(move |_req| (200, "text/html", payload.clone()));
         let dir = tempfile::tempdir().unwrap();
         let ex = test_executor(dir.path());
-        let r = ex.execute("web_read", &json!({ "url": "https://example.com", "render": "browser" }));
-        assert!(r.is_err());
-        assert!(r.unwrap_err().to_string().contains("未接线"));
+        let r = ex
+            .execute("web_read", &json!({ "url": url, "render": "browser" }))
+            .unwrap();
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"].as_bool(), Some(true), "r={r}");
+        assert!(
+            v["content"].as_str().unwrap().contains("可读正文"),
+            "r={r}"
+        );
+    }
+
+    #[test]
+    fn extract_readable_text_skips_scripts_and_falls_back_to_body() {
+        let dom = r#"<!doctype html><html><head><title>Sample Title</title></head><body>
+            <script>var x = "noise text";</script>
+            <style>.a{display:none}</style>
+            <div id="nav">导航杂讯</div>
+            <main><article><h1>正文标题</h1><p>正文内容填充，足够长度验证提取与回落的段落文本。</p></article></main>
+            <div class="content">short</div>
+        </body></html>"#;
+        let (title, text) = extract_readable_text(dom);
+        assert_eq!(title, "Sample Title");
+        assert!(text.contains("正文标题"), "text={text}");
+        assert!(!text.contains("noise"), "script 文本应跳过");
+        assert!(!text.contains(".a{"), "style 文本应跳过");
+        assert!(text.len() > 20);
+    }
+
+    #[test]
+    fn extract_readable_text_prefers_long_article() {
+        let long = "正文".repeat(400);
+        let dom = format!(
+            r#"<html><head><title>Long</title></head><body><div id="nav">nav</div><article>{long}</article><div>short</div></body></html>"#
+        );
+        let (title, text) = extract_readable_text(&dom);
+        assert_eq!(title, "Long");
+        assert!(text.starts_with("正文"), "应取 article 文本: len={}", text.len());
+        assert!(!text.contains("nav"), "短导航不应混入");
     }
 
     #[test]
