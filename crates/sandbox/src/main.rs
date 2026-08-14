@@ -22,7 +22,7 @@
 //! - 环境清理：执行子命令时继承最小环境（PATH/TMP 等），不注入父进程敏感变量
 //! - 一次一请求：串行处理，天然防并发资源争抢
 
-use std::io::{BufRead, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -326,11 +326,50 @@ impl Sandbox {
                 path.display()
             ));
         }
-        // 双保险：词法判定通过后，若路径已存在，再解析符号链接/junction，
-        // 验证真实落点仍在 root 内（词法判定不解析链接 → junction 逃逸）。
+        // 双保险：词法判定通过后，再解析符号链接/junction，验证真实落点仍在 root 内。
+        //
+        // 本轮审计 B1 实锤的缺口：旧实现只对【已存在】的完整路径 canonicalize
+        // （`if let Ok(canon) = canonicalize(&normalized)`）——写入场景目标文件尚不存在
+        // 时 canonicalize 失败 → 跳过二次校验 → 经「junction 父目录 + 新文件名」逃逸
+        // 出沙箱根（write_file 落盘到 root 外的真实目录）。
+        //
+        // 修复策略：
+        // 1. 以【父目录】为锚点 canonicalize（父目录必存在）→ 校验真实落点；
+        // 2. 校验通过后返回「真实父目录 + 文件名」的落点路径，后续 IO 直接作用于
+        //    真实路径，顺带消除词法校验 → 实际 IO 之间的 TOCTOU 窗口（审计 B4）；
+        // 3. 目标已存在且自身是链接 → 再解析一次，防 symlink 文件指向 root 外。
+        let canon_root =
+            std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        if let (Some(file_name), Some(parent)) = (normalized.file_name(), normalized.parent()) {
+            if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+                // 判定对象是「真实父目录 + 文件名」的落点而非父目录本身：
+                // 目标即 root 自身（如 cwd=root）时其父目录在 root 之上属合法；
+                // 父目录为 junction 指向 root 外时，落点自然落在 root 外被拒。
+                let real = canon_parent.join(file_name);
+                if !same_path_prefix(&real, &canon_root) {
+                    return Err(format!(
+                        "路径越界（父目录链接解析后，沙箱根 {}）: {}",
+                        self.root.display(),
+                        path.display()
+                    ));
+                }
+                // 目标已存在且为链接 → 校验其真实落点（防文件级 symlink 逃逸）
+                if let Ok(canon) = std::fs::canonicalize(&real) {
+                    if !same_path_prefix(&canon, &canon_root) {
+                        return Err(format!(
+                            "路径越界（链接解析后，沙箱根 {}）: {}",
+                            self.root.display(),
+                            path.display()
+                        ));
+                    }
+                }
+                return Ok(real);
+            }
+            // 父目录尚不存在：词法判定已通过；create_dir_all 新建的是普通目录
+            //（无预置链接），无逃逸面，返回规范化路径即可。
+        }
+        // 目标已存在 → 自身 canonicalize 兜底（无父目录/父目录不可解析场景）
         if let Ok(canon) = std::fs::canonicalize(&normalized) {
-            let canon_root = std::fs::canonicalize(&self.root)
-                .unwrap_or_else(|_| self.root.clone());
             if !same_path_prefix(&canon, &canon_root) {
                 return Err(format!(
                     "路径越界（链接解析后，沙箱根 {}）: {}",
@@ -508,15 +547,60 @@ fn parse_args(args: &[String]) -> Result<(PathBuf, Vec<String>), String> {
 // stdin/stdout 主循环
 // ─────────────────────────────────────────────────────────────
 
+/// 单条 JSON-RPC 请求行的最大字节数（审计 B3 修复）。
+/// 原实现 `read_line` 无上限：恶意/异常父进程可灌入无限长行，
+/// 令子进程内存无限增长。现超限行整体丢弃（继续消费到换行），
+/// 协议串行性不受影响，后续行正常解析。
+const MAX_RPC_LINE_BYTES: usize = 256 * 1024;
+
+/// 有界读一行：正常行 → Some(行内容含换行)；超长行 → 丢弃后返回 Some(空)；
+/// EOF → None。超长不会把已读字节留在缓冲污染下一行。
+fn read_line_limited<R: std::io::BufRead>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::with_capacity(128);
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(None); // EOF
+        }
+        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+            buf.extend_from_slice(&available[..=pos]);
+            reader.consume(pos + 1);
+            return Ok(Some(buf));
+        }
+        buf.extend_from_slice(available);
+        let consumed = available.len();
+        reader.consume(consumed);
+        if buf.len() > max {
+            // 超长：丢弃本行剩余字节（继续消费到换行/EOF），返回空标记
+            loop {
+                let avail = reader.fill_buf()?;
+                if avail.is_empty() {
+                    break;
+                }
+                if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                    let consumed = pos + 1;
+                    reader.consume(consumed);
+                    break;
+                }
+                let consumed = avail.len();
+                reader.consume(consumed);
+            }
+            return Ok(Some(Vec::new()));
+        }
+    }
+}
+
 fn run_io_loop(sandbox: &Sandbox) {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    let mut line = String::new();
+    let mut reader = stdin.lock();
     loop {
-        line.clear();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
+        let line = match read_line_limited(&mut reader, MAX_RPC_LINE_BYTES) {
+            Ok(None) => break, // EOF
+            Ok(Some(b)) => b,
             Err(e) => {
                 let _ = writeln!(
                     stdout,
@@ -526,12 +610,22 @@ fn run_io_loop(sandbox: &Sandbox) {
                 let _ = stdout.flush();
                 break;
             }
+        };
+        if line.is_empty() {
+            // 超长行被丢弃：回执超限错误，协议继续（后续行不受影响）
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({ "id": null, "ok": false, "error": "请求行超过长度上限，已丢弃" })
+            );
+            let _ = stdout.flush();
+            continue;
         }
-        let trimmed = line.trim();
+        let trimmed = String::from_utf8_lossy(&line).trim().to_string();
         if trimmed.is_empty() {
             continue;
         }
-        let req: Value = match serde_json::from_str(trimmed) {
+        let req: Value = match serde_json::from_str(&trimmed) {
             Ok(v) => v,
             Err(e) => {
                 let _ = writeln!(

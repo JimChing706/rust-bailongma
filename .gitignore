@@ -31,6 +31,9 @@ _dist/
 # 攻击验证残留（不入库）
 audit_tmp/
 
+# 本地工具运行状态（不入库）
+.codewhale/
+
 # 系统
 Thumbs.db
 .DS_Store

@@ -190,6 +190,48 @@ fn escape_symlink_escape_rejected_or_documented() {
     );
 }
 
+#[test]
+fn escape_symlink_write_path_new_file_rejected() {
+    // 审计 B1 实锤的缺口：目标【尚不存在】时旧实现的 canonicalize 失败 → 跳过
+    // 二次校验 → 经 junction 父目录逃逸（write_file 落盘到 root 外）。
+    // 修复后：以父目录为锚点校验，新文件写入必须被拒，且 outside 无落盘。
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+
+    if !make_link(&root, &outside) {
+        eprintln!("SKIP: 无法创建链接（权限/平台限制），本用例不判定");
+        return;
+    }
+
+    let mut child = spawn_sandbox(&root, &[]);
+    let r = rpc(
+        &mut child,
+        &json!({ "id": 1, "method": "write_file",
+                 "params": { "path": "leak/new.txt", "content": "ESCAPED" } }),
+    );
+    // 链接逃逸拒绝后沙箱仍应存活（后续请求可正常处理）
+    let r2 = rpc(
+        &mut child,
+        &json!({ "id": 2, "method": "write_file",
+                 "params": { "path": "ok.txt", "content": "FINE" } }),
+    );
+    kill(&mut child);
+
+    assert_eq!(
+        r["ok"], false,
+        "写路径经 junction 父目录必须被拒（目标不存在也要校验）: {r}"
+    );
+    assert_eq!(r2["ok"], true, "拒绝逃逸后正常写路径应放行: {r2}");
+    assert_eq!(
+        std::fs::read_to_string(outside.join("new.txt")).is_err(),
+        true,
+        "outside 目录必须无落盘文件（逃逸写入未发生）"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────
 // 2. 命令逃逸
 // ─────────────────────────────────────────────────────────────

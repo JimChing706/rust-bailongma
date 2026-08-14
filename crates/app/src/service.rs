@@ -129,6 +129,11 @@ impl AppRuntime {
             .and_then(|v| v.as_str())
             .unwrap_or(compat::DEFAULT_AGENT_NAME)
             .to_string();
+        // S1（审计修复）：用真实 sandbox 根显式初始化全局审批门。
+        // 此前仅 server.rs 调 set_global_on_request（隐含 global() 的 temp_dir 兜底），
+        // 导致审批门以临时目录为 PolicyEngine 文件边界且语义不透明；chat/serve/desktop
+        // 三入口共用本装配 → 这里初始化即覆盖全部生产路径。init_global 幂等（OnceLock）。
+        bailongma_core::approval::init_global(tool_root.clone());
         // Q6 人工介入硬通道：随 config 开关装配（默认关闭 = 零侵入）
         let intervention = Arc::new(InterventionGate::new(cfg.intervention.enabled));
         // M1 装配收口：挂载 LLM 观测层（埋点链路已在 caller/retry 就位，此处补齐采集端）。
@@ -197,6 +202,12 @@ impl AppRuntime {
         });
         let mut executor = NativeToolExecutor::new(self.tool_root.clone())
             .with_db(self.db.clone())
+            // S1（审计修复）：生产装配必须接线全局审批门。
+            // 此前 with_approval 仅存在于测试——approval=None 时 guard_approval 直接放行，
+            // exec_command / delete_file / delegate_to_agent 在生产中全部免人工确认。
+            // 现与 HTTP POST /approval（提交到同一 global()）闭环：高危工具过 120s
+            // fail-closed 审批门（交互轮/唤醒轮共用，唤醒轮无人值守时按超时拒绝）。
+            .with_approval(bailongma_core::approval::global())
             .with_send_message(send_message);
         if let Some(bin) = &self.sandbox_bin {
             executor = executor.with_sandbox(bin.clone());
@@ -210,10 +221,25 @@ impl AppRuntime {
         let conversation_id =
             conversations::insert(&self.db, "user", &msg.from_id, &msg.content).ok()?;
         let runtime = self.clone();
+        // 审计 A3 修复：内层 spawn 捕获 panic（JoinError）而不是让裸 panic 传播。
+        // 此前 run_message_turn_impl 若有 panic 会直接打到 tokio 全局 panic hook
+        // （默认 hook 会 print 但*不杀进程*——风险在 panic 发生在持有非 UnwindSafe
+        // 资源处，且日志无任何「消息轮异常」上下文，故障不可观测）。
+        // 内层任务 panic 时外层 await JoinHandle 得到 Err(JoinError)，转为结构化日志，
+        // 并保证该消息轮不会静默中止（恢复点：下一条消息照常进入新轮）。
         tokio::spawn(async move {
-            runtime
-                .run_message_turn_impl(msg, conversation_id, None, None)
-                .await;
+            let inner = tokio::spawn(async move {
+                runtime
+                    .run_message_turn_impl(msg, conversation_id, None, None)
+                    .await;
+            });
+            if let Err(e) = inner.await {
+                if e.is_panic() {
+                    tracing::error!("[消息轮] run_message_turn panic（已捕获，不影响后续消息）");
+                } else if e.is_cancelled() {
+                    tracing::warn!("[消息轮] run_message_turn 被取消");
+                }
+            }
         });
         Some(conversation_id)
     }
@@ -807,6 +833,43 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn production_executor_wires_global_approval() {
+        // S1（审计修复）：生产 executor 必须接线全局审批门；exec_command 必须
+        // 产生挂起审批请求（而非 approval=None 直接放行的旧行为）。
+        let runtime = test_runtime();
+        let ex = runtime.build_executor();
+        assert!(
+            ex.approval.is_some(),
+            "S1 修复：生产 executor 必须挂载全局审批门"
+        );
+
+        // 核心语义：exec_command 走全局门 → 出现新的挂起请求 → deny 后按拒绝返回
+        let gate = bailongma_core::approval::global();
+        let before: Vec<String> = gate.pending_ids();
+        let g2 = gate.clone();
+        let handle = std::thread::spawn(move || {
+            g2.guard_tool_call("exec_command", "whoami").unwrap()
+        });
+        let mut id: Option<String> = None;
+        for _ in 0..200 {
+            if let Some(nid) = gate.pending_ids().iter().find(|i| !before.contains(i)) {
+                id = Some(nid.clone());
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let id = id.expect("exec_command 应产生挂起审批请求（而非生产免审批放行）");
+        gate.submit(&id, "deny").unwrap();
+        assert!(
+            matches!(
+                handle.join().unwrap(),
+                bailongma_core::approval::GuardResult::Denied(_)
+            ),
+            "deny 后 guard 应按拒绝返回"
+        );
     }
 
     #[test]

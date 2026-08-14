@@ -454,7 +454,13 @@ fn apply_event(
                 DailyState::Error => {
                     // 同请求再次失败（重试链）：total 已计过，仅错误明细已追加，不再重复计
                 }
-                DailyState::Done => unreachable!("done 分支已在上面提前 return"),
+                DailyState::Done => {
+                    // 审计 L3 修复：状态机乱序防御。done 后收到迟到的 CallFailed 属
+                    // 事件乱序（入口 finish_reason=="done" 提前 return 覆盖主要路径，
+                    // 此处为兜底）——不可 unreachable! panic：flusher 是后台任务，
+                    // panic 会杀死指标线程使成本账本静默停更。
+                    tracing::debug!("metrics: done 状态收到迟到 CallFailed（忽略）");
+                }
             }
             let _ = was_aborted;
             e.daily = DailyState::Error;

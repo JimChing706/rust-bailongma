@@ -208,18 +208,28 @@ pub fn upsert_calls_batch(db: &Db, rows: &[LlmCallAgg]) -> Result<()> {
     })
 }
 
-/// 批量写工具台账（INSERT OR IGNORE 防重放；唯一键含 attempt，重试路径不误伤）。
-/// 评审修订 #2：`UNIQUE(request_id, round, attempt, tool_name)`。
+/// 批量写工具台账（审计 L1 修复：键含参数 → 同键覆盖而非吞掉）。
+///
+/// 原实现 `INSERT OR IGNORE`（唯一键 request_id+round+attempt+tool_name）会吞掉
+/// 同轮同名工具【不同参数】的第二次调用——防重放键缺参数指纹导致结果错乱。
+/// 现改为 ON CONFLICT 覆盖：同键不同参数 → 以最新一次参数/结果为准；
+/// 同键同参数重试（真防重放场景）→ 幂等覆盖；attempt 变化 → 新行（重试台账保留）。
 pub fn upsert_tool_calls_batch(db: &Db, rows: &[LlmToolCallRow]) -> Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
     db.transaction(|tx| {
         let mut stmt = tx.prepare(
-            "INSERT OR IGNORE INTO llm_tool_calls
+            "INSERT INTO llm_tool_calls
                (request_id, round, attempt, tool_name, args_json, result_json, status,
                 duration_ms, delegated_from)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(request_id, round, attempt, tool_name) DO UPDATE SET
+               args_json       = excluded.args_json,
+               result_json     = excluded.result_json,
+               status          = excluded.status,
+               duration_ms     = excluded.duration_ms,
+               delegated_from  = excluded.delegated_from",
         )?;
         for r in rows {
             stmt.execute(params![
@@ -238,22 +248,25 @@ pub fn upsert_tool_calls_batch(db: &Db, rows: &[LlmToolCallRow]) -> Result<()> {
     })
 }
 
-/// P1-2 工具防重放查询：同一逻辑请求（request_id + round + tool_name）是否已有成功执行记录。
-/// 命中 → 复用记录结果，不重复执行（故障注入场景：provider 完成但响应丢失 → 同逻辑请求重试）。
+/// P1-2 工具防重放查询：同一逻辑请求（request_id + round + tool_name + **args**）是否已有成功执行记录。
+/// 审计 L1 修复：键纳入 args 参数维度——同轮同名工具不同参数必须重新执行，
+/// 不得复用另一参数的结果；同参数重试（provider 完成但响应丢失）命中复用。
 /// 只返回 status='ok' 的记录：error/tripped 不视为已成功执行，重试应重新执行。
 pub fn find_tool_call_result(
     db: &Db,
     request_id: &str,
     round: i64,
     tool_name: &str,
+    args_json: &str,
 ) -> Result<Option<String>> {
     let conn = db.conn();
     let mut stmt = conn.prepare(
         "SELECT result_json FROM llm_tool_calls
-         WHERE request_id = ?1 AND round = ?2 AND tool_name = ?3 AND status = 'ok'
+         WHERE request_id = ?1 AND round = ?2 AND tool_name = ?3 AND args_json = ?4
+           AND status = 'ok'
          ORDER BY attempt DESC, rowid DESC LIMIT 1",
     )?;
-    let p = params![request_id, round, tool_name];
+    let p = params![request_id, round, tool_name, args_json];
     let mut rows = stmt.query(p)?;
     if let Some(row) = rows.next()? {
         return Ok(Some(row.get(0)?));
@@ -739,30 +752,60 @@ mod tests {
     #[test]
     fn find_tool_call_result_returns_only_ok_replay() {
         let db = test_db();
-        let row = |attempt: i64, status: &str, tool_name: &str, result: &str| LlmToolCallRow {
-            request_id: "r9".into(),
-            round: 3,
-            attempt,
-            tool_name: tool_name.into(),
-            args_json: "{\"to\":\"u\"}".into(),
-            result_json: result.into(),
-            status: status.into(),
-            duration_ms: 5,
-            delegated_from: String::new(),
+        let row = |attempt: i64, status: &str, tool_name: &str, args: &str, result: &str| {
+            LlmToolCallRow {
+                request_id: "r9".into(),
+                round: 3,
+                attempt,
+                tool_name: tool_name.into(),
+                args_json: args.into(),
+                result_json: result.into(),
+                status: status.into(),
+                duration_ms: 5,
+                delegated_from: String::new(),
+            }
         };
         // 先落 error（attempt 1），再落 ok（attempt 2）——模拟重试后成功
-        upsert_tool_calls_batch(&db, &[row(1, "error", "send_message", r#"{"ok":false}"#)]).unwrap();
-        upsert_tool_calls_batch(&db, &[row(2, "ok", "send_message", r#"{"delivered":true}"#)]).unwrap();
+        upsert_tool_calls_batch(
+            &db,
+            &[row(1, "error", "send_message", r#"{"to":"u"}"#, r#"{"ok":false}"#)],
+        )
+        .unwrap();
+        upsert_tool_calls_batch(
+            &db,
+            &[row(2, "ok", "send_message", r#"{"to":"u"}"#, r#"{"delivered":true}"#)],
+        )
+        .unwrap();
         // 只复用成功记录，且取最新 attempt
-        let hit = find_tool_call_result(&db, "r9", 3, "send_message").unwrap();
+        let hit = find_tool_call_result(&db, "r9", 3, "send_message", r#"{"to":"u"}"#).unwrap();
         assert_eq!(hit.as_deref(), Some(r#"{"delivered":true}"#));
+        // 审计 L1：同轮同名工具【不同参数】不得命中复用（必须重新执行）
+        let other_args = find_tool_call_result(&db, "r9", 3, "send_message", r#"{"to":"v"}"#)
+            .unwrap();
+        assert!(other_args.is_none(), "不同参数不应复用结果");
         // 未执行过的工具 → None
-        assert!(find_tool_call_result(&db, "r9", 3, "web_search").unwrap().is_none());
+        assert!(
+            find_tool_call_result(&db, "r9", 3, "web_search", r#"{"q":"x"}"#)
+                .unwrap()
+                .is_none()
+        );
         // 只有 error 记录 → None（错误不防重放，允许重试重新执行）
-        upsert_tool_calls_batch(&db, &[row(1, "error", "express", r#"{"ok":false}"#)]).unwrap();
-        assert!(find_tool_call_result(&db, "r9", 3, "express").unwrap().is_none());
+        upsert_tool_calls_batch(
+            &db,
+            &[row(1, "error", "express", r#"{"text":"hi"}"#, r#"{"ok":false}"#)],
+        )
+        .unwrap();
+        assert!(
+            find_tool_call_result(&db, "r9", 3, "express", r#"{"text":"hi"}"#)
+                .unwrap()
+                .is_none()
+        );
         // 不同 round 不串键
-        assert!(find_tool_call_result(&db, "r9", 4, "send_message").unwrap().is_none());
+        assert!(
+            find_tool_call_result(&db, "r9", 4, "send_message", r#"{"to":"u"}"#)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

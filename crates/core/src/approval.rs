@@ -128,9 +128,14 @@ impl ApprovalGate {
     }
 
     fn new_id(&self) -> String {
+        use std::hash::{BuildHasher as _, Hasher as _};
         let mut seq = self.seq.lock().unwrap();
         *seq += 1;
-        format!("ap_{}_{}", now_ms(), seq)
+        // 审计 S3 修复：追加进程级随机熵（RandomState 每次实例化播种不同），
+        // 防止仅凭时间戳+序号即可预测/枚举的 id（可被其他会话猜测污染挂起表）。
+        let entropy =
+            std::collections::hash_map::RandomState::new().build_hasher().finish();
+        format!("ap_{}_{}_{:016x}", now_ms(), seq, entropy)
     }
 
     /// 工具调用守卫：Allow → Proceed；RequireApproval → 挂起等用户抉择；
@@ -172,7 +177,10 @@ impl ApprovalGate {
                     inner.pending.insert(req.id.clone(), tx);
                 }
                 // 场景面板推送（失败不阻塞审批流程，由超时兜底）
-                if let Some(cb) = self.on_request.lock().unwrap().as_ref() {
+                // 审计 S4 修复：锁内仅 clone（Arc），释放锁后再调用回调——
+                // 回调可能反向进入 gate（如查询 pending 列表），持锁调用会死锁。
+                let cb = self.on_request.lock().unwrap().as_ref().cloned();
+                if let Some(cb) = cb {
                     cb(&req);
                 }
                 let outcome = match rx.recv_timeout(self.timeout) {

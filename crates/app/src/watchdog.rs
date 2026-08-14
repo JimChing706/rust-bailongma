@@ -105,6 +105,15 @@ impl WatchdogState {
 /// 循环监督器：守护 worker 循环，panic/退出/假死 → 指数退避重启。
 pub struct LoopSupervisor;
 
+/// A1（审计修复）：假死 worker 强杀后的限时等待。
+///
+/// 旧实现 `worker_handle.abort()` 后直接 `await`：若 worker 卡在同步阻塞段
+/// （std Mutex 锁 DB / 长 SQLite 查询，abort 无法抢占），await 永久挂起 →
+/// supervisor 连同监控一起死亡，假死自愈彻底失效。
+/// 现在限时等待：正常取消立即返回；超时则放弃该任务（占用线程但保活），
+/// supervisor 记录 stuck 并立即进入重启流程。
+const STUCK_ABORT_GRACE: Duration = Duration::from_millis(500);
+
 impl LoopSupervisor {
     /// 启动监督循环（返回 supervisor 的 JoinHandle；abort 它可整体停掉）。
     ///
@@ -150,9 +159,14 @@ impl LoopSupervisor {
                         }
                     }
                     _ = &mut monitor => {
-                        // 假死：强杀 worker（abort 的 JoinError 是 Cancelled，不算 panic）
+                        // 假死：强杀 worker。异步任务 abort 后很快取消；但若 worker
+                        // 卡在同步阻塞段（std Mutex 锁 DB / 长查询）abort 不生效，
+                        // 无限 await 会让 supervisor 陪葬（审计 A1 实锤）。
+                        // 限时等待：超时放弃该任务（占用线程但保活），重启新循环。
                         worker_handle.abort();
-                        let _ = worker_handle.await;
+                        tokio::time::timeout(STUCK_ABORT_GRACE, &mut worker_handle)
+                            .await
+                            .ok();
                         "stuck-heartbeat-timeout"
                     }
                 };
@@ -227,6 +241,48 @@ mod tests {
         assert_eq!(state.stuck_count(), 0);
         let err = state.last_error().unwrap_or_default();
         assert!(err.contains("panic"), "最近错误应为 panic，实际: {err}");
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn stuck_in_sync_block_supervisor_survives() {
+        // A1（审计修复）：worker 卡死在【同步阻塞段】（不 yield 到 runtime，
+        // 模拟 std Mutex 锁 DB / 长 SQLite 查询）时 abort 无法立即取消——
+        // supervisor 必须限时放弃/等待，而不是无限 await 陪葬。
+        //
+        // 场景建模：首次启动即假死（偶发 DB 锁），同步段持续 150ms 后自行恢复；
+        // 重启后的新 worker 恢复健康。注意不能写成「永久卡死」——僵尸 worker
+        // 会永久占用一个 multi_thread worker 线程，测试结束 drop runtime 时
+        // 无法 join 该线程导致进程挂住（超出 supervisor 职责，非产品缺陷）。
+        // 必须用 multi_thread runtime：current_thread 会被同步阻塞整个卡死。
+        let state = WatchdogState::default();
+        let handle = LoopSupervisor::spawn(
+            state.clone(),
+            |w| async move {
+                w.beat();
+                // 同步段：模拟卡死在 DB 锁（150ms 后自行恢复）
+                let stuck_until = std::time::Instant::now() + Duration::from_millis(150);
+                while std::time::Instant::now() < stuck_until {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // 恢复后：健康循环
+                loop {
+                    w.beat();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            },
+            Duration::from_millis(40),
+            Duration::from_millis(1),
+            |_| {},
+        );
+        let ok = wait_until(|| state.stuck_count() >= 1, Duration::from_secs(3)).await;
+        assert!(ok, "同步段卡死也应判假死并重启（限时放弃保活）");
+        // 重启后的健康 worker 持续心跳 → 不再产生新 stuck
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(state.stuck_count(), 1, "恢复后不应再判假死");
+        let err = state.last_error().unwrap_or_default();
+        assert!(err.contains("stuck"), "最近错误应为假死，实际: {err}");
         handle.abort();
         let _ = handle.await;
     }

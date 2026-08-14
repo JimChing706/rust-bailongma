@@ -19,9 +19,16 @@ use crate::db::Db;
 
 /// 工具防重放守卫（可插拔；DB 实现见 [`DbToolReplayGuard`]）。
 pub trait ToolReplayGuard: Send + Sync {
-    /// 查询同一逻辑工具调用是否已有成功执行结果；命中返回记录的结果 JSON。
-    fn find_result(&self, request_id: &str, round: usize, tool_name: &str) -> Option<String>;
-    /// 同步记录一次工具执行（幂等：同键重复记录被 INSERT OR IGNORE 去重）。
+    /// 查询同一逻辑工具调用（request_id + round + tool_name + **args**）是否已有成功执行结果；
+    /// 命中返回记录的结果 JSON。审计 L1 修复：键含参数维度，同轮同名不同参数必须重新执行。
+    fn find_result(
+        &self,
+        request_id: &str,
+        round: usize,
+        tool_name: &str,
+        args: &Value,
+    ) -> Option<String>;
+    /// 同步记录一次工具执行（幂等：同键重复记录按最新参数/结果覆盖）。
     #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
@@ -49,8 +56,15 @@ impl DbToolReplayGuard {
 }
 
 impl ToolReplayGuard for DbToolReplayGuard {
-    fn find_result(&self, request_id: &str, round: usize, tool_name: &str) -> Option<String> {
-        match find_tool_call_result(&self.db, request_id, round as i64, tool_name) {
+    fn find_result(
+        &self,
+        request_id: &str,
+        round: usize,
+        tool_name: &str,
+        args: &Value,
+    ) -> Option<String> {
+        match find_tool_call_result(&self.db, request_id, round as i64, tool_name, &args.to_string())
+        {
             Ok(Some(r)) => Some(r),
             Ok(None) => None,
             Err(e) => {

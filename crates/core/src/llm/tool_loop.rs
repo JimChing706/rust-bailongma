@@ -550,7 +550,13 @@ pub async fn call_llm(
             let (result, stopped) = match stop_reason {
                 Some(reason) => {
                     tracing::warn!("[工具熔断] {}: {}", tc.name, reason);
-                    state.consecutive_failures = 0; // 对齐 Node：熔断后重置全局连续失败
+                    // 审计 L2 修复：熔断后不再清零连续失败（清零会让熔断形同虚设——
+                    // 每次熔断重置后需再攒 3 次失败才熔断）。收紧到阈值-1：
+                    // 下一次失败立即再次熔断；成功则由 record_outcome 清零解除，
+                    // 避免「熔断后永久拒绝」的死锁。
+                    state.consecutive_failures = limits
+                        .max_consecutive_failures
+                        .saturating_sub(1);
                     let stopped_result = make_tool_loop_stopped_result(&tc.name, &reason);
                     // ── M2 台账：熔断事件（status=tripped）──
                     record_tool_call(&round_ctx, round, &tc.name, &normalized, &stopped_result, "tripped", 0, &args.delegated_from);
@@ -558,8 +564,11 @@ pub async fn call_llm(
                 }
                 None => {
                     let rid = round_ctx.request_id.clone().unwrap_or_default();
-                    // ── P1-2 工具防重放：同逻辑请求（request_id+round+tool）已有成功记录 → 复用 ──
-                    let cached = replay_guard.and_then(|g| g.find_result(&rid, round, &tc.name));
+                    // ── P1-2 工具防重放：同逻辑请求（request_id+round+tool+参数）已有成功记录 → 复用 ──
+                    //（审计 L1 修复：键含参数指纹——同轮同名工具不同参数必须重新执行，
+                    //  否则第二次调用会误复用第一次的结果）
+                    let cached = replay_guard
+                        .and_then(|g| g.find_result(&rid, round, &tc.name, &normalized));
                     let (r, dur_ms) = if let Some(cached) = cached {
                         tracing::info!(
                             "[工具防重放] {} round {} 命中台账，复用记录结果（不重复执行）",
