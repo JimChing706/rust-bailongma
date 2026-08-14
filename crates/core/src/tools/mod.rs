@@ -44,6 +44,7 @@ use crate::llm::tools::{
 
 pub mod extra;
 pub mod matter_tools;
+pub mod sys_tools;
 pub mod validate;
 
 // ─────────────────────────────────────────────────────────────
@@ -70,6 +71,12 @@ const DEFAULT_MEMORY_LIMIT: u32 = 10;
 /// send_message 投递回调：`(target_id, content) -> Result<String>`。
 pub type SendMessageFn = Arc<dyn Fn(&str, &str) -> Result<String> + Send + Sync>;
 
+/// TICK 节奏调整回调（对齐 Node ticker.js）：`(seconds, ttl, reason) -> Result<String>`。
+pub type TickIntervalFn = Arc<dyn Fn(u64, u64, &str) -> Result<String> + Send + Sync>;
+
+/// 记忆回忆方向回调（对齐 Node onRecall）：`(query) -> Result<()>`。
+pub type RecallFn = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
 /// 真实工具执行器（对齐 Node 版 capabilities/ 各工具的返回形状）。
 pub struct NativeToolExecutor {
     /// 文件操作沙箱根（绝对路径）
@@ -84,6 +91,10 @@ pub struct NativeToolExecutor {
     pub approval: Option<Arc<ApprovalGate>>,
     /// 调用来源信任分层（P2-2，Phase 1 修复 D）：System 免确认，User/Agent 需人工确认
     pub caller_trust: CallerTrust,
+    /// TICK 节奏回调（None 时 set_tick_interval 返回未接线错误）
+    pub set_tick_interval: Option<TickIntervalFn>,
+    /// 记忆回忆方向回调（None 时 recall_memory 仅返回结果，不记录方向）
+    pub on_recall: Option<RecallFn>,
 }
 
 impl NativeToolExecutor {
@@ -95,6 +106,8 @@ impl NativeToolExecutor {
             sandbox_bin: None,
             approval: None,
             caller_trust: CallerTrust::Agent,
+            set_tick_interval: None,
+            on_recall: None,
         }
     }
 
@@ -105,6 +118,16 @@ impl NativeToolExecutor {
 
     pub fn with_send_message(mut self, cb: SendMessageFn) -> Self {
         self.send_message = Some(cb);
+        self
+    }
+
+    pub fn with_tick_interval(mut self, cb: TickIntervalFn) -> Self {
+        self.set_tick_interval = Some(cb);
+        self
+    }
+
+    pub fn with_recall(mut self, cb: RecallFn) -> Self {
+        self.on_recall = Some(cb);
         self
     }
 
@@ -165,10 +188,13 @@ impl NativeToolExecutor {
     pub fn is_ready(&self, name: &str) -> bool {
         match name {
             "search_memory" | "collect_agents" | "remind" | "set_reminder"
-            | "matter_create" | "matter_query" | "delegate_to_agent" | "grant_agent_delegation" => {
-                self.db.is_some()
-            }
+            | "matter_create" | "matter_query" | "delegate_to_agent" | "grant_agent_delegation"
+            | "upsert_memory" | "probe_memory" | "recall_memory" | "merge_memories"
+            | "downgrade_memory" | "set_agent_name" | "set_location"
+            | "complete_startup_self_check" | "set_task" | "complete_task"
+            | "update_task_step" => self.db.is_some(),
             "send_message" => self.send_message.is_some(),
+            "set_tick_interval" => self.set_tick_interval.is_some(),
             _ => true,
         }
     }
@@ -304,6 +330,11 @@ impl NativeToolExecutor {
     }
 
     fn exec_command(&self, args: &Value) -> Result<Value> {
+        self.exec_command_inner(args)
+    }
+
+    /// exec_command 实际实现（sys_tools 的 exec_quick_command 复用此路径）。
+    pub(crate) fn exec_command_inner(&self, args: &Value) -> Result<Value> {
         let command = args
             .get("command")
             .and_then(Value::as_str)
@@ -551,6 +582,26 @@ impl ToolExecutor for NativeToolExecutor {
             "set_reminder" => extra::set_reminder_impl(self, &args),
             "matter_create" => matter_tools::matter_create_impl(self, &args),
             "matter_query" => matter_tools::matter_query_impl(self, &args),
+            "upsert_memory" => sys_tools::upsert_memory_impl(self, &args),
+            "probe_memory" => sys_tools::probe_memory_impl(self, &args),
+            "recall_memory" => sys_tools::recall_memory_impl(self, &args),
+            "merge_memories" => sys_tools::merge_memories_impl(self, &args),
+            "downgrade_memory" => sys_tools::downgrade_memory_impl(self, &args),
+            "skip_recognition" => sys_tools::skip_recognition_impl(self, &args),
+            "skip_consolidation" => sys_tools::skip_consolidation_impl(self, &args),
+            "set_agent_name" => sys_tools::set_agent_name_impl(self, &args),
+            "set_location" => sys_tools::set_location_impl(self, &args),
+            "set_tick_interval" => sys_tools::set_tick_interval_impl(self, &args),
+            "find_tool" => sys_tools::find_tool_impl(self, &args),
+            "complete_startup_self_check" => {
+                sys_tools::complete_startup_self_check_impl(self, &args)
+            }
+            "set_task" => sys_tools::set_task_impl(self, &args),
+            "complete_task" => sys_tools::complete_task_impl(self, &args),
+            "update_task_step" => sys_tools::update_task_step_impl(self, &args),
+            "exec_quick_command" => sys_tools::exec_quick_command_impl(self, &args),
+            "list_processes" => sys_tools::list_processes_impl(self, &args),
+            "kill_process" => sys_tools::kill_process_impl(self, &args),
             "delegate_to_agent" => {
                 let Some(db) = &self.db else {
                     return Err(CoreError::Tool(
@@ -622,6 +673,7 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
     ];
     tools.extend(extra::extra_tool_schemas());
     tools.extend(matter_tools::matter_tool_schemas());
+    tools.extend(sys_tools::sys_tool_schemas());
     tools.push(delegate_to_agent_schema());
     tools.push(grant_agent_delegation_schema());
     tools

@@ -31,7 +31,7 @@ use bailongma_core::api::events::EventBus;
 use bailongma_core::api::routes::InboundMessage;
 use bailongma_core::compat;
 use bailongma_core::config::{load_config, Config};
-use bailongma_core::db::repositories::{brain_ui_events, conversations, turn_state};
+use bailongma_core::db::repositories::{brain_ui_events, config as config_repo, conversations, turn_state};
 use bailongma_core::db::Db;
 use bailongma_core::embedding::NoopEmbedder;
 use bailongma_core::error::Result;
@@ -46,7 +46,9 @@ use bailongma_core::llm::types::{ChatMessage, ChatRole, StreamEvent};
 use bailongma_core::memory::injector::{ContextWindowConfig, InjectorContext};
 use bailongma_core::memory::messages::LlmRole;
 use bailongma_core::runtime::{init as runtime_init, run_user_turn, RuntimeState, TurnRequest};
-use bailongma_core::tools::{all_tool_schemas, NativeToolExecutor, SendMessageFn};
+use bailongma_core::tools::{
+    all_tool_schemas, NativeToolExecutor, RecallFn, SendMessageFn, TickIntervalFn,
+};
 use bailongma_core::wakeup::{due_wakeup, CoalescedWakeup};
 use crate::watchdog::{LoopSupervisor, WatchdogState};
 use serde_json::json;
@@ -215,11 +217,83 @@ impl AppRuntime {
             // 现与 HTTP POST /approval（提交到同一 global()）闭环：高危工具过 120s
             // fail-closed 审批门（交互轮/唤醒轮共用，唤醒轮无人值守时按超时拒绝）。
             .with_approval(bailongma_core::approval::global())
-            .with_send_message(send_message);
+            .with_send_message(send_message)
+            // TICK 节奏回调（对齐 Node ticker.js）：写入 config 表，spawn_wakeup_loop
+            // 每心跳消费 remaining 计数，归零后回落到 wakeup_interval_secs。
+            .with_tick_interval(self.tick_interval_callback())
+            // 记忆回忆方向回调（对齐 Node onRecall → state.prev_recall）。
+            .with_recall(self.recall_callback());
         if let Some(bin) = &self.sandbox_bin {
             executor = executor.with_sandbox(bin.clone());
         }
         executor
+    }
+
+    /// set_tick_interval 回调：`(seconds, ttl, reason)` 持久化到 config 表，
+    /// remaining 心跳数初始化为 ttl（对齐 Node ticker 的「保持 N 次成功自检」语义）。
+    fn tick_interval_callback(&self) -> TickIntervalFn {
+        let db = self.db.clone();
+        Arc::new(move |seconds, ttl, reason| {
+            let secs = seconds.clamp(1, 36_000);
+            let ttl = ttl.clamp(1, 100);
+            config_repo::set_config(&db, "tick_interval_secs", &secs.to_string())?;
+            config_repo::set_config(&db, "tick_interval_ttl", &ttl.to_string())?;
+            config_repo::set_config(&db, "tick_interval_remaining", &ttl.to_string())?;
+            config_repo::set_config(&db, "tick_interval_set_at", &now_input_ts())?;
+            config_repo::set_config(&db, "tick_interval_reason", reason)?;
+            Ok(format!(
+                "TICK 节奏已更新为 {secs}s（维持 {ttl} 次心跳），生效中"
+            ))
+        })
+    }
+
+    /// recall_memory 方向回调：`(query)` 记录到 config 表 prev_recall（对齐 Node state）。
+    fn recall_callback(&self) -> RecallFn {
+        let db = self.db.clone();
+        Arc::new(move |query: &str| {
+            config_repo::set_config(&db, "prev_recall", query)?;
+            Ok(())
+        })
+    }
+
+    /// 读取并消费 TICK 节奏（对齐 Node ticker 的 TTL 心跳语义）：
+    /// - config 有 tick_interval_secs 且 remaining>0 → 生效，remaining 递减；
+    /// - remaining 归零 / 未配置 → 清除节奏配置，回落到 base_secs。
+    fn effective_tick_interval(&self, base_secs: u64) -> u64 {
+        let Some(cur) = config_repo::get_config(&self.db, "tick_interval_secs")
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|s| (1..=36_000).contains(s))
+        else {
+            return base_secs;
+        };
+        // remaining 缺失时用 ttl 初始化（容错历史数据/中间态）
+        let rem = config_repo::get_config(&self.db, "tick_interval_remaining")
+            .ok()
+            .flatten()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                config_repo::get_config(&self.db, "tick_interval_ttl")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(1)
+            });
+        if rem == 0 {
+            // 节奏过期：清空节奏配置（写空串 → parse 失败 → 回落），回到默认节奏
+            let _ = config_repo::set_config(&self.db, "tick_interval_secs", "");
+            let _ = config_repo::set_config(&self.db, "tick_interval_ttl", "");
+            let _ = config_repo::set_config(&self.db, "tick_interval_remaining", "");
+            base_secs
+        } else {
+            let _ = config_repo::set_config(
+                &self.db,
+                "tick_interval_remaining",
+                &(rem - 1).to_string(),
+            );
+            cur
+        }
     }
 
     /// serve / desktop 入口：落库用户消息 → 异步跑意识闭环（不阻塞 HTTP 响应）。
@@ -818,6 +892,15 @@ impl AppRuntime {
                     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
                     loop {
                         interval.tick().await;
+                        // TICK 节奏（set_tick_interval）：每心跳消费一次，有效期内按
+                        // 动态间隔重建 interval；TTL 归零自动回落到 wakeup_interval_secs。
+                        let eff = runtime.effective_tick_interval(interval_secs);
+                        if eff != interval.period().as_secs() {
+                            interval = tokio::time::interval_at(
+                                tokio::time::Instant::now() + Duration::from_secs(eff),
+                                Duration::from_secs(eff),
+                            );
+                        }
                         wstate.beat();
                         let now = now_input_ts();
                         // 审计 A2：上一批提醒仍在交付中 → 跳过本轮（串行化防重复唤醒）。
@@ -877,6 +960,7 @@ mod tests {
     use super::*;
     use bailongma_core::db::open_database;
     use bailongma_core::llm::metrics::MetricEvent;
+    use bailongma_core::llm::tool_loop::ToolExecutor;
 
     fn test_runtime() -> AppRuntime {
         // app crate 无 tempfile dev-dep：用系统临时目录 + pid + 原子序号 + 时间戳隔离。
@@ -1166,5 +1250,99 @@ mod tests {
         assert_eq!(attribution, "created");
         assert_eq!(is_tick, 0, "交互轮 is_tick=0");
         assert_eq!(sections_hit, Some(stats.sections_hit as i64));
+    }
+
+    // ── set_tick_interval / recall_memory 接线（对齐 Node ticker.js / onRecall）──
+    // 注意：assemble 内 metrics::init 需要 tokio reactor → 一律用 #[tokio::test]。
+
+    #[tokio::test]
+    async fn set_tick_interval_writes_config_and_consumes_heartbeats() {
+        let runtime = test_runtime();
+        let ex = runtime.build_executor();
+        // 工具调用 → config 持久化（回调已接线）
+        let r = ex
+            .execute("set_tick_interval", &json!({ "seconds": 5, "ttl": 3, "reason": "任务冲刺" }))
+            .unwrap();
+        assert!(r.contains("5s"), "回调应返回节奏确认: {r}");
+        assert_eq!(
+            config_repo::get_config(&runtime.db, "tick_interval_secs")
+                .unwrap()
+                .as_deref(),
+            Some("5")
+        );
+        // 心跳消费：ttl=3 期间生效，之后回落
+        assert_eq!(runtime.effective_tick_interval(60), 5);
+        assert_eq!(runtime.effective_tick_interval(60), 5);
+        assert_eq!(runtime.effective_tick_interval(60), 5);
+        assert_eq!(runtime.effective_tick_interval(60), 60, "TTL 归零后回落默认节奏");
+        // 回落后再无节奏配置
+        assert!(
+            config_repo::get_config(&runtime.db, "tick_interval_secs")
+                .unwrap()
+                .is_none_or(|s| s.is_empty()),
+            "节奏过期后配置应清空"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_tick_interval_unwired_when_no_db() {
+        // core 层未接线回调时返回明确错误（sys_tools 单测已覆盖 core 语义）
+        let runtime = test_runtime();
+        let ex = NativeToolExecutor::new(runtime.tool_root.clone());
+        let r = ex.execute("set_tick_interval", &json!({ "seconds": 5, "ttl": 3 }));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("未接线"));
+    }
+
+    #[tokio::test]
+    async fn recall_memory_records_direction() {
+        let runtime = test_runtime();
+        let ex = runtime.build_executor();
+        bailongma_core::db::repositories::memories::insert_simple(
+            &runtime.db,
+            "fact",
+            "用户喜欢冷萃咖啡",
+        )
+        .unwrap();
+        let r = ex
+            .execute("recall_memory", &json!({ "query": "咖啡" }))
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["count"], 1, "{v}");
+        assert_eq!(
+            config_repo::get_config(&runtime.db, "prev_recall")
+                .unwrap()
+                .as_deref(),
+            Some("咖啡"),
+            "recall 方向应记录到 config（对齐 Node state.prev_recall）"
+        );
+    }
+
+    #[tokio::test]
+    async fn wakeup_loop_consumes_tick_interval_without_dying() {
+        // set_tick_interval(2s) 后 wakeup 循环按 2s 节奏重建 interval 且不崩溃：
+        // 提醒只触发一次广播（首拍），随后靠 watchdog 心跳新鲜度验证循环存活。
+        let runtime = test_runtime();
+        insert_due_reminder(&runtime.db, "2026-08-11T08:00:00+08:00", "节奏测试");
+        let mut rx = runtime.bus.subscribe();
+        let ex = runtime.build_executor();
+        let _ = ex
+            .execute("set_tick_interval", &json!({ "seconds": 2, "ttl": 2 }))
+            .unwrap();
+
+        let _handle = runtime.spawn_wakeup_loop();
+        // 首拍立即触发（tokio interval 首 tick 即回）→ 广播
+        let _ = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("首拍应广播");
+        // 2.5s 内应至少再有 1 次心跳（2s 节奏：t≈2 心跳），循环未死、未重启
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            runtime.wakeup_watchdog.heartbeat_age() < Duration::from_secs(2),
+            "2s 节奏下 2.5s 时应已有新心跳"
+        );
+        assert_eq!(runtime.wakeup_watchdog.restart_count(), 0);
+        // TTL=2 已消费完 → 下一拍回落 1s 测试默认节奏
+        assert_eq!(runtime.effective_tick_interval(1), 1, "TTL 归零后应回落默认节奏");
     }
 }

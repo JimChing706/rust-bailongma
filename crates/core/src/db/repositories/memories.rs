@@ -524,6 +524,54 @@ pub fn search_by_embedding(db: &Db, query: &[f32], limit: u32) -> Result<Vec<Sco
     Ok(scored)
 }
 
+/// 更新记忆 salience（对齐 `downgrade_memory` / recognizer 更新路径）。
+/// 返回是否命中行。范围校验（1..=5）由工具层负责。
+pub fn update_salience(db: &Db, mem_id: &str, new_salience: i64) -> Result<bool> {
+    if mem_id.trim().is_empty() {
+        return Err(crate::error::CoreError::InvalidInput(
+            "update_salience 需要 mem_id".into(),
+        ));
+    }
+    let conn = db.conn();
+    let n = conn.execute(
+        "UPDATE memories SET salience = ?1 WHERE mem_id = ?2",
+        params![new_salience, mem_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// 合并后更新 keep 记忆（对齐 `merge_memories` 语义）：
+/// content/detail/title/salience 取合并值；entities 做 union 合并。
+/// 返回是否命中行。
+pub fn merge_update(
+    db: &Db,
+    keep_mem_id: &str,
+    merged_content: &str,
+    merged_detail: Option<&str>,
+    merged_entities: &[String],
+    merged_salience: i64,
+) -> Result<bool> {
+    if keep_mem_id.trim().is_empty() {
+        return Err(crate::error::CoreError::InvalidInput(
+            "merge_update 需要 keep_mem_id".into(),
+        ));
+    }
+    let detail = merged_detail
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| merged_content.to_string());
+    let entities_json = serde_json::to_string(merged_entities).unwrap_or_else(|_| "[]".into());
+    let conn = db.conn();
+    let n = conn.execute(
+        r#"
+        UPDATE memories SET
+          content = ?1, detail = ?2, entities = ?3, salience = ?4, timestamp = ?5
+        WHERE mem_id = ?6
+        "#,
+        params![merged_content, detail, entities_json, merged_salience, now_iso(), keep_mem_id],
+    )?;
+    Ok(n > 0)
+}
+
 /// 余弦相似度（f32，NaN/Inf 归 0）。
 fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
     let mut dot = 0.0f32;
