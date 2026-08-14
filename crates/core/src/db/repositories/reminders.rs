@@ -68,6 +68,25 @@ pub fn mark_fired(db: &Db, ids: &[i64], now: &str) -> Result<u64> {
     Ok(n as u64)
 }
 
+/// 创建一条提醒（status='pending'）。`due_at` 由调用方保证为可解析的 ISO 8601
+/// （工具层 `set_reminder` 已归一为 UTC RFC3339；`source` 标识创建来源）。
+/// 返回新行 id。
+pub fn insert_reminder(
+    db: &Db,
+    user_id: &str,
+    due_at: &str,
+    task: &str,
+    source: &str,
+) -> Result<i64> {
+    let conn = db.conn();
+    conn.execute(
+        "INSERT INTO reminders (user_id, due_at, task, system_message, status, source)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+        rusqlite::params![user_id, due_at, task, format!("sys:{task}"), source],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

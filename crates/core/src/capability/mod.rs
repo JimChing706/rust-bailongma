@@ -301,6 +301,16 @@ const BUILTIN: &[ToolCapability] = &[
         output_policy: OutputPolicy::Passthrough,
         requires_approval: false,
     },
+    ToolCapability {
+        name: "set_reminder",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::MemoryWrite],
+        scopes: &[Scope::Schedule],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
 
     ToolCapability {
         name: "matter_create",
@@ -432,7 +442,7 @@ mod tests {
         }
         // 纯查询 / 沙箱内读写 / 对外发送（Medium 可控，文档既定）→ Trusted
         for n in ["get_timestamp", "read_file", "write_file", "list_dir", "make_dir",
-                  "search_memory", "collect_agents", "remind", "send_message",
+                  "search_memory", "collect_agents", "remind", "set_reminder", "send_message",
                   "matter_create", "matter_query"] {
             assert_eq!(trust_tier(n), TrustTier::Trusted, "{n}");
         }

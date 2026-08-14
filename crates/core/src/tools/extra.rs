@@ -1,10 +1,12 @@
-//! 计划对齐补充工具：`collect_agents`（known_agents 表）与 `remind`（reminders 表）。
+//! 计划对齐补充工具：`collect_agents`（known_agents 表）、`remind`（reminders 表）
+//! 与 `set_reminder`（创建提醒，收尾 A 级「生产无提醒写入方」缺口）。
 //!
 //! 背景：bailongma-multiagent-enhancement 计划的 9 工具清单为
 //! get_timestamp / read_file / write_file / list_dir / exec_command /
 //! search_memory / send_message / collect_agents / remind；R2 首版以
-//! make_dir / delete_file 补足了文件类，本模块补齐剩余两个（执行端读
-//! `known_agents` / `reminders` 表，同步、可测）。
+//! make_dir / delete_file 补足了文件类，本模块补齐其余两个（执行端读
+//! `known_agents` / `reminders` 表，同步、可测）；审计 A 级遗留再补
+//! `set_reminder` 打通提醒创建路径（LLM → reminders 表 pending → wakeup 到点投递）。
 //!
 //! 接线门与 search_memory / send_message 一致：无 Db 注入时返回明确错误，
 //! 由 [`super::NativeToolExecutor::is_ready`] 决定是否暴露给 LLM。
@@ -122,6 +124,66 @@ pub fn remind_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
     }
 }
 
+/// 默认用户 ID（单用户部署，与现有 remind 测试数据一致；工具层不向 LLM 开放 user_id）。
+const DEFAULT_USER_ID: &str = "ID:000001";
+/// task 长度上限（防 LLM 幻觉内容撑爆提醒表 / 触发消息）
+const MAX_TASK_LEN: usize = 500;
+
+/// set_reminder：创建一条到期提醒（写 reminders 表，status='pending'）。
+///
+/// - `due_at`：ISO 8601 到期时间（必填，任意时区；存储前归一为 UTC RFC3339，
+///   与 D1 修复后的比较语义一致——字典序即真实时间序）；
+/// - `task`：提醒内容（必填，非空，≤500 字符）；
+/// - 写入后到点由 wakeup 轮触发投递（system_message），可用 `remind` 查询。
+///
+/// 低风险落库（Medium / MemoryWrite / Schedule），与 send_message 同档不要求人工审批；
+/// 无 Db 注入时返回明确错误（由 [`super::NativeToolExecutor::is_ready`] 决定是否暴露）。
+pub fn set_reminder_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
+    let Some(db) = &ex.db else {
+        return Err(CoreError::Tool(
+            "set_reminder 未接线（未注入 Db，当前轮不可用）".into(),
+        ));
+    };
+    let raw_due = args
+        .get("due_at")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Tool("set_reminder 缺 due_at".into()))?;
+    let task = args
+        .get("task")
+        .and_then(Value::as_str)
+        .ok_or_else(|| CoreError::Tool("set_reminder 缺 task".into()))?;
+    let task = task.trim();
+    if task.is_empty() {
+        return Err(CoreError::Tool("set_reminder task 不能为空".into()));
+    }
+    if task.chars().count() > MAX_TASK_LEN {
+        return Err(CoreError::Tool(format!(
+            "set_reminder task 超长（{} 字符，上限 {MAX_TASK_LEN}）",
+            task.chars().count()
+        )));
+    }
+    // 时间归一：任意时区 ISO → UTC RFC3339（`Z` 后缀，与库内 now_iso()/D1 比较语义一致）
+    let due_utc = chrono::DateTime::parse_from_rfc3339(raw_due)
+        .map_err(|e| CoreError::Tool(format!("set_reminder due_at 非法: {e}")))?
+        .to_utc()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let id = crate::db::repositories::reminders::insert_reminder(
+        db,
+        DEFAULT_USER_ID,
+        &due_utc,
+        task,
+        "set_reminder",
+    )
+    .map_err(|e| CoreError::Tool(format!("写入提醒失败: {e}")))?;
+    Ok(json!({
+        "ok": true,
+        "id": id,
+        "due_at": due_utc,
+        "task": task,
+        "status": "pending",
+    }))
+}
+
 /// 补充工具的 OpenAI schema（由 [`super::all_tool_schemas`] 追加）。
 pub fn extra_tool_schemas() -> Vec<crate::llm::tools::ToolSchema> {
     use crate::llm::tools::{boolean_param, enum_param, integer_param, ToolSchema};
@@ -139,6 +201,12 @@ pub fn extra_tool_schemas() -> Vec<crate::llm::tools::ToolSchema> {
         .param("action", enum_param("操作", &["list"]))
         .param("limit", integer_param("返回条数，默认 10，最大 50"))
         .param("now", crate::llm::tools::string_param("当前时间 ISO 注入（测试/调试用，默认取系统时间）")),
+        ToolSchema::new(
+            "set_reminder",
+            "创建一条到期提醒（写入 reminders 表；到点后自动触发投递，可用 remind 查询）",
+        )
+        .required("due_at", crate::llm::tools::string_param("ISO 8601 到期时间（任意时区，存储归一为 UTC）"))
+        .required("task", crate::llm::tools::string_param("提醒内容（非空，≤500 字符）")),
     ]
 }
 
@@ -284,11 +352,118 @@ mod tests {
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"collect_agents"));
         assert!(names.contains(&"remind"));
+        assert!(names.contains(&"set_reminder"));
         for s in &schemas {
             let v = s.to_openai_value();
             assert_eq!(v["type"], "function");
             assert_eq!(v["function"]["name"], s.name);
             assert_eq!(v["function"]["parameters"]["type"], "object");
         }
+    }
+
+    // ── set_reminder ──
+
+    #[test]
+    fn set_reminder_requires_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = NativeToolExecutor::new(dir.path().to_path_buf());
+        let r = ex.execute("set_reminder", &json!({ "due_at": "2026-08-12T08:00:00Z", "task": "开会" }));
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("未接线"));
+        assert!(!ex.is_ready("set_reminder"));
+    }
+
+    #[test]
+    fn set_reminder_creates_pending_then_due() {
+        let db = test_db();
+        let ex = executor(db);
+        assert!(ex.is_ready("set_reminder"));
+
+        // 创建未来 1 天提醒
+        let r = ex
+            .execute(
+                "set_reminder",
+                &json!({ "due_at": "2026-08-11T08:00:00+08:00", "task": "项目周报" }),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"], true, "{v}");
+        assert_eq!(v["task"], "项目周报");
+        assert_eq!(v["status"], "pending");
+        assert_eq!(v["due_at"], "2026-08-11T00:00:00Z", "{v}"); // +08:00 → UTC 归一
+        let id: i64 = v["id"].as_i64().unwrap();
+        assert!(id > 0);
+
+        // 到点前 remind 查不到
+        let r2 = ex
+            .execute("remind", &json!({ "now": "2026-08-10T23:00:00Z" }))
+            .unwrap();
+        let v2: Value = serde_json::from_str(&r2).unwrap();
+        assert_eq!(v2["count"], 0, "{v2}");
+
+        // 到点后 remind 查到且不消费（2026-08-11T09:00:00+08:00 = 01:00Z > due 00:00Z）
+        let r3 = ex
+            .execute("remind", &json!({ "now": "2026-08-11T09:00:00+08:00" }))
+            .unwrap();
+        let v3: Value = serde_json::from_str(&r3).unwrap();
+        assert_eq!(v3["count"], 1, "{v3}");
+        assert_eq!(v3["reminders"][0]["id"], id);
+        assert_eq!(v3["reminders"][0]["user_id"], "ID:000001");
+        let status: String = ex
+            .db
+            .as_ref()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT status FROM reminders WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "pending");
+        // source 标记创建来源
+        let source: String = ex
+            .db
+            .as_ref()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT source FROM reminders WHERE id = ?1",
+                rusqlite::params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source, "set_reminder");
+    }
+
+    #[test]
+    fn set_reminder_rejects_bad_input() {
+        let db = test_db();
+        let ex = executor(db);
+        // 非法时间
+        let r = ex.execute(
+            "set_reminder",
+            &json!({ "due_at": "不是日期", "task": "x" }),
+        );
+        assert!(r.is_err(), "非法时间应拒绝: {r:?}");
+        assert!(r.unwrap_err().to_string().contains("due_at 非法"));
+        // 空 task
+        let r2 = ex.execute(
+            "set_reminder",
+            &json!({ "due_at": "2026-08-12T08:00:00Z", "task": "   " }),
+        );
+        assert!(r2.is_err());
+        assert!(r2.unwrap_err().to_string().contains("不能为空"));
+        // 超长 task
+        let long = "长".repeat(MAX_TASK_LEN + 1);
+        let r3 = ex.execute(
+            "set_reminder",
+            &json!({ "due_at": "2026-08-12T08:00:00Z", "task": long }),
+        );
+        assert!(r3.is_err());
+        assert!(r3.unwrap_err().to_string().contains("超长"));
+        // schema 层：缺必填参数
+        let r4 = ex.execute("set_reminder", &json!({ "task": "x" }));
+        assert!(r4.is_err());
     }
 }

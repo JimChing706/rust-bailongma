@@ -164,8 +164,10 @@ impl NativeToolExecutor {
     /// 工具是否已接线（供上层决定是否把工具暴露给 LLM）。
     pub fn is_ready(&self, name: &str) -> bool {
         match name {
-            "search_memory" | "collect_agents" | "remind" | "matter_create" | "matter_query"
-            | "delegate_to_agent" | "grant_agent_delegation" => self.db.is_some(),
+            "search_memory" | "collect_agents" | "remind" | "set_reminder"
+            | "matter_create" | "matter_query" | "delegate_to_agent" | "grant_agent_delegation" => {
+                self.db.is_some()
+            }
             "send_message" => self.send_message.is_some(),
             _ => true,
         }
@@ -546,6 +548,7 @@ impl ToolExecutor for NativeToolExecutor {
             "send_message" => self.send_message_impl(&args),
             "collect_agents" => extra::collect_agents_impl(self, &args),
             "remind" => extra::remind_impl(self, &args),
+            "set_reminder" => extra::set_reminder_impl(self, &args),
             "matter_create" => matter_tools::matter_create_impl(self, &args),
             "matter_query" => matter_tools::matter_query_impl(self, &args),
             "delegate_to_agent" => {
@@ -898,6 +901,7 @@ mod tests {
             "send_message",
             "collect_agents",
             "remind",
+            "set_reminder",
         ] {
             assert!(names.contains(&tool), "缺少 schema: {tool}");
         }
@@ -917,6 +921,7 @@ mod tests {
         assert!(!ex.is_ready("send_message"));
         assert!(!ex.is_ready("collect_agents"));
         assert!(!ex.is_ready("remind"));
+        assert!(!ex.is_ready("set_reminder"));
         assert!(ex.is_ready("exec_command"));
         let ex2 = executor(dir.path())
             .with_db(Db::open(dir.path().join("t2.db")).unwrap())
@@ -925,6 +930,7 @@ mod tests {
         assert!(ex2.is_ready("send_message"));
         assert!(ex2.is_ready("collect_agents"));
         assert!(ex2.is_ready("remind"));
+        assert!(ex2.is_ready("set_reminder"));
     }
 
     // ── 第 1 轮审计修复的回归测试（红转绿）──
