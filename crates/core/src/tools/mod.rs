@@ -46,6 +46,7 @@ pub mod extra;
 pub mod matter_tools;
 pub mod sys_tools;
 pub mod validate;
+pub mod web_tools;
 
 // ─────────────────────────────────────────────────────────────
 // 常量
@@ -77,6 +78,32 @@ pub type TickIntervalFn = Arc<dyn Fn(u64, u64, &str) -> Result<String> + Send + 
 /// 记忆回忆方向回调（对齐 Node onRecall）：`(query) -> Result<()>`。
 pub type RecallFn = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 
+/// 联网工具密钥/端点（对齐 Node getWebSearchCredentials；None = 未配置，跳过对应引擎）。
+/// app 层从 config.json extra 合并 config 表注入。
+#[derive(Debug, Clone, Default)]
+pub struct WebKeys {
+    /// serper.dev 密钥（POST https://google.serper.dev/search）
+    pub serper_key: Option<String>,
+    /// Brave Search API 密钥（GET api.search.brave.com/res/v1/web/search）
+    pub brave_key: Option<String>,
+    /// Tavily 密钥（POST api.tavily.com/search）
+    pub tavily_key: Option<String>,
+    /// 自建 SearXNG 实例 URL（GET {base}/search?q&format=json）
+    pub searxng_url: Option<String>,
+    /// Jina Reader 密钥（r.jina.ai / s.jina.ai，可选）
+    pub jina_key: Option<String>,
+}
+
+impl WebKeys {
+    /// 是否有任一「带 key 第一梯队」引擎（无 key 兜底引擎恒可用）。
+    pub fn has_keyed_engine(&self) -> bool {
+        self.serper_key.is_some()
+            || self.brave_key.is_some()
+            || self.tavily_key.is_some()
+            || self.searxng_url.is_some()
+    }
+}
+
 /// 真实工具执行器（对齐 Node 版 capabilities/ 各工具的返回形状）。
 pub struct NativeToolExecutor {
     /// 文件操作沙箱根（绝对路径）
@@ -95,6 +122,8 @@ pub struct NativeToolExecutor {
     pub set_tick_interval: Option<TickIntervalFn>,
     /// 记忆回忆方向回调（None 时 recall_memory 仅返回结果，不记录方向）
     pub on_recall: Option<RecallFn>,
+    /// 联网工具密钥（None 时 web_search 仅用无 key 兜底引擎）
+    pub web_keys: Option<WebKeys>,
 }
 
 impl NativeToolExecutor {
@@ -108,6 +137,7 @@ impl NativeToolExecutor {
             caller_trust: CallerTrust::Agent,
             set_tick_interval: None,
             on_recall: None,
+            web_keys: None,
         }
     }
 
@@ -128,6 +158,11 @@ impl NativeToolExecutor {
 
     pub fn with_recall(mut self, cb: RecallFn) -> Self {
         self.on_recall = Some(cb);
+        self
+    }
+
+    pub fn with_web_keys(mut self, keys: WebKeys) -> Self {
+        self.web_keys = Some(keys);
         self
     }
 
@@ -602,6 +637,10 @@ impl ToolExecutor for NativeToolExecutor {
             "exec_quick_command" => sys_tools::exec_quick_command_impl(self, &args),
             "list_processes" => sys_tools::list_processes_impl(self, &args),
             "kill_process" => sys_tools::kill_process_impl(self, &args),
+            "web_search" => web_tools::web_search_impl(self, &args),
+            "web_read" => web_tools::web_read_impl(self, &args),
+            "fetch_url" => web_tools::fetch_url_impl(self, &args),
+            "download_file" => web_tools::download_file_impl(self, &args),
             "delegate_to_agent" => {
                 let Some(db) = &self.db else {
                     return Err(CoreError::Tool(
@@ -674,6 +713,7 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
     tools.extend(extra::extra_tool_schemas());
     tools.extend(matter_tools::matter_tool_schemas());
     tools.extend(sys_tools::sys_tool_schemas());
+    tools.extend(web_tools::web_tool_schemas());
     tools.push(delegate_to_agent_schema());
     tools.push(grant_agent_delegation_schema());
     tools

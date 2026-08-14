@@ -536,6 +536,51 @@ const BUILTIN: &[ToolCapability] = &[
         output_policy: OutputPolicy::Passthrough,
         requires_approval: true,
     },
+
+    // ── 第二批 web_tools（对齐 Node：TOOL_RISK 为 high 仅为审计/成本考量，
+    //    不在 AUTONOMOUS_USER_AUTH_REQUIRED 集合 → 自主可执行、无需人工确认；
+    //    故用 Medium 而非 High（Rust 的 High 会自动触发 needs_approval））──
+
+    ToolCapability {
+        name: "web_search",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::Network],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "web_read",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::Network],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "fetch_url",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::Network],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "download_file",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::Network, SideEffect::Write],
+        scopes: &[Scope::Network, Scope::Files],
+        allowed_paths: None,
+        deny_paths: SENSITIVE_DENY,
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
 ];
 
 /// 工具信任分层（P2-2）：由能力声明推导，供 PolicyEngine 分层放行。
@@ -627,7 +672,8 @@ mod tests {
         // 纯查询 / 沙箱内读写 / 对外发送（Medium 可控，文档既定）→ Trusted
         for n in ["get_timestamp", "read_file", "write_file", "list_dir", "make_dir",
                   "search_memory", "collect_agents", "remind", "set_reminder", "send_message",
-                  "matter_create", "matter_query"] {
+                  "matter_create", "matter_query",
+                  "web_search", "web_read", "fetch_url", "download_file"] {
             assert_eq!(trust_tier(n), TrustTier::Trusted, "{n}");
         }
         // 未知工具 → Denied
@@ -660,9 +706,16 @@ mod tests {
             "get_timestamp", "read_file", "list_dir", "write_file", "make_dir",
             "delete_file", "exec_command", "search_memory", "send_message",
             "collect_agents", "remind", "matter_create", "matter_query",
+            "web_search", "web_read", "fetch_url", "download_file",
         ];
         for n in names {
             assert!(builtin(n).is_some(), "能力表缺工具: {n}");
+        }
+        // web 工具：Node 语义下 high 仅审计，不要求人工确认 → Medium/Trusted
+        for n in ["web_search", "web_read", "fetch_url", "download_file"] {
+            let cap = builtin(n).unwrap();
+            assert_eq!(cap.risk_level, RiskLevel::Medium, "{n}");
+            assert!(!cap.needs_approval(), "{n}");
         }
         // exec_command 必须 Critical + require approval
         let exec = builtin("exec_command").unwrap();

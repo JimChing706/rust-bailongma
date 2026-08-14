@@ -47,7 +47,7 @@ use bailongma_core::memory::injector::{ContextWindowConfig, InjectorContext};
 use bailongma_core::memory::messages::LlmRole;
 use bailongma_core::runtime::{init as runtime_init, run_user_turn, RuntimeState, TurnRequest};
 use bailongma_core::tools::{
-    all_tool_schemas, NativeToolExecutor, RecallFn, SendMessageFn, TickIntervalFn,
+    all_tool_schemas, NativeToolExecutor, RecallFn, SendMessageFn, TickIntervalFn, WebKeys,
 };
 use bailongma_core::wakeup::{due_wakeup, CoalescedWakeup};
 use crate::watchdog::{LoopSupervisor, WatchdogState};
@@ -222,7 +222,10 @@ impl AppRuntime {
             // 每心跳消费 remaining 计数，归零后回落到 wakeup_interval_secs。
             .with_tick_interval(self.tick_interval_callback())
             // 记忆回忆方向回调（对齐 Node onRecall → state.prev_recall）。
-            .with_recall(self.recall_callback());
+            .with_recall(self.recall_callback())
+            // 联网工具密钥（对齐 Node getWebSearchCredentials）：config.json 顶级
+            // 字段（flatten 进 cfg.extra）→ config 表 → 环境变量，见 [`AppRuntime::web_keys`]。
+            .with_web_keys(self.web_keys());
         if let Some(bin) = &self.sandbox_bin {
             executor = executor.with_sandbox(bin.clone());
         }
@@ -254,6 +257,44 @@ impl AppRuntime {
             config_repo::set_config(&db, "prev_recall", query)?;
             Ok(())
         })
+    }
+
+    /// 联网工具密钥装配（对齐 Node `getWebSearchCredentials`，键名与 config.json
+    /// 顶级字段一致：`serper_api_key` / `brave_api_key` / `tavily_api_key` /
+    /// `searxng_url` / `jina_api_key`）。优先级：config.json（flatten 进 `cfg.extra`）
+    /// → config 表 → 环境变量；空串视为未配置（跳过对应引擎）。
+    fn web_keys(&self) -> WebKeys {
+        WebKeys {
+            serper_key: self.web_secret("serper_api_key", "SERPER_API_KEY"),
+            brave_key: self.web_secret("brave_api_key", "BRAVE_API_KEY"),
+            tavily_key: self.web_secret("tavily_api_key", "TAVILY_API_KEY"),
+            searxng_url: self.web_secret("searxng_url", "SEARXNG_URL"),
+            jina_key: self.web_secret("jina_api_key", "JINA_API_KEY"),
+        }
+    }
+
+    /// 单个密钥取值：`cfg.extra` → config 表 → 环境变量，trim 后非空才返回。
+    fn web_secret(&self, cfg_key: &str, env_key: &str) -> Option<String> {
+        let pick = |v: &str| {
+            let t = v.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        if let Some(v) = self.cfg.extra.get(cfg_key).and_then(|v| v.as_str()) {
+            if let Some(v) = pick(v) {
+                return Some(v);
+            }
+        }
+        if let Ok(Some(v)) = config_repo::get_config(&self.db, cfg_key) {
+            if let Some(v) = pick(&v) {
+                return Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var(env_key) {
+            if let Some(v) = pick(&v) {
+                return Some(v);
+            }
+        }
+        None
     }
 
     /// 读取并消费 TICK 节奏（对齐 Node ticker 的 TTL 心跳语义）：
