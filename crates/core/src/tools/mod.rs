@@ -124,6 +124,9 @@ pub struct NativeToolExecutor {
     pub on_recall: Option<RecallFn>,
     /// 联网工具密钥（None 时 web_search 仅用无 key 兜底引擎）
     pub web_keys: Option<WebKeys>,
+    /// SSRF 防护开关：true 时允许访问本机/私网（对齐 Node config.network.allowLanAccess；
+    /// false 时 web_read / fetch_url / download_file 拒绝 localhost、私网与云元数据地址）
+    pub allow_lan_access: bool,
 }
 
 impl NativeToolExecutor {
@@ -138,6 +141,7 @@ impl NativeToolExecutor {
             set_tick_interval: None,
             on_recall: None,
             web_keys: None,
+            allow_lan_access: false,
         }
     }
 
@@ -163,6 +167,12 @@ impl NativeToolExecutor {
 
     pub fn with_web_keys(mut self, keys: WebKeys) -> Self {
         self.web_keys = Some(keys);
+        self
+    }
+
+    /// SSRF 防护开关（默认 false = 拒绝本机/私网/云元数据地址）。
+    pub fn with_allow_lan_access(mut self, allow: bool) -> Self {
+        self.allow_lan_access = allow;
         self
     }
 

@@ -225,7 +225,10 @@ impl AppRuntime {
             .with_recall(self.recall_callback())
             // 联网工具密钥（对齐 Node getWebSearchCredentials）：config.json 顶级
             // 字段（flatten 进 cfg.extra）→ config 表 → 环境变量，见 [`AppRuntime::web_keys`]。
-            .with_web_keys(self.web_keys());
+            .with_web_keys(self.web_keys())
+            // SSRF 防护（对齐 Node config.network.allowLanAccess）：默认拒绝本机/私网/
+            // 云元数据地址；用户显式开启局域网访问时才放行。
+            .with_allow_lan_access(self.cfg.network.allow_lan_access);
         if let Some(bin) = &self.sandbox_bin {
             executor = executor.with_sandbox(bin.clone());
         }

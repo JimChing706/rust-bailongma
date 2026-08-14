@@ -9,6 +9,11 @@
 //!
 //! 同步 executor 内通过模块级 [`RT`]（current_thread tokio runtime）跑 async reqwest，
 //! 与 Node 的 fetch 行为对齐（UA/头、重定向、内容类型过滤、低价值页面检测）。
+//!
+//! SSRF 防护（对齐 Node `assertBrowserUrlAllowed`）：web_read / fetch_url / download_file
+//! 请求前与每次重定向都校验目标 URL——拒绝非 http/https 协议、带凭据 URL、localhost 与
+//! 私网/本机/云元数据地址（169.254.169.254 等），域名则解析后检查防 DNS rebinding；
+//! `allow_lan_access=true`（对齐 Node config.network.allowLanAccess）时放行本机/私网。
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -81,7 +86,8 @@ fn block_on<F: Future>(fut: F) -> F::Output {
     RT.block_on(fut)
 }
 
-/// 共享 HTTP client（浏览器头 + 连接超时 + 有限重定向）。
+/// 共享 HTTP client（浏览器头 + 连接超时 + 有限重定向），供不校验用户 URL 的
+/// 爬虫/搜索请求使用（URL 均为代码内构造的公网地址）。
 static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
         .user_agent(WEB_USER_AGENT)
@@ -91,6 +97,35 @@ static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .build()
         .expect("failed to build web http client")
 });
+
+/// 构建带 SSRF 重定向策略的 client（公共配置与 [`HTTP`] 一致）。
+/// reqwest 0.12 移除了 `RequestBuilder::redirect`，重定向策略只能在
+/// client 构建时注入，故按 `allow_lan` 固定两个实例。
+fn http_client(allow_lan: bool) -> &'static reqwest::Client {
+    static HTTP_SAFE: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .user_agent(WEB_USER_AGENT)
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(30))
+            .redirect(redirect_policy(false))
+            .build()
+            .expect("failed to build ssrf-safe http client")
+    });
+    static HTTP_LAN: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .user_agent(WEB_USER_AGENT)
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(30))
+            .redirect(redirect_policy(true))
+            .build()
+            .expect("failed to build lan-allowed http client")
+    });
+    if allow_lan {
+        &HTTP_LAN
+    } else {
+        &HTTP_SAFE
+    }
+}
 
 // ─────────────────────────────────────────────────────────────
 // 缓存（模块级 static，进程内共享；对齐 Node Map LRU）
@@ -395,7 +430,8 @@ pub fn web_read_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
     let mut failures: Vec<Value> = Vec::new();
 
     // 策略一：受保护直连 HTTP
-    let direct = block_on(fetch_via_direct(&url, timeout_ms, is_likely_api_url(&url)));
+    let allow_lan = ex.allow_lan_access;
+    let direct = block_on(fetch_via_direct(&url, timeout_ms, is_likely_api_url(&url), allow_lan));
     if direct.ok {
         let outcome = ReadOutcome {
             url: &url,
@@ -464,7 +500,7 @@ pub fn web_read_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
 }
 
 /// `fetch_url(url, timeout_ms?)`：抓取 URL 原始响应（status/headers/body 原文）。
-pub fn fetch_url_impl(_ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
+pub fn fetch_url_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
     let raw_url = args
         .get("url")
         .and_then(Value::as_str)
@@ -477,9 +513,14 @@ pub fn fetch_url_impl(_ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
         .and_then(Value::as_u64)
         .unwrap_or(FETCH_URL_TIMEOUT_MS)
         .clamp(1_000, MAX_TIMEOUT_MS);
+    let allow_lan = ex.allow_lan_access;
 
     block_on(async move {
-        let resp = HTTP
+        // SSRF 防护：请求前校验 + 每跳重定向校验
+        let parsed = reqwest::Url::parse(&url)
+            .map_err(|e| CoreError::Tool(format!("URL 无效: {e}")))?;
+        check_url_ssrf(&parsed, allow_lan).map_err(CoreError::Tool)?;
+        let resp = http_client(allow_lan)
             .get(&url)
             .timeout(Duration::from_millis(timeout_ms))
             .send()
@@ -551,9 +592,14 @@ pub fn download_file_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value
     ));
     let temp_for_io = temp_path.clone();
     let started = Instant::now();
+    let allow_lan = ex.allow_lan_access;
 
     let result = block_on(async move {
-        let resp = HTTP
+        // SSRF 防护：请求前校验 + 每跳重定向校验
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| format!("URL 无效: {e}"))?;
+        check_url_ssrf(&parsed, allow_lan)?;
+        let resp = http_client(allow_lan)
             .get(url)
             .timeout(Duration::from_secs(timeout_sec))
             .send()
@@ -900,8 +946,29 @@ async fn fetch_via_direct(
     url: &str,
     timeout_ms: u64,
     expect_json: bool,
+    allow_lan: bool,
 ) -> DirectResult {
-    let resp = match HTTP
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(p) => p,
+        Err(e) => {
+            return DirectResult {
+                ok: false, status: None, content_type: None,
+                title: String::new(), body: String::new(), is_json: false,
+                final_url: url.to_string(), code: Some("SSRF".into()),
+                error: Some(format!("URL 无效: {e}")), low_value: false,
+            };
+        }
+    };
+    // SSRF 防护：请求前校验目标 URL（协议/凭据/本机/私网/云元数据，防 DNS rebinding）
+    if let Err(e) = check_url_ssrf(&parsed, allow_lan) {
+        return DirectResult {
+            ok: false, status: None, content_type: None,
+            title: String::new(), body: String::new(), is_json: false,
+            final_url: url.to_string(), code: Some("SSRF".into()),
+            error: Some(e), low_value: false,
+        };
+    }
+    let resp = match http_client(allow_lan)
         .get(url)
         .header(
             "Accept",
@@ -1174,6 +1241,96 @@ fn normalize_url(raw: &str) -> String {
     } else {
         format!("https://{v}")
     }
+}
+
+/// SSRF 防护：IPv4/IPv6 私网判定（对齐 Node `isPrivateAddress`）。
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 10
+                || o[0] == 127
+                || o[0] == 0
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 172 && o[1] >= 16 && o[1] <= 31)
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 100 && o[1] >= 64 && o[1] <= 127)
+                || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+                || o[0] >= 224
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            // v4-mapped 地址（::ffff:a.b.c.d）递归判定
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_private_ip(std::net::IpAddr::V4(mapped));
+            }
+            let segs = v6.segments();
+            // fc00::/7 unique-local、fe80::/10 link-local、ff00::/8 multicast
+            (segs[0] & 0xfe00) == 0xfc00
+                || (segs[0] & 0xffc0) == 0xfe80
+                || (segs[0] & 0xff00) == 0xff00
+        }
+    }
+}
+
+/// SSRF 防护：URL 校验（协议/凭据/主机名/IP 字面量/域名解析），对齐 Node
+/// `assertBrowserUrlAllowed`。`allow_lan=true` 时放行本机/私网地址。
+/// 注意：域名解析用同步 std `ToSocketAddrs`（重定向策略回调与请求前均同步调用，
+/// 仅在直连工具里使用，频率低可接受阻塞）。
+/// 返回 `std::result::Result` 以避免与 crate 的 `Result<T, CoreError>` 别名冲突。
+fn check_url_ssrf(url: &reqwest::Url, allow_lan: bool) -> std::result::Result<(), String> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!("仅支持 http/https 协议: {url}"));
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL 含凭据（username/password），已拒绝".into());
+    }
+    if allow_lan {
+        return Ok(());
+    }
+    let host = url
+        .host_str()
+        .unwrap_or("")
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_lowercase();
+    if host.is_empty() {
+        return Err("URL 无有效主机名".into());
+    }
+    if host == "localhost" || host.ends_with(".localhost") {
+        return Err(format!("禁止访问本机/私网地址: {host}"));
+    }
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_private_ip(ip) {
+            return Err(format!("禁止访问本机/私网地址: {host}"));
+        }
+        return Ok(());
+    }
+    // 域名：解析后任一地址为私网 → 拒绝（防 DNS rebinding）
+    let addrs = std::net::ToSocketAddrs::to_socket_addrs(&(host.as_str(), 80))
+        .map_err(|e| format!("域名解析失败: {host} ({e})"))?;
+    let mut any = false;
+    for sa in addrs {
+        any = true;
+        if is_private_ip(sa.ip()) {
+            return Err(format!("域名 {host} 解析到本机/私网地址: {}", sa.ip()));
+        }
+    }
+    if !any {
+        return Err(format!("域名 {host} 无解析结果"));
+    }
+    Ok(())
+}
+
+/// SSRF 防护：reqwest 重定向策略——每跳重定向都过 [`check_url_ssrf`]；
+/// 被拒目标通过 `Attempt::error` 使整个请求失败（对齐 Node 的 redirect 检查中止）。
+fn redirect_policy(allow_lan: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| match check_url_ssrf(attempt.url(), allow_lan) {
+        Ok(()) => attempt.follow(),
+        Err(e) => attempt.error(format!("SSRF 拒绝重定向目标: {e}")),
+    })
 }
 
 fn has_cjk(s: &str) -> bool {
@@ -1463,12 +1620,24 @@ mod tests {
     use std::thread;
 
     fn test_executor(root: &Path) -> NativeToolExecutor {
-        NativeToolExecutor::new(root.to_path_buf())
+        // 本地 mock server 均在 127.0.0.1：放行私网以测试直连抓取路径；
+        // SSRF 拦截行为由 ssrf_* 测试用默认（allow_lan=false）executor 覆盖。
+        NativeToolExecutor::new(root.to_path_buf()).with_allow_lan_access(true)
     }
 
     /// 起一个一次性 mock HTTP server，返回基础 URL。
     fn mock_server(
         handler: impl Fn(&str) -> (u16, &'static str, Vec<u8>) + Send + 'static,
+    ) -> String {
+        mock_server_with_headers(move |req| {
+            let (status, ctype, body) = handler(req);
+            (status, ctype, body, Vec::new())
+        })
+    }
+
+    /// 支持自定义响应头的 mock server（重定向测试用）。
+    fn mock_server_with_headers(
+        handler: impl Fn(&str) -> (u16, &'static str, Vec<u8>, Vec<(&'static str, &'static str)>) + Send + 'static,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1477,18 +1646,26 @@ mod tests {
                 let mut buf = vec![0u8; 65536];
                 let _ = stream.read(&mut buf);
                 let req = String::from_utf8_lossy(&buf).to_string();
-                let (status, ctype, body) = handler(&req);
+                let (status, ctype, body, headers) = handler(&req);
                 let reason = match status {
                     200 => "OK",
+                    301 => "Moved Permanently",
+                    302 => "Found",
+                    307 => "Temporary Redirect",
+                    308 => "Permanent Redirect",
                     404 => "Not Found",
                     403 => "Forbidden",
                     503 => "Service Unavailable",
                     _ => "Custom",
                 };
-                let head = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                let mut head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
                     body.len()
                 );
+                for (k, v) in headers {
+                    head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                head.push_str("Connection: close\r\n\r\n");
                 let _ = stream.write_all(head.as_bytes());
                 let _ = stream.write_all(&body);
                 let _ = stream.flush();
@@ -1797,5 +1974,106 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(1023), "1023 B");
         assert!(format_bytes(2048).starts_with("2.0 KB"));
+    }
+
+    #[test]
+    fn ssrf_private_ip_table_matches_node() {
+        use std::net::IpAddr;
+        for (ip, expect_private) in [
+            ("10.0.0.5", true),
+            ("127.0.0.1", true),
+            ("0.0.0.0", true),
+            ("169.254.169.254", true),
+            ("172.16.0.1", true),
+            ("172.31.255.255", true),
+            ("172.32.0.1", false),
+            ("192.168.1.10", true),
+            ("100.64.0.1", true),
+            ("100.127.255.255", true),
+            ("100.128.0.1", false),
+            ("198.18.0.1", true),
+            ("198.19.255.255", true),
+            ("223.255.255.255", false),
+            ("224.0.0.1", true),
+            ("8.8.8.8", false),
+            ("::1", true),
+            ("::", true),
+            ("fc00::1", true),
+            ("fd12:3456::1", true),
+            ("fe80::1", true),
+            ("2001:4860:4860::8888", false),
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:169.254.169.254", true),
+            ("::ffff:8.8.8.8", false),
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert_eq!(is_private_ip(ip), expect_private, "ip={ip}");
+        }
+    }
+
+    #[test]
+    fn ssrf_rejects_private_and_metadata_urls() {
+        let dir = tempfile::tempdir().unwrap();
+        // 默认 allow_lan=false：本机/私网/云元数据/带凭据 URL 一律拒绝
+        let ex = NativeToolExecutor::new(dir.path().to_path_buf());
+        for u in [
+            "http://127.0.0.1:8080/status",
+            "http://localhost:3000/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://192.168.1.10:8000/api",
+            "http://10.0.0.5/",
+            "http://user:pass@example.com/",
+            "file:///etc/passwd",
+        ] {
+            let r = ex.execute("fetch_url", &json!({ "url": u }));
+            assert!(r.is_err(), "url={u} 应被 SSRF 拒绝");
+        }
+        // download_file 同样拒绝私网
+        let r = ex.execute(
+            "download_file",
+            &json!({ "url": "http://127.0.0.1:1/x", "output_path": "x" }),
+        );
+        assert!(r.is_err());
+        // web_read 直连同样拒绝（fetch_via_direct SSRF 前置）：失败折叠进 JSON
+        let r = ex
+            .execute(
+                "web_read",
+                &json!({ "url": "http://169.254.169.254/latest/meta-data/", "render": "http" }),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["ok"].as_bool(), Some(false), "r={r}");
+        let fails = v["failures"].as_array().unwrap();
+        assert!(
+            fails.iter().any(|f| f["code"].as_str() == Some("SSRF")),
+            "r={r}"
+        );
+    }
+
+    #[test]
+    fn ssrf_redirect_to_private_is_rejected() {
+        // redirect_policy 与首跳校验共用 check_url_ssrf：直接验证判定函数
+        let evil = reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+        assert!(check_url_ssrf(&evil, false).is_err());
+        assert!(check_url_ssrf(&evil, true).is_ok(), "allow_lan=true 放行");
+        let ftp = reqwest::Url::parse("ftp://example.com/x").unwrap();
+        assert!(check_url_ssrf(&ftp, true).is_err(), "非 http/https 协议拒绝");
+        let cred = reqwest::Url::parse("http://u:p@example.com/").unwrap();
+        assert!(check_url_ssrf(&cred, true).is_err(), "凭据 URL 拒绝");
+
+        // 端到端：mock server 首跳即私网（127.0.0.1）→ no-lan executor 请求前拒绝
+        let url = mock_server_with_headers(|_req| {
+            (302, "text/html", Vec::new(), vec![("Location", "http://169.254.169.254/")])
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let ex = NativeToolExecutor::new(dir.path().to_path_buf()); // allow_lan=false
+        let e = ex
+            .execute("fetch_url", &json!({ "url": url }))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("SSRF") || e.contains("禁止") || e.contains("拒绝"),
+            "e={e}"
+        );
     }
 }
