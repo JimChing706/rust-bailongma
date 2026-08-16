@@ -27,6 +27,8 @@ use crate::error::Result;
 
 pub const CACHE_TTL_MS: u64 = 30 * 60 * 1000; // 30 分钟（对齐 Node CACHE_TTL_MS）
 const FETCH_TIMEOUT_MS: u64 = 6000;
+/// L4（审计修复）：天气缓存条数上限，防不同城市/配置变更导致无界增长。
+const WEATHER_CACHE_MAX: usize = 64;
 
 /// 天气注入触发关键词（对齐 capability-registry.js `WEATHER_KEYWORD_RE`）。
 fn weather_keyword_re() -> &'static Regex {
@@ -268,6 +270,16 @@ async fn fetch_and_cache_weather(location: &str) -> Option<WeatherData> {
                         fetched_at: Instant::now(),
                     },
                 );
+                // L4（审计修复）：超限先淘汰过期项，仍超限则清空（城市数有限，代价可接受）。
+                if guard.len() > WEATHER_CACHE_MAX {
+                    let now = Instant::now();
+                    guard.retain(|_, e| {
+                        now.duration_since(e.fetched_at).as_millis() < CACHE_TTL_MS as u128
+                    });
+                    if guard.len() > WEATHER_CACHE_MAX {
+                        guard.clear();
+                    }
+                }
             }
             Some(data)
         }

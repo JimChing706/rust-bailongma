@@ -114,11 +114,14 @@ fn start_of_day(now: DateTime<Local>) -> DateTime<FixedOffset> {
     let date: NaiveDate = now.date_naive();
     let midnight = date.and_hms_opt(0, 0, 0).expect("midnight is always valid");
     let offset = *now.offset();
-    Local
+    // L3（审计修复）：DST 春季跳变使 00:00 不存在、秋季回拨使午夜歧义时，single() 返回 None
+    // 会 panic。用 earliest/latest 回落取任一有效映射；均无映射（极罕见）则按 naive midnight 兜底。
+    let local_midnight = Local
         .from_local_datetime(&midnight)
-        .single()
-        .expect("local midnight exists")
-        .with_timezone(&offset)
+        .earliest()
+        .or_else(|| Local.from_local_datetime(&midnight).latest())
+        .unwrap_or_else(|| midnight.and_utc().with_timezone(&Local));
+    local_midnight.with_timezone(&offset)
 }
 
 #[cfg(test)]

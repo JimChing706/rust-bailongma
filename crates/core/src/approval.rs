@@ -13,8 +13,9 @@
 //! - **场景广播解耦**：`on_request` 回调由 API 层注入（server.rs 桥接 SceneStore），
 //!   本模块不依赖 scene。
 //! - **全局单例**：进程级 `global()`（可变槽：未初始化时 fail-closed 隔离门 +
-//!   告警，init_global 总是覆盖替换，生产顺序无关），执行器与 HTTP 处理器共享；
-//!   实例 API 保留给单元测试独立构造。
+//!   告警，init_global 总是覆盖替换）。注意 `set_global_on_request` 须在 `init_global`
+//!   之后调用，否则回调会被后续 init_global 覆盖丢失（当前生产装配顺序已保证）；
+//!   执行器与 HTTP 处理器共享，实例 API 保留给单元测试独立构造。
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

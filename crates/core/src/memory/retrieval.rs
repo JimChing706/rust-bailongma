@@ -37,8 +37,10 @@ pub struct ParsedMessage {
 
 pub fn parse_message_input(message: &str) -> ParsedMessage {
     let trimmed = message.trim();
-    if regex::Regex::new(r"^TICK\s")
-        .expect("static regex")
+    // L7（审计修复）：TICK 前缀正则每次调用重编译，热路径上每轮一次；改 OnceLock 编译一次。
+    static TICK_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    if TICK_RE
+        .get_or_init(|| regex::Regex::new(r"^TICK\s").expect("static regex"))
         .is_match(trimmed)
     {
         return ParsedMessage {

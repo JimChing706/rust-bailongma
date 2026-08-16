@@ -13,10 +13,10 @@ use tracing::info;
 
 use crate::error::Result;
 
-/// 业务表清单（不含 sqlite_sequence 与 memories_fts 的 4 张内部影子表）。
-/// 与 Node 版 schema.js 最终状态一致：24 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 29；
-/// M1 新增 3 张 LLM 指标表 → 27 张业务表 + 4 张 FTS 内部表 + sqlite_sequence = 32；
-/// P1 新增 turn_state（显式 Turn 状态机）→ 30 张业务表；事项账本 matters/matter_events → 32 张。
+/// 业务表清单（含 memories_fts 虚拟表；不含 sqlite_sequence 与 memories_fts 的 4 张影子表）。
+/// 共 32 张：Node 版原有表 + M1 观测三表（llm_calls/llm_tool_calls/llm_metrics_daily）
+/// + M3 观测两表（llm_context_sections/llm_turns）+ P1 turn_state + 事项账本 matters/matter_events。
+/// 加上 memories_fts 4 张影子表与 sqlite_sequence，打开后的库共 37 张表。
 pub const BUSINESS_TABLES: &[&str] = &[
     "conversations",
     "memories",
