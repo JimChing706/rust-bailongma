@@ -872,13 +872,15 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     // ── H8（审计修复）：llm_tool_calls 唯一键纳入 args_json 维度 ──
     migrate_llm_tool_calls_unique_args(conn)?;
 
-    // ── L17（审计修复，波 1）：时间戳 offset → UTC Z 归一 ──
-    migrate_timestamps_v1(conn)?;
-
     // ── 重建 FTS 索引（覆盖已有历史数据；对老库是幂等全量重建） ──
     // D3（审计修复）：不再每次启动无条件全量 rebuild——大库启动慢（分钟级）且磨损磁盘。
     // 用 config flag 标记重建版本：仅在首次（新库/老库首次升级）重建一次，
     // 之后由 memories_ai/ad/au 三触发器增量维护。
+    //
+    // L17（波 2）：必须先于时间戳迁移——migrate_timestamps_v1 / migrate_created_at_v1
+    // 会 UPDATE memories（触发 memories_au），若此刻 FTS 索引尚未建立（空索引），
+    // 外部内容表上执行 'delete' 会报 SQLITE_CORRUPT；先重建出与当前 memories 一致的
+    // 基线索引，再让触发器在一致索引上做增量 delete+insert 即安全。
     let fts_done: i64 = conn
         .prepare("SELECT COUNT(*) FROM config WHERE key = 'migration_fts_rebuild_v1'")?
         .query_row([], |r| r.get(0))?;
@@ -889,6 +891,12 @@ pub fn initialize(conn: &Connection) -> Result<()> {
              ON CONFLICT(key) DO UPDATE SET value = '1'",
         )?;
     }
+
+    // ── L17（审计修复，波 1）：时间戳 offset → UTC Z 归一 ──
+    migrate_timestamps_v1(conn)?;
+
+    // ── L17（审计修复，波 2）：space-naive created_at/updated_at → UTC Z 归一 ──
+    migrate_created_at_v1(conn)?;
 
     info!("[db schema] 迁移完成 ({} 张业务表)", BUSINESS_TABLES.len());
     Ok(())
@@ -1056,6 +1064,77 @@ fn migrate_timestamps_v1(conn: &Connection) -> Result<()> {
     )?;
     tx.commit()?;
     info!("[db schema] 时间戳归一 v1：{total} 行 offset→Z，跳过 {skipped}");
+    Ok(())
+}
+
+/// L17（波 2）：space-naive `created_at`/`updated_at`（SQLite `datetime('now')` 产物，
+/// 无时区、按 UTC 记）归一为 UTC `Z` 毫秒格式，统一库内时间口径（审计 I3 两套口径）。
+///
+/// 动态发现所有含 `created_at`/`updated_at` 列的业务表（`pragma_table_info`），
+/// 逐行把 space-naive 值改写为 `Z`；已是 ISO（offset/Z）或不可解析的跳过。
+/// 幂等（config flag 守卫）；`unchecked_transaction` 包整批，避免半程中断。
+fn migrate_created_at_v1(conn: &Connection) -> Result<()> {
+    let done: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM config WHERE key = 'migration_created_at_v1'",
+        [],
+        |r| r.get(0),
+    )?;
+    if done > 0 {
+        return Ok(());
+    }
+
+    let tables: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let tx = conn.unchecked_transaction()?;
+    let mut total = 0usize;
+    let mut skipped = 0usize;
+    for table in &tables {
+        // 表名来自 sqlite_master（受信标识符），内联进 pragma_table_info 避免绑定参数
+        // 触发 SQLite 表值函数在部分版本的损坏问题（SQLITE_CORRUPT）。
+        let cols: Vec<String> = {
+            let stmt_sql = format!(
+                "SELECT name FROM pragma_table_info('{table}') \
+                 WHERE name IN ('created_at','updated_at')"
+            );
+            let mut stmt = tx.prepare(&stmt_sql)?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for col in &cols {
+            // 用 rowid 定位行：config/entities/user_profiles/llm_metrics_daily 等主键非
+            // 自增 id（TEXT PRIMARY KEY），但都是普通 rowid 表，rowid 恒可用。
+            let sql =
+                format!("SELECT rowid, {col} FROM {table} WHERE {col} IS NOT NULL AND {col} != ''");
+            let rows: Vec<(i64, String)> = {
+                let mut stmt = tx.prepare(&sql)?;
+                let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for (rid, val) in rows {
+                if let Some(z) = crate::db::models::normalize_space_naive_to_utc_z(&val) {
+                    tx.execute(
+                        &format!("UPDATE {table} SET {col} = ?1 WHERE rowid = ?2"),
+                        params![z, rid],
+                    )?;
+                    total += 1;
+                } else {
+                    skipped += 1;
+                }
+            }
+        }
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, datetime('now'))",
+        params!["migration_created_at_v1", chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    info!("[db schema] created_at/updated_at 归一 v1：{total} 行 space-naive→Z，跳过 {skipped}");
     Ok(())
 }
 
@@ -1254,6 +1333,58 @@ mod tests {
         let flag: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM config WHERE key = 'migration_timestamps_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, 1);
+    }
+
+    #[test]
+    fn migrate_created_at_v1_normalizes_space_naive_to_z() {
+        // L17（波 2）：space-naive created_at/updated_at → UTC Z；已 ISO 跳过。
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        // 清 flag 触发迁移，写入 space-naive + ISO 混合数据模拟老库
+        conn.execute("DELETE FROM config WHERE key = 'migration_created_at_v1'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (role, from_id, content, timestamp, created_at)
+             VALUES ('user','u','space','2026-08-10T00:00:00Z','2026-08-10 08:00:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (role, from_id, content, timestamp, created_at)
+             VALUES ('user','u','iso','2026-08-10T00:00:00Z','2026-08-10T00:00:00.000Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate_created_at_v1(&conn).unwrap();
+
+        // space-naive 行归一为 Z（datetime('now') 按 UTC 记 → 原样换 T/Z 后缀）
+        let ts: String = conn
+            .query_row(
+                "SELECT created_at FROM conversations WHERE content = 'space'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts, "2026-08-10T08:00:00.000Z");
+        // 已 ISO 行保持原样
+        let ts2: String = conn
+            .query_row(
+                "SELECT created_at FROM conversations WHERE content = 'iso'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts2, "2026-08-10T00:00:00.000Z");
+        // flag 已写（幂等：二次执行 no-op）
+        let flag: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config WHERE key = 'migration_created_at_v1'",
                 [],
                 |r| r.get(0),
             )

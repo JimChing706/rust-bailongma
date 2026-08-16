@@ -103,6 +103,13 @@ fn now_input_ts() -> String {
     chrono::Local::now().to_rfc3339()
 }
 
+/// L17（波 2）：落库审计时间戳（turn_state.started_at 等）用 UTC-Z 固定毫秒，
+/// 与 `bailongma_core::db::models::now_iso()` 同口径；区别于 `now_input_ts()`
+/// （本地 offset，仅供消息行解析，非落库时间列）。
+fn now_utc_iso() -> String {
+    bailongma_core::db::models::now_iso()
+}
+
 /// 定位 sandbox 子进程可执行文件（与当前可执行文件同目录）。
 fn locate_sandbox_bin() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
@@ -444,7 +451,7 @@ impl AppRuntime {
         };
         let turn_id = match turn_state::create_turn(
             &self.db,
-            &now_input_ts(),
+            &now_utc_iso(),
             &turn_key,
             &msg.channel,
             &msg.from_id,

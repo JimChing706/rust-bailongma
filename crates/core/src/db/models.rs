@@ -59,6 +59,18 @@ pub fn epoch_ms_to_utc_z(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// L17（波 2）：将 SQLite `datetime('now')` 产生的 space-naive 时间戳
+/// （`YYYY-MM-DD HH:MM:SS`，无时区、按 UTC 记）归一为 UTC `Z` 毫秒格式。
+/// 已含 `T` 或 `Z` 后缀的值（offset/Z 格式）返回 None（调用方跳过，不重复处理）；
+/// 不可解析（非 space-naive）返回 None。
+pub fn normalize_space_naive_to_utc_z(ts: &str) -> Option<String> {
+    if ts.contains('T') || ts.ends_with('Z') {
+        return None;
+    }
+    let nd = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S").ok()?;
+    Some(nd.and_utc().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+}
+
 /// JSON 数组列 ↔ `Vec<String>`。
 fn decode_json_vec(v: Option<&str>) -> Vec<String> {
     match v {
@@ -460,6 +472,20 @@ mod tests {
         // epoch 0 = 1970-01-01T00:00:00Z
         assert_eq!(epoch_ms_to_utc_z(0), "1970-01-01T00:00:00.000Z");
         assert_eq!(epoch_ms_to_utc_z(86_400_000), "1970-01-02T00:00:00.000Z");
+    }
+
+    #[test]
+    fn normalize_space_naive_to_utc_z_converts_and_skips() {
+        // space-naive（datetime('now') 产物）→ Z 毫秒
+        assert_eq!(
+            normalize_space_naive_to_utc_z("2026-08-10 08:00:00").as_deref(),
+            Some("2026-08-10T08:00:00.000Z")
+        );
+        // 已 ISO（offset / Z）→ None，交给 normalize_to_utc_z 处理或跳过
+        assert_eq!(normalize_space_naive_to_utc_z("2026-08-10T08:00:00+08:00"), None);
+        assert_eq!(normalize_space_naive_to_utc_z("2026-08-10T00:00:00Z"), None);
+        // 不可解析 → None
+        assert_eq!(normalize_space_naive_to_utc_z("不是日期"), None);
     }
 
     #[test]

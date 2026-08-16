@@ -261,7 +261,9 @@ pub async fn stream_once(
             // M12（审计修复）：started_at 用 UTC——llm_metrics_daily.day 取 started_at 前 10 位，
             // 周报/预算窗口用 SQLite date('now')（UTC）；此前本地日 vs UTC 日在 +08:00 时窗口
             // 边界漂移约 8 小时。统一 UTC 后二者同口径。
-            started_at: chrono::Utc::now().to_rfc3339(),
+            // L17（波 2）：改用 now_iso()（固定毫秒 + Z 后缀）替代 to_rfc3339()（产出 +00:00
+            // offset），与 turn_state/llm_turns 及归一迁移同格式，直接比较/排序不漂移。
+            started_at: crate::db::models::now_iso(),
             stage: ctx.stage.clone(),
         });
     }

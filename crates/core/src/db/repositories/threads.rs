@@ -213,16 +213,11 @@ pub fn save_state(db: &Db, ts: &ThreadState, merged_away_ids: Option<&[String]>)
 pub fn load_thread_state(db: &Db) -> Result<Option<ThreadState>> {
     let conn = db.conn();
 
-    let thread_rows: Vec<Thread> = {
-        let mut stmt = conn.prepare("SELECT * FROM threads")?;
-        let rows = stmt.query_map([], Thread::from_row)?;
-        let mut v = Vec::new();
-        for r in rows {
-            v.push(r?);
-        }
-        v
-    };
-    if thread_rows.is_empty() {
+    // 空表（无任何线索行）→ None，触发上层 focus_stack 迁移；有行但全被窗口过滤 → Some(空)。
+    let has_any: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM threads)", [], |r| {
+        r.get(0)
+    })?;
+    if !has_any {
         return Ok(None);
     }
 
@@ -235,17 +230,22 @@ pub fn load_thread_state(db: &Db) -> Result<Option<ThreadState>> {
         }
         v
     };
-    let open_thread_ids: std::collections::HashSet<String> =
-        commitments.iter().map(|c| c.thread_id.clone()).collect();
 
+    // L17（波 3）：把「开放承诺钉住 + 7 天窗口」过滤下推到 SQL，不再全表载入内存
+    // 再 Rust 过滤（审计 L17「threads 全表载入内存再过滤」）。last_event_at 为
+    // 固定毫秒 Z（now_iso 写侧），与 cutoff 的 Z 下界同格式，可直接字典序比较。
     let cutoff_ms = now_ms().saturating_sub(THREAD_LOAD_WINDOW.as_millis());
-    let threads: Vec<Thread> = thread_rows
-        .into_iter()
-        .filter(|t| {
-            open_thread_ids.contains(&t.id)
-                || parse_iso_ms(&t.last_event_at).unwrap_or(0) >= cutoff_ms
-        })
-        .collect();
+    let cutoff_iso = crate::db::models::epoch_ms_to_utc_z(cutoff_ms as i64);
+    let mut stmt = conn.prepare(
+        "SELECT * FROM threads
+         WHERE id IN (SELECT thread_id FROM commitments WHERE status = 'open')
+            OR last_event_at >= ?1",
+    )?;
+    let rows = stmt.query_map(params![cutoff_iso], Thread::from_row)?;
+    let mut threads = Vec::new();
+    for r in rows {
+        threads.push(r?);
+    }
 
     let foreground_id: Option<String> = conn
         .query_row(

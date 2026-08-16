@@ -922,7 +922,9 @@ impl TurnSession {
     pub fn begin(collector: MetricsCollector) -> Self {
         Self {
             request_id: new_request_id(),
-            started_at_iso: chrono::Local::now().to_rfc3339(),
+            // L17（波 2）：started_at 写侧 UTC-Z 固定毫秒（与 llm_calls.started_at 同口径，
+            // 避免 Local offset 与 Z 混排导致跨表时间口径漂移）。
+            started_at_iso: crate::db::models::now_iso(),
             started: std::time::Instant::now(),
             collector,
             sections_hit: 0,
