@@ -46,6 +46,6 @@ pub mod retrieval;
 pub mod self_evolution;
 pub mod software_install_intent;
 pub mod system_prompt;
-pub mod weather;
 pub mod temporal;
 pub mod threads;
+pub mod weather;

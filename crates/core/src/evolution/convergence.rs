@@ -133,14 +133,8 @@ mod tests {
         let mut t = ConvergenceTracker::new(cfg);
         assert_eq!(t.record(3.0), ConvergenceStatus::Continue(1)); // 基线
         assert_eq!(t.record(3.0), ConvergenceStatus::Continue(2)); // 停滞 1
-        assert!(matches!(
-            t.record(3.0),
-            ConvergenceStatus::Converged { .. }
-        )); // 停滞 2 → 收敛
-        assert!(matches!(
-            t.record(3.0),
-            ConvergenceStatus::Converged { .. }
-        ));
+        assert!(matches!(t.record(3.0), ConvergenceStatus::Converged { .. })); // 停滞 2 → 收敛
+        assert!(matches!(t.record(3.0), ConvergenceStatus::Converged { .. }));
     }
 
     #[test]

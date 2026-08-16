@@ -27,11 +27,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::watchdog::{LoopSupervisor, WatchdogState};
 use bailongma_core::api::events::EventBus;
 use bailongma_core::api::routes::InboundMessage;
 use bailongma_core::compat;
 use bailongma_core::config::{load_config, Config};
-use bailongma_core::db::repositories::{brain_ui_events, config as config_repo, conversations, turn_state};
+use bailongma_core::db::repositories::{
+    brain_ui_events, config as config_repo, conversations, turn_state,
+};
 use bailongma_core::db::Db;
 use bailongma_core::embedding::NoopEmbedder;
 use bailongma_core::error::Result;
@@ -50,7 +53,6 @@ use bailongma_core::tools::{
     all_tool_schemas, NativeToolExecutor, RecallFn, SendMessageFn, TickIntervalFn, WebKeys,
 };
 use bailongma_core::wakeup::{due_wakeup, CoalescedWakeup};
-use crate::watchdog::{LoopSupervisor, WatchdogState};
 use serde_json::json;
 use tokio::sync::Mutex;
 
@@ -450,7 +452,49 @@ impl AppRuntime {
             Some(conversation_id),
             "retry",
         ) {
-            Ok(id) => Some(id),
+            Ok(id) if id > 0 => Some(id),
+            // M22（审计修复）：同 idempotency_key 已存在（并发/在途重复）→ 重查按状态处理，
+            // 不再「降级继续」导致重复执行（重复发消息/重复扣费）。
+            Ok(0) => {
+                if let Ok(Some(existing)) = turn_state::find_by_idempotency_key(&self.db, &turn_key)
+                {
+                    if matches!(
+                        existing.state.as_str(),
+                        "completed" | "failed" | "cancelled"
+                    ) {
+                        tracing::info!(
+                            key = %turn_key,
+                            state = %existing.state,
+                            "[A4] 幂等命中（建行冲突后重查）：消息已处理，跳过重复执行"
+                        );
+                        return TurnReply {
+                            conversation_id,
+                            ok: true,
+                            content: format!("（幂等命中：消息 {turn_key} 已处理，跳过重复执行）"),
+                            total_calls: 0,
+                            aborted: false,
+                            tool_name: None,
+                        };
+                    }
+                    // 仍在运行中：在途重复，拒绝双执行
+                    tracing::warn!(
+                        key = %turn_key,
+                        state = %existing.state,
+                        "[A4] 幂等键在途重复，跳过重复执行"
+                    );
+                    return TurnReply {
+                        conversation_id,
+                        ok: true,
+                        content: format!("（在途重复：消息 {turn_key} 正在处理中）"),
+                        total_calls: 0,
+                        aborted: false,
+                        tool_name: None,
+                    };
+                }
+                // 竞态罕见（建行冲突但重查不到）：降级继续执行，保持旧容错
+                None
+            }
+            Ok(_) => None, // 负数不可能（create_turn 只返回 >0 或 0），防御穷尽
             Err(e) => {
                 tracing::warn!("[P1] turn_state 建行失败（降级继续）: {e}");
                 None
@@ -468,7 +512,11 @@ impl AppRuntime {
                 }
             }
         };
-        let reply = |ok: bool, content: String, total_calls: usize, aborted: bool, tool_name: Option<String>| {
+        let reply = |ok: bool,
+                     content: String,
+                     total_calls: usize,
+                     aborted: bool,
+                     tool_name: Option<String>| {
             TurnReply {
                 conversation_id,
                 ok,
@@ -511,7 +559,10 @@ impl AppRuntime {
         // 2) 组装入站输入（对齐 parse_message_input 约定）并跑注入闭包
         let input = format!(
             "[{}] {} [{}] {}",
-            msg.from_id, now_input_ts(), msg.channel, msg.content
+            msg.from_id,
+            now_input_ts(),
+            msg.channel,
+            msg.content
         );
         let embedder = NoopEmbedder;
         let window = ContextWindowConfig::default();
@@ -687,9 +738,11 @@ impl AppRuntime {
     /// 审计 A2：唤醒交付成功 → 消费提醒（mark_fired）+ 清 in-flight。
     /// 广播/LLM 内容已送达即视为交付成功（原文兜底也算送达，提醒不丢）。
     fn wakeup_delivered(&self, wake: &CoalescedWakeup) {
-        if let Err(e) =
-            bailongma_core::db::repositories::reminders::mark_fired(&self.db, &wake.reminder_ids, &now_input_ts())
-        {
+        if let Err(e) = bailongma_core::db::repositories::reminders::mark_fired(
+            &self.db,
+            &wake.reminder_ids,
+            &now_input_ts(),
+        ) {
             // mark_fired 失败：提醒仍是 pending，下轮会重复唤醒（可接受，不丢消息）
             tracing::warn!("[wakeup] mark_fired 失败（下轮可能重复唤醒）: {e}");
         }
@@ -699,6 +752,24 @@ impl AppRuntime {
     /// 审计 A2：交付失败 → 仅清 in-flight，提醒保持 pending（下轮自动重试）。
     fn wakeup_dropped(&self) {
         self.wake_inflight.lock().unwrap().clear();
+    }
+
+    /// 审计 H7：唤醒循环重启回调——清空残留 in-flight 并落自愈事件。
+    ///
+    /// watchdog 假死/超时 abort 后，被取消的 worker 不会执行 wakeup_delivered/
+    /// wakeup_dropped 清理 wake_inflight；残留非空会让重启后的新循环每轮跳过、
+    /// 唤醒永久停摆。重启时清空 in-flight（提醒仍 pending，下轮重新查询），
+    /// 至多重发一次、绝不静默停摆。
+    fn on_wakeup_restart(&self, reason: &str) {
+        tracing::error!("[wakeup] 循环重启（{reason}），watchdog 已拉起新循环");
+        self.wake_inflight.lock().unwrap().clear();
+        let _ = brain_ui_events::insert_brain_ui_event(
+            &self.db,
+            &now_input_ts(),
+            "l2",
+            "wakeup_restart",
+            &json!({ "reason": reason }),
+        );
     }
 
     /// 唤醒轮输入行（`[system] ts [tick] 内容`，对齐 parse_message_input 约定）。
@@ -975,18 +1046,10 @@ impl AppRuntime {
         };
 
         // 波5：每次重启落 brain_ui_events（自愈事件可观测）+ error 日志
+        // 审计 H7：重启回调清空 wake_inflight 残留（见 on_wakeup_restart）
         let on_restart = {
-            let db = runtime.db.clone();
-            move |reason: &str| {
-                tracing::error!("[wakeup] 循环重启（{reason}），watchdog 已拉起新循环");
-                brain_ui_events::insert_brain_ui_event(
-                    &db,
-                    &now_input_ts(),
-                    "l2",
-                    "wakeup_restart",
-                    &json!({ "reason": reason }),
-                );
-            }
+            let runtime = runtime.clone();
+            move |reason: &str| runtime.on_wakeup_restart(reason)
         };
 
         LoopSupervisor::spawn(
@@ -1055,9 +1118,8 @@ mod tests {
         let gate = bailongma_core::approval::global();
         let before: Vec<String> = gate.pending_ids();
         let g2 = gate.clone();
-        let handle = std::thread::spawn(move || {
-            g2.guard_tool_call("exec_command", "whoami").unwrap()
-        });
+        let handle =
+            std::thread::spawn(move || g2.guard_tool_call("exec_command", "whoami").unwrap());
         let mut id: Option<String> = None;
         for _ in 0..200 {
             if let Some(nid) = gate.pending_ids().iter().find(|i| !before.contains(i)) {
@@ -1085,6 +1147,20 @@ mod tests {
         );
         assert!(line.starts_with("[system] 2026-08-11T08:00:00+08:00 [tick] "));
         assert!(line.contains("喂猫"));
+    }
+
+    #[tokio::test]
+    async fn wakeup_restart_clears_inflight() {
+        // 审计 H7：watchdog 假死/超时 abort 后，被取消的 worker 不清理 wake_inflight；
+        // 重启回调必须清空残留，否则新循环每轮跳过、唤醒永久停摆。
+        let runtime = test_runtime();
+        runtime.wake_inflight.lock().unwrap().extend([1i64, 2, 3]);
+        assert!(!runtime.wake_inflight.lock().unwrap().is_empty());
+        runtime.on_wakeup_restart("stuck-heartbeat-timeout");
+        assert!(
+            runtime.wake_inflight.lock().unwrap().is_empty(),
+            "重启后 wake_inflight 必须清空（H7）"
+        );
     }
 
     #[tokio::test]
@@ -1129,7 +1205,9 @@ mod tests {
         // 消费后提醒标记 fired（不会重复唤醒）
         let conn = runtime.db.conn();
         let status: String = conn
-            .query_row("SELECT status FROM reminders WHERE id = ?1", [rid], |r| r.get(0))
+            .query_row("SELECT status FROM reminders WHERE id = ?1", [rid], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(status, "fired");
     }
@@ -1146,7 +1224,11 @@ mod tests {
         };
         let reply = runtime.run_message_turn(msg, None, None).await;
         assert!(reply.ok, "降级回复视为完成，ok 应为 true");
-        assert!(reply.content.contains("LLM 未激活"), "内容: {}", reply.content);
+        assert!(
+            reply.content.contains("LLM 未激活"),
+            "内容: {}",
+            reply.content
+        );
         assert_eq!(reply.conversation_id, 1);
 
         let rows = conversations::recent_by_from(&runtime.db, "ID:000001", 10).unwrap();
@@ -1214,7 +1296,9 @@ mod tests {
         let calls: i64 = runtime
             .db
             .conn()
-            .query_row("SELECT total_calls FROM llm_metrics_daily", [], |r| r.get(0))
+            .query_row("SELECT total_calls FROM llm_metrics_daily", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(calls, 1, "日聚合 total_calls 只计一次");
     }
@@ -1279,7 +1363,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(joins, stats.sections_hit as i64, "section 明细都应 JOIN 到 llm_calls");
+        assert_eq!(
+            joins, stats.sections_hit as i64,
+            "section 明细都应 JOIN 到 llm_calls"
+        );
 
         // turn 级记录（attribution / is_tick / sections_hit）
         let (attribution, is_tick, sections_hit): (String, i64, Option<i64>) = runtime
@@ -1305,7 +1392,10 @@ mod tests {
         let ex = runtime.build_executor();
         // 工具调用 → config 持久化（回调已接线）
         let r = ex
-            .execute("set_tick_interval", &json!({ "seconds": 5, "ttl": 3, "reason": "任务冲刺" }))
+            .execute(
+                "set_tick_interval",
+                &json!({ "seconds": 5, "ttl": 3, "reason": "任务冲刺" }),
+            )
             .unwrap();
         assert!(r.contains("5s"), "回调应返回节奏确认: {r}");
         assert_eq!(
@@ -1318,7 +1408,11 @@ mod tests {
         assert_eq!(runtime.effective_tick_interval(60), 5);
         assert_eq!(runtime.effective_tick_interval(60), 5);
         assert_eq!(runtime.effective_tick_interval(60), 5);
-        assert_eq!(runtime.effective_tick_interval(60), 60, "TTL 归零后回落默认节奏");
+        assert_eq!(
+            runtime.effective_tick_interval(60),
+            60,
+            "TTL 归零后回落默认节奏"
+        );
         // 回落后再无节奏配置
         assert!(
             config_repo::get_config(&runtime.db, "tick_interval_secs")
@@ -1387,6 +1481,10 @@ mod tests {
         );
         assert_eq!(runtime.wakeup_watchdog.restart_count(), 0);
         // TTL=2 已消费完 → 下一拍回落 1s 测试默认节奏
-        assert_eq!(runtime.effective_tick_interval(1), 1, "TTL 归零后应回落默认节奏");
+        assert_eq!(
+            runtime.effective_tick_interval(1),
+            1,
+            "TTL 归零后应回落默认节奏"
+        );
     }
 }

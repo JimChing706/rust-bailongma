@@ -6,9 +6,7 @@ use std::time::Duration;
 use anyhow::Context;
 use tao::dpi::{LogicalPosition, LogicalSize};
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{
-    ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget,
-};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 #[cfg(target_os = "windows")]
 use tao::platform::windows::WindowExtWindows;
 use tao::window::{Window, WindowBuilder, WindowId};
@@ -60,10 +58,11 @@ pub fn run_desktop_shell() -> anyhow::Result<()> {
     MenuEvent::set_event_handler(Some(move |event| {
         let _ = menu_proxy.send_event(DesktopUserEvent::MenuEvent(event));
     }));
-    let instance_listener_thread = spawn_instance_listener(instance_listener, event_loop.create_proxy());
+    let instance_listener_thread =
+        spawn_instance_listener(instance_listener, event_loop.create_proxy());
 
-    let main_window = build_main_window(&event_loop, &window_manager_state)
-        .context("创建主窗口失败")?;
+    let main_window =
+        build_main_window(&event_loop, &window_manager_state).context("创建主窗口失败")?;
     let main_window_id = main_window.id();
 
     let main_webview = WebViewBuilder::new()
@@ -88,7 +87,8 @@ pub fn run_desktop_shell() -> anyhow::Result<()> {
         true,
         None,
     );
-    let tray_open_status_item = MenuItem::with_id("tray-open-status-window", "打开系统状态窗口", true, None);
+    let tray_open_status_item =
+        MenuItem::with_id("tray-open-status-window", "打开系统状态窗口", true, None);
     let tray_quit_item = MenuItem::with_id("quit-app", "退出", true, None);
     let tray_menu = Menu::new();
     tray_menu
@@ -106,19 +106,22 @@ pub fn run_desktop_shell() -> anyhow::Result<()> {
     let hide_main_window_item = MenuItem::with_id("hide-main-window", "隐藏主窗口", true, None);
     let open_status_window_item =
         MenuItem::with_id("open-status-window", "打开系统状态窗口", true, None);
-    let close_status_window_item =
-        MenuItem::with_id(
-            "close-status-window",
-            "关闭系统状态窗口",
-            window_manager_state.status.open,
-            None,
-        );
+    let close_status_window_item = MenuItem::with_id(
+        "close-status-window",
+        "关闭系统状态窗口",
+        window_manager_state.status.open,
+        None,
+    );
     let quit_menu_item = MenuItem::with_id("quit-app-menu", "退出应用", true, None);
 
     let app_submenu = Submenu::with_items(
         "应用",
         true,
-        &[&show_main_window_item, &hide_main_window_item, &quit_menu_item],
+        &[
+            &show_main_window_item,
+            &hide_main_window_item,
+            &quit_menu_item,
+        ],
     )
     .context("创建应用菜单失败")?;
     let window_submenu = Submenu::with_items(
@@ -253,11 +256,7 @@ pub fn run_desktop_shell() -> anyhow::Result<()> {
                     ..
                 } => {
                     tracing::info!("收到托盘左键事件，切换主窗口显示状态");
-                    toggle_main_window(
-                        &main_window,
-                        &tray_toggle_item,
-                        &mut main_window_visible,
-                    );
+                    toggle_main_window(&main_window, &tray_toggle_item, &mut main_window_visible);
                     persist_window_manager_state(
                         &user_dir,
                         &mut window_manager_state,
@@ -268,7 +267,9 @@ pub fn run_desktop_shell() -> anyhow::Result<()> {
                 }
                 _ => {}
             },
-            Event::UserEvent(DesktopUserEvent::ExternalCommand(ExternalCommand::ShowMainWindow)) => {
+            Event::UserEvent(DesktopUserEvent::ExternalCommand(
+                ExternalCommand::ShowMainWindow,
+            )) => {
                 tracing::info!("收到单实例唤醒指令，激活主窗口");
                 set_main_window_visible(
                     &main_window,
@@ -287,11 +288,7 @@ pub fn run_desktop_shell() -> anyhow::Result<()> {
             Event::UserEvent(DesktopUserEvent::MenuEvent(menu_event)) => {
                 let menu_id = menu_event.id;
                 if menu_id == tray_toggle_item.id().clone() {
-                    toggle_main_window(
-                        &main_window,
-                        &tray_toggle_item,
-                        &mut main_window_visible,
-                    );
+                    toggle_main_window(&main_window, &tray_toggle_item, &mut main_window_visible);
                     persist_window_manager_state(
                         &user_dir,
                         &mut window_manager_state,
@@ -472,8 +469,7 @@ fn acquire_single_instance() -> anyhow::Result<Option<TcpListener>> {
 }
 
 fn signal_existing_instance() -> anyhow::Result<()> {
-    let mut stream =
-        TcpStream::connect(SINGLE_INSTANCE_ADDR).context("连接现有实例失败")?;
+    let mut stream = TcpStream::connect(SINGLE_INSTANCE_ADDR).context("连接现有实例失败")?;
     stream
         .write_all(SINGLE_INSTANCE_SHOW_MAIN.as_bytes())
         .context("发送唤醒指令失败")?;

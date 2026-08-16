@@ -184,7 +184,7 @@ mod tests {
     use super::*;
     use crate::db::repositories::conversations::insert;
 
-fn test_db() -> Db {
+    fn test_db() -> Db {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("blm_iter_test_{}_{}", std::process::id(), n));
@@ -211,18 +211,35 @@ fn test_db() -> Db {
         let mut gate = |_: &str| Ok(true);
 
         // 缺快照
-        let g = AutoIterateGuard { snapshot_available: false, ..full_guard() };
+        let g = AutoIterateGuard {
+            snapshot_available: false,
+            ..full_guard()
+        };
         assert!(matches!(g.readiness(), TrioReadiness::Missing { .. }));
-        let err = run_iteration(&db, &snap_dir(), "t", ConvergenceConfig::default(), &g, &mut apply, &mut gate);
+        let err = run_iteration(
+            &db,
+            &snap_dir(),
+            "t",
+            ConvergenceConfig::default(),
+            &g,
+            &mut apply,
+            &mut gate,
+        );
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("缺一不启动"));
 
         // 缺批准
-        let g = AutoIterateGuard { approval_available: false, ..full_guard() };
+        let g = AutoIterateGuard {
+            approval_available: false,
+            ..full_guard()
+        };
         assert!(matches!(g.readiness(), TrioReadiness::Missing { .. }));
 
         // 缺收敛
-        let g = AutoIterateGuard { convergence_available: false, ..full_guard() };
+        let g = AutoIterateGuard {
+            convergence_available: false,
+            ..full_guard()
+        };
         assert!(matches!(g.readiness(), TrioReadiness::Missing { .. }));
 
         // 全齐 → Ready
@@ -245,15 +262,31 @@ fn test_db() -> Db {
             approvals += 1;
             Ok(true)
         };
-        let cfg = ConvergenceConfig { max_rounds: 10, stable_rounds: 2, min_improvement: 0.0 };
+        let cfg = ConvergenceConfig {
+            max_rounds: 10,
+            stable_rounds: 2,
+            min_improvement: 0.0,
+        };
 
-        let out = run_iteration(&db, &snap_dir(), "conv", cfg, &full_guard(), &mut apply, &mut gate).unwrap();
+        let out = run_iteration(
+            &db,
+            &snap_dir(),
+            "conv",
+            cfg,
+            &full_guard(),
+            &mut apply,
+            &mut gate,
+        )
+        .unwrap();
         assert!(matches!(out.status, ConvergenceStatus::Converged { .. }));
         assert_eq!(out.rounds, 3);
         assert_eq!(apply_calls, 3);
         assert_eq!(approvals, 3);
         // 变更落库：初始 + 3 条
-        let n: i64 = db.conn().query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0)).unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 4);
         // 快照保留（供回滚）
         assert!(std::path::Path::new(&out.snapshot_path).exists());
@@ -277,12 +310,31 @@ fn test_db() -> Db {
             }
         };
         let mut gate = |_: &str| Ok(true);
-        let cfg = ConvergenceConfig { max_rounds: 10, stable_rounds: 2, min_improvement: 0.0 };
+        let cfg = ConvergenceConfig {
+            max_rounds: 10,
+            stable_rounds: 2,
+            min_improvement: 0.0,
+        };
 
-        let err = run_iteration(&db, &snap_dir(), "rb", cfg, &full_guard(), &mut apply, &mut gate).unwrap_err();
-        assert!(err.to_string().contains("已回滚"), "错误应说明已回滚: {err}");
+        let err = run_iteration(
+            &db,
+            &snap_dir(),
+            "rb",
+            cfg,
+            &full_guard(),
+            &mut apply,
+            &mut gate,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("已回滚"),
+            "错误应说明已回滚: {err}"
+        );
         // 回滚后只剩初始 1 条（第一轮的写入也被撤销）
-        let n: i64 = db.conn().query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0)).unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1, "失败轮应整库回滚到迭代前");
     }
 
@@ -294,9 +346,21 @@ fn test_db() -> Db {
         let mut gate = |_: &str| Ok(false); // 拒绝
         let cfg = ConvergenceConfig::default();
 
-        let err = run_iteration(&db, &snap_dir(), "deny", cfg, &full_guard(), &mut apply, &mut gate).unwrap_err();
+        let err = run_iteration(
+            &db,
+            &snap_dir(),
+            "deny",
+            cfg,
+            &full_guard(),
+            &mut apply,
+            &mut gate,
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("未获人工批准"));
-        let n: i64 = db.conn().query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0)).unwrap();
+        let n: i64 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(n, 1, "拒绝后不得有任何变更");
     }
 
@@ -305,9 +369,22 @@ fn test_db() -> Db {
         let db = test_db();
         let mut apply = || Ok(1.0f64);
         let mut gate = |_: &str| Ok(true);
-        let cfg = ConvergenceConfig { max_rounds: 2, stable_rounds: 5, min_improvement: 0.0 };
+        let cfg = ConvergenceConfig {
+            max_rounds: 2,
+            stable_rounds: 5,
+            min_improvement: 0.0,
+        };
 
-        let out = run_iteration(&db, &snap_dir(), "max", cfg, &full_guard(), &mut apply, &mut gate).unwrap();
+        let out = run_iteration(
+            &db,
+            &snap_dir(),
+            "max",
+            cfg,
+            &full_guard(),
+            &mut apply,
+            &mut gate,
+        )
+        .unwrap();
         assert!(matches!(out.status, ConvergenceStatus::MaxRounds));
         assert_eq!(out.rounds, 2);
         std::fs::remove_file(&out.snapshot_path).ok();

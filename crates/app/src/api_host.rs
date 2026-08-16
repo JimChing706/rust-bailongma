@@ -106,7 +106,10 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
     bailongma_core::api::security::lan_exposure_check(lan, token_configured)
         .map_err(CoreError::Api)?;
 
-    tracing::info!("数据库: {}", user_dir.join("data").join("jarvis.db").display());
+    tracing::info!(
+        "数据库: {}",
+        user_dir.join("data").join("jarvis.db").display()
+    );
     tracing::info!("[R3] 工具沙箱根: {}", runtime.tool_root.display());
     if let Some(bin) = &runtime.sandbox_bin {
         tracing::info!("[R3] sandbox 子进程: {}", bin.display());
@@ -179,7 +182,8 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
         inbound,
         Arc::new(move || agent_name.clone()),
         status,
-    );
+    )
+    .with_intervention(runtime.intervention.clone());
     if token_configured {
         tracing::info!("[API] BAILONGMA_API_TOKEN 已配置：/message 强制 token 校验");
     } else {

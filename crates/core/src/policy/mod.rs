@@ -81,10 +81,9 @@ const NETWORK_DENY_EXACT: &[&str] = &[
 ];
 
 const NETWORK_PRIVATE_PREFIXES: &[&str] = &[
-    "127.", "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
-    "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
-    "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
-    "::1", "fe80:",
+    "127.", "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.", "172.20.", "172.21.",
+    "172.22.", "172.23.", "172.24.", "172.25.", "172.26.", "172.27.", "172.28.", "172.29.",
+    "172.30.", "172.31.", "::1", "fe80:",
 ];
 
 /// 输出脱敏扫描模式（命中即脱敏，不做正则依赖）。
@@ -99,8 +98,16 @@ const SECRET_PATTERNS: &[(&str, &str)] = &[
 
 /// 默认敏感路径 denylist（与 `capability::SENSITIVE_DENY` 对齐并补充）。
 const POLICY_DENY_PATHS: &[&str] = &[
-    ".ssh", "id_rsa", "id_ed25519", ".env", "credentials", "secret",
-    "id_dsa", "id_ecdsa", ".pem", ".key",
+    ".ssh",
+    "id_rsa",
+    "id_ed25519",
+    ".env",
+    "credentials",
+    "secret",
+    "id_dsa",
+    "id_ecdsa",
+    ".pem",
+    ".key",
 ];
 
 /// 记忆写操作的策略：默认需人工确认。
@@ -238,7 +245,10 @@ impl PolicyEngine {
     /// 返回 `Sanitize` 时调用方必须使用 `redacted` 内容替换原文。
     pub fn check_output_release(&mut self, content: &str) -> PolicyDecision {
         let decision = sanitize_content(content);
-        self.record(&format!("output_release:{} bytes", content.len()), &decision);
+        self.record(
+            &format!("output_release:{} bytes", content.len()),
+            &decision,
+        );
         decision
     }
 
@@ -259,7 +269,10 @@ impl PolicyEngine {
 ///   这类逃逸不做文件系统规范化也能被纯组件判定拦住；
 /// - 不同盘符 / 同前缀兄弟目录（workspace vs workspace2）因组件不匹配被拒绝。
 fn is_within(root: &Path, child: &Path) -> bool {
-    if child.components().any(|c| matches!(c, Component::ParentDir)) {
+    if child
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
         return false;
     }
     let mut r = root.components();
@@ -291,9 +304,7 @@ fn host_of(url: &str) -> Option<&str> {
 }
 
 fn is_private_host(host: &str) -> bool {
-    NETWORK_PRIVATE_PREFIXES
-        .iter()
-        .any(|p| host.starts_with(p))
+    NETWORK_PRIVATE_PREFIXES.iter().any(|p| host.starts_with(p))
 }
 
 fn network_decision(url: &str) -> PolicyDecision {
@@ -339,6 +350,15 @@ fn sanitize_content(content: &str) -> PolicyDecision {
     }
 }
 
+/// H5（审计修复）：对外输出脱敏——exec 命令 stdout/stderr 可能含密钥（如 `cat .env`），
+/// 命中 SECRET_PATTERNS/超长 token 时替换为占位；无命中则原样返回。
+pub fn redact_output(content: &str) -> String {
+    match sanitize_content(content) {
+        PolicyDecision::Sanitize { redacted, .. } => redacted,
+        _ => content.to_string(),
+    }
+}
+
 /// 简单子串/模式命中（无正则依赖）：`BEGIN ... PRIVATE KEY` 变体按关键词扫描。
 fn pattern_hits(s: &str, pat: &str) -> bool {
     if pat.contains("BEGIN") {
@@ -354,9 +374,8 @@ fn pattern_hits(s: &str, pat: &str) -> bool {
         s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .any(|w| w.len() >= 24 && w.starts_with("ghp_"))
     } else if pat.starts_with("xox") {
-        s.split_whitespace().any(|w| {
-            w.len() >= 15 && (w.starts_with("xoxb-") || w.starts_with("xoxp-"))
-        })
+        s.split_whitespace()
+            .any(|w| w.len() >= 15 && (w.starts_with("xoxb-") || w.starts_with("xoxp-")))
     } else {
         s.contains(pat)
     }
@@ -384,22 +403,19 @@ fn redact_line_hits(s: &str, kind: &str) -> String {
 }
 
 fn long_token_hits(s: &str) -> bool {
-    s.split_whitespace().any(|w| {
-        w.len() >= 64
-            && (w.chars().all(|c| c.is_ascii_hexdigit()) || is_base64ish(w))
-    })
+    s.split_whitespace()
+        .any(|w| w.len() >= 64 && (w.chars().all(|c| c.is_ascii_hexdigit()) || is_base64ish(w)))
 }
 
 fn is_base64ish(w: &str) -> bool {
-    w.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    w.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
 }
 
 fn redact_long_tokens(s: &str) -> String {
     s.split_whitespace()
         .map(|w| {
-            if w.len() >= 64
-                && (w.chars().all(|c| c.is_ascii_hexdigit()) || is_base64ish(w))
-            {
+            if w.len() >= 64 && (w.chars().all(|c| c.is_ascii_hexdigit()) || is_base64ish(w)) {
                 format!("[REDACTED:LONG_TOKEN]({} chars)", w.len())
             } else {
                 w.to_string()

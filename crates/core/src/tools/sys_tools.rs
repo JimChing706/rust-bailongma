@@ -64,10 +64,7 @@ pub fn upsert_memory_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value
             .and_then(Value::as_str)
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| CoreError::Tool("upsert_memory 每条必须提供 mem_id".into()))?;
-        let mem_type = obj
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("fact");
+        let mem_type = obj.get("type").and_then(Value::as_str).unwrap_or("fact");
         if !MEMORY_TYPES.contains(&mem_type) {
             return Err(CoreError::Tool(format!(
                 "upsert_memory type 非法: {mem_type}（允许 {}）",
@@ -123,8 +120,7 @@ pub fn upsert_memory_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value
             .map(String::from);
         let parent_id = match parent_mem_id {
             Some(pid) if !pid.trim().is_empty() => {
-                crate::db::repositories::memories::get_by_mem_id(db, &pid)?
-                    .map(|m| m.id)
+                crate::db::repositories::memories::get_by_mem_id(db, &pid)?.map(|m| m.id)
             }
             _ => None,
         };
@@ -184,9 +180,8 @@ pub fn probe_memory_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value>
         .and_then(Value::as_u64)
         .unwrap_or(8)
         .min(20) as u32;
-    let hits =
-        crate::db::repositories::memories::search_scored(db, &query, limit)
-            .map_err(|e| CoreError::Tool(format!("记忆探测失败: {e}")))?;
+    let hits = crate::db::repositories::memories::search_scored(db, &query, limit)
+        .map_err(|e| CoreError::Tool(format!("记忆探测失败: {e}")))?;
     let items: Vec<Value> = hits
         .into_iter()
         .map(|s| {
@@ -278,7 +273,9 @@ pub fn merge_memories_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Valu
         })
         .ok_or_else(|| CoreError::Tool("merge_memories 缺 drop_mem_ids".into()))?;
     if drop_ids.is_empty() {
-        return Err(CoreError::Tool("merge_memories drop_mem_ids 不能为空".into()));
+        return Err(CoreError::Tool(
+            "merge_memories drop_mem_ids 不能为空".into(),
+        ));
     }
     let merged_content = args
         .get("merged_content")
@@ -301,7 +298,9 @@ pub fn merge_memories_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Valu
         .map_err(|e| CoreError::Tool(format!("读取 keep 失败: {e}")))?
         .ok_or_else(|| CoreError::Tool(format!("merge_memories keep 不存在: {keep_mem_id}")))?;
     if drop_ids.contains(&keep_mem_id.to_string()) {
-        return Err(CoreError::Tool("merge_memories keep 不能同时在 drop 中".into()));
+        return Err(CoreError::Tool(
+            "merge_memories keep 不能同时在 drop 中".into(),
+        ));
     }
 
     // 计算默认 salience = max(涉及记忆) 与 entities union
@@ -327,8 +326,9 @@ pub fn merge_memories_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Valu
 
     let mut hidden: Vec<String> = Vec::new();
     for drop_id in &drop_ids {
-        let ok = crate::db::repositories::memories::hide_by_mem_id(db, drop_id, Some(keep_mem_id), None)
-            .map_err(|e| CoreError::Tool(format!("隐藏 drop 失败: {e}")))?;
+        let ok =
+            crate::db::repositories::memories::hide_by_mem_id(db, drop_id, Some(keep_mem_id), None)
+                .map_err(|e| CoreError::Tool(format!("隐藏 drop 失败: {e}")))?;
         if ok {
             hidden.push(drop_id.clone());
         }
@@ -372,7 +372,9 @@ pub fn downgrade_memory_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Va
     let ok = crate::db::repositories::memories::update_salience(db, mem_id, new_salience)
         .map_err(|e| CoreError::Tool(format!("降级记忆失败: {e}")))?;
     if !ok {
-        return Err(CoreError::Tool(format!("downgrade_memory 记忆不存在: {mem_id}")));
+        return Err(CoreError::Tool(format!(
+            "downgrade_memory 记忆不存在: {mem_id}"
+        )));
     }
     Ok(json!({
         "ok": true,
@@ -455,7 +457,9 @@ pub fn set_location_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value>
         return Err(CoreError::Tool("set_location 缺 city".into()));
     }
     if city.chars().count() > 64 {
-        return Err(CoreError::Tool("set_location city 超长（上限 64 字符）".into()));
+        return Err(CoreError::Tool(
+            "set_location city 超长（上限 64 字符）".into(),
+        ));
     }
     crate::db::repositories::config::set_config(db, "location_city", &city)
         .map_err(|e| CoreError::Tool(format!("写入配置失败: {e}")))?;
@@ -499,29 +503,63 @@ pub fn find_tool_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
         .trim()
         .to_lowercase();
     if query.is_empty() {
-        return Err(CoreError::Tool("find_tool 缺 query：用一句话描述你需要做什么".into()));
+        return Err(CoreError::Tool(
+            "find_tool 缺 query：用一句话描述你需要做什么".into(),
+        ));
     }
     // 关键词 → 工具映射（中文 + 英文）
     let catalog: &[(&str, &[&str])] = &[
         ("web_search", &["搜索", "查一下", "搜", "search", "news"]),
-        ("web_read", &["网页", "阅读", "读取", "url", "read", "网页内容"]),
+        (
+            "web_read",
+            &["网页", "阅读", "读取", "url", "read", "网页内容"],
+        ),
         ("fetch_url", &["下载页面", "抓取", "fetch"]),
         ("browser_open", &["浏览器", "打开网页", "browser", "浏览"]),
-        ("read_file", &["读文件", "读取文件", "打开文件", "read file"]),
-        ("write_file", &["写文件", "写入文件", "保存文件", "write", "创建文件"]),
+        (
+            "read_file",
+            &["读文件", "读取文件", "打开文件", "read file"],
+        ),
+        (
+            "write_file",
+            &["写文件", "写入文件", "保存文件", "write", "创建文件"],
+        ),
         ("list_dir", &["列目录", "查看目录", "list", "目录"]),
-        ("exec_command", &["运行", "执行命令", "命令", "command", "shell", "终端", "运行命令"]),
-        ("exec_quick_command", &["快速命令", "pwd", "whoami", "quick", "命令", "运行"]),
+        (
+            "exec_command",
+            &[
+                "运行",
+                "执行命令",
+                "命令",
+                "command",
+                "shell",
+                "终端",
+                "运行命令",
+            ],
+        ),
+        (
+            "exec_quick_command",
+            &["快速命令", "pwd", "whoami", "quick", "命令", "运行"],
+        ),
         ("list_processes", &["进程", "后台", "process", "任务"]),
-        ("kill_process", &["结束进程", "杀进程", "停止进程", "kill", "stop"]),
+        (
+            "kill_process",
+            &["结束进程", "杀进程", "停止进程", "kill", "stop"],
+        ),
         ("set_reminder", &["提醒", "提醒我", "reminder", "日程"]),
-        ("search_memory", &["回忆", "记忆", "我记得", "memory", "recall"]),
+        (
+            "search_memory",
+            &["回忆", "记忆", "我记得", "memory", "recall"],
+        ),
         ("upsert_memory", &["记住", "写入记忆", "save", "记得"]),
         ("send_message", &["发消息", "回复", "send", "message"]),
         ("get_timestamp", &["时间", "现在几点", "time", "timestamp"]),
         ("ui_set", &["卡片", "面板", "界面", "ui", "显示"]),
         ("speak", &["说话", "语音", "朗读", "speak", "tts"]),
-        ("generate_image", &["生成图片", "画图", "图片", "image", "插画"]),
+        (
+            "generate_image",
+            &["生成图片", "画图", "图片", "image", "插画"],
+        ),
         ("generate_music", &["生成音乐", "作曲", "music", "歌曲"]),
         ("generate_lyrics", &["歌词", "lyrics"]),
         ("set_task", &["任务", "计划", "目标", "task", "todo"]),
@@ -532,12 +570,21 @@ pub fn find_tool_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
         ("weather", &["天气", "weather", "气温"]),
         ("install_software", &["安装软件", "安装", "install", "卸载"]),
         ("download_file", &["下载", "download"]),
-        ("collect_agents", &["agent", "协作", "委托", "claude", "codex"]),
+        (
+            "collect_agents",
+            &["agent", "协作", "委托", "claude", "codex"],
+        ),
         ("delegate_to_agent", &["委托", "交给", "delegate"]),
         ("matter_create", &["事项", "账本", "matter", "任务单"]),
         ("set_agent_name", &["改名", "名字", "称呼", "rename"]),
-        ("set_location", &["位置", "城市", "地区", "location", "city"]),
-        ("complete_startup_self_check", &["自检", "startup check", "体检"]),
+        (
+            "set_location",
+            &["位置", "城市", "地区", "location", "city"],
+        ),
+        (
+            "complete_startup_self_check",
+            &["自检", "startup check", "体检"],
+        ),
     ];
     let schemas = super::all_tool_schemas();
     let mut loaded: Vec<Value> = Vec::new();
@@ -545,10 +592,7 @@ pub fn find_tool_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
         if !ex.is_ready(name) {
             continue;
         }
-        if keywords
-            .iter()
-            .any(|k| query.contains(&k.to_lowercase()))
-        {
+        if keywords.iter().any(|k| query.contains(&k.to_lowercase())) {
             if let Some(s) = schemas.iter().find(|s| s.name == *name) {
                 loaded.push(json!({
                     "name": s.name,
@@ -581,7 +625,9 @@ pub fn complete_startup_self_check_impl(ex: &NativeToolExecutor, args: &Value) -
         .trim()
         .to_string();
     if summary.is_empty() {
-        return Err(CoreError::Tool("complete_startup_self_check 缺 summary".into()));
+        return Err(CoreError::Tool(
+            "complete_startup_self_check 缺 summary".into(),
+        ));
     }
     let results = args.get("results").cloned().unwrap_or(Value::Null);
     let record = json!({
@@ -592,8 +638,7 @@ pub fn complete_startup_self_check_impl(ex: &NativeToolExecutor, args: &Value) -
     crate::db::repositories::config::set_config(
         db,
         "startup_self_check",
-        &serde_json::to_string(&record)
-            .map_err(|e| CoreError::Tool(format!("序列化失败: {e}")))?,
+        &serde_json::to_string(&record).map_err(|e| CoreError::Tool(format!("序列化失败: {e}")))?,
     )
     .map_err(|e| CoreError::Tool(format!("写入配置失败: {e}")))?;
     Ok(json!({ "ok": true, "persisted": true }))
@@ -616,11 +661,7 @@ fn load_task(db: &crate::db::Db) -> Result<(Option<String>, Vec<Value>)> {
     Ok((task, steps))
 }
 
-fn save_task(
-    db: &crate::db::Db,
-    task: Option<&str>,
-    steps: &[Value],
-) -> Result<()> {
+fn save_task(db: &crate::db::Db, task: Option<&str>, steps: &[Value]) -> Result<()> {
     match task {
         Some(t) => crate::db::repositories::config::set_config(db, "current_task", t)
             .map_err(|e| CoreError::Tool(format!("保存任务失败: {e}")))?,
@@ -711,7 +752,9 @@ pub fn update_task_step_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Va
     };
     let (task, mut steps) = load_task(db)?;
     if task.is_none() || task.as_deref().unwrap_or("").is_empty() {
-        return Err(CoreError::Tool("update_task_step 当前无进行中的任务".into()));
+        return Err(CoreError::Tool(
+            "update_task_step 当前无进行中的任务".into(),
+        ));
     }
     let step_index = args
         .get("step_index")
@@ -761,9 +804,9 @@ pub fn exec_quick_command_impl(ex: &NativeToolExecutor, args: &Value) -> Result<
         .and_then(Value::as_u64)
         .unwrap_or(10)
         .clamp(1, 30);
-    let obj = merged.as_object_mut().ok_or_else(|| {
-        CoreError::Tool("exec_quick_command 参数必须是 JSON 对象".into())
-    })?;
+    let obj = merged
+        .as_object_mut()
+        .ok_or_else(|| CoreError::Tool("exec_quick_command 参数必须是 JSON 对象".into()))?;
     // exec_command 内部读取 timeout_ms；quick 档把 timeout(秒) 换算为 ms
     obj.insert("timeout_ms".into(), Value::Number(quick_timeout.into()));
     if let Some(t) = obj.get("timeout") {
@@ -826,7 +869,9 @@ pub fn kill_process_impl(_ex: &NativeToolExecutor, args: &Value) -> Result<Value
         status.success()
     };
     if !killed {
-        return Err(CoreError::Tool(format!("kill_process 进程不存在或已退出: {pid}")));
+        return Err(CoreError::Tool(format!(
+            "kill_process 进程不存在或已退出: {pid}"
+        )));
     }
     Ok(json!({
         "ok": true,
@@ -1053,8 +1098,10 @@ mod tests {
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("不能为空"));
         // 缺 mem_id
-        let r2 = ex
-            .execute("upsert_memory", &json!({ "memories": [{ "content": "x" }] }));
+        let r2 = ex.execute(
+            "upsert_memory",
+            &json!({ "memories": [{ "content": "x" }] }),
+        );
         assert!(r2.is_err());
         assert!(r2.unwrap_err().to_string().contains("mem_id"));
         // type 非法
@@ -1116,21 +1163,17 @@ mod tests {
         assert_eq!(v["merged_salience"], 4, "{v}"); // max(3,4)
         assert_eq!(v["hidden"], json!(["m_drop"]), "{v}");
         // drop 已隐藏
-        let drop = crate::db::repositories::memories::get_by_mem_id(
-            ex.db.as_ref().unwrap(),
-            "m_drop",
-        )
-        .unwrap()
-        .unwrap();
+        let drop =
+            crate::db::repositories::memories::get_by_mem_id(ex.db.as_ref().unwrap(), "m_drop")
+                .unwrap()
+                .unwrap();
         assert!(!drop.visibility);
         assert_eq!(drop.merged_into.as_deref(), Some("m_keep"));
         // keep 已更新
-        let keep = crate::db::repositories::memories::get_by_mem_id(
-            ex.db.as_ref().unwrap(),
-            "m_keep",
-        )
-        .unwrap()
-        .unwrap();
+        let keep =
+            crate::db::repositories::memories::get_by_mem_id(ex.db.as_ref().unwrap(), "m_keep")
+                .unwrap()
+                .unwrap();
         assert_eq!(keep.content, "用户喜欢并常喝咖啡");
     }
 
@@ -1149,13 +1192,16 @@ mod tests {
                 &json!({ "mem_id": "m_stale", "new_salience": 1 }),
             )
             .unwrap();
-        assert!(serde_json::from_str::<Value>(&r).unwrap()["ok"].as_bool().unwrap_or(false), "{r}");
-        let got = crate::db::repositories::memories::get_by_mem_id(
-            ex.db.as_ref().unwrap(),
-            "m_stale",
-        )
-        .unwrap()
-        .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&r).unwrap()["ok"]
+                .as_bool()
+                .unwrap_or(false),
+            "{r}"
+        );
+        let got =
+            crate::db::repositories::memories::get_by_mem_id(ex.db.as_ref().unwrap(), "m_stale")
+                .unwrap()
+                .unwrap();
         assert_eq!(got.salience, 1);
         // 不存在的 mem_id 报错
         let r2 = ex.execute(
@@ -1172,17 +1218,28 @@ mod tests {
         let r = ex
             .execute("set_agent_name", &json!({ "name": "小白龙" }))
             .unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&r).unwrap()["agent_name"], "小白龙");
-        let stored = crate::db::repositories::config::get_config(ex.db.as_ref().unwrap(), "agent_name")
-            .unwrap()
-            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&r).unwrap()["agent_name"],
+            "小白龙"
+        );
+        let stored =
+            crate::db::repositories::config::get_config(ex.db.as_ref().unwrap(), "agent_name")
+                .unwrap()
+                .unwrap();
         assert_eq!(stored, "小白龙");
         // 非法字符
         let r2 = ex.execute("set_agent_name", &json!({ "name": "bad!name" }));
         assert!(r2.is_err());
         // 位置
-        let r3 = ex.execute("set_location", &json!({ "city": "北京" })).unwrap();
-        assert!(serde_json::from_str::<Value>(&r3).unwrap()["ok"].as_bool().unwrap_or(false), "{r3}");
+        let r3 = ex
+            .execute("set_location", &json!({ "city": "北京" }))
+            .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&r3).unwrap()["ok"]
+                .as_bool()
+                .unwrap_or(false),
+            "{r3}"
+        );
     }
 
     #[test]
@@ -1221,8 +1278,15 @@ mod tests {
         );
         assert!(r4.is_err());
         // 完成
-        let r5 = ex.execute("complete_task", &json!({ "summary": "完成" })).unwrap();
-        assert!(serde_json::from_str::<Value>(&r5).unwrap()["ok"].as_bool().unwrap_or(false), "{r5}");
+        let r5 = ex
+            .execute("complete_task", &json!({ "summary": "完成" }))
+            .unwrap();
+        assert!(
+            serde_json::from_str::<Value>(&r5).unwrap()["ok"]
+                .as_bool()
+                .unwrap_or(false),
+            "{r5}"
+        );
         // 已完成后再完成 → 报错
         let r6 = ex.execute("complete_task", &json!({}));
         assert!(r6.is_err());
@@ -1247,7 +1311,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Db::open(dir.path().join("t.db")).unwrap();
         let ex = executor(db);
-        let r = ex.execute("find_tool", &json!({ "query": "运行命令" })).unwrap();
+        let r = ex
+            .execute("find_tool", &json!({ "query": "运行命令" }))
+            .unwrap();
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["ok"], true, "{v}");
         let names: Vec<&str> = v["loaded"]

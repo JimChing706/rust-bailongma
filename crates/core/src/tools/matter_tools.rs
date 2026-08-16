@@ -38,7 +38,12 @@ pub fn matter_create_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value
             "matter_create 未接线（未注入 Db，当前轮不可用）".into(),
         ));
     };
-    let s = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let s = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
     let id = crate::matter::create(
         db,
         &s("title"),
@@ -409,7 +414,9 @@ mod tests {
                 [],
             )
             .unwrap();
-        let r2 = ex.execute("matter_query", &json!({ "action": "ghosts" })).unwrap();
+        let r2 = ex
+            .execute("matter_query", &json!({ "action": "ghosts" }))
+            .unwrap();
         let v2: Value = serde_json::from_str(&r2).unwrap();
         assert_eq!(v2["count"], 1, "{v2}");
         assert!(v2["stale_before"].as_str().unwrap().contains("20"));
@@ -446,7 +453,10 @@ mod tests {
         let child = v["id"].as_i64().unwrap();
 
         let r2 = ex
-            .execute("matter_query", &json!({ "action": "children", "id": parent }))
+            .execute(
+                "matter_query",
+                &json!({ "action": "children", "id": parent }),
+            )
             .unwrap();
         let v2: Value = serde_json::from_str(&r2).unwrap();
         assert_eq!(v2["count"], 1, "{v2}");

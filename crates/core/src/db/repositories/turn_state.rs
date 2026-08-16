@@ -43,11 +43,15 @@ pub fn create_turn(
     recover_policy: &str,
 ) -> Result<i64> {
     let conn = db.conn();
-    conn.execute(
+    // M22（审计修复）：idempotency_key 部分唯一索引（WHERE idempotency_key != ''）。
+    // 并发/在途重复同 key 时不再报错（旧「降级继续」会导致双执行），而是 ON CONFLICT
+    // DO NOTHING 并返回 0，由调用方按「已存在」重查该行处理。
+    let n = conn.execute(
         "INSERT INTO turn_state
            (state, round, attempt, idempotency_key, conversation_id, channel, from_id,
             input_snapshot, recover_policy, started_at)
-         VALUES ('received', 0, 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+         VALUES ('received', 0, 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(idempotency_key) WHERE idempotency_key != '' DO NOTHING",
         rusqlite::params![
             idempotency_key,
             conversation_id,
@@ -58,6 +62,9 @@ pub fn create_turn(
             started_at
         ],
     )?;
+    if n == 0 {
+        return Ok(0); // 冲突：同 idempotency_key 已存在
+    }
     Ok(conn.last_insert_rowid())
 }
 
@@ -237,11 +244,78 @@ mod tests {
     }
 
     #[test]
+    fn create_turn_conflict_returns_zero() {
+        // M22（审计修复）：同 idempotency_key 二次建行应返回 0（ON CONFLICT DO NOTHING），
+        // 供调用方按「已存在」处理，而非报错「降级继续」导致重复执行。
+        let db = test_db();
+        let first = create_turn(
+            &db,
+            "2026-08-10T18:00:00+08:00",
+            "dup-key",
+            "TUI",
+            "ID:000001",
+            "hello",
+            Some(1),
+            "retry",
+        )
+        .unwrap();
+        assert!(first > 0);
+
+        let second = create_turn(
+            &db,
+            "2026-08-10T18:00:01+08:00",
+            "dup-key",
+            "TUI",
+            "ID:000001",
+            "hello-again",
+            Some(2),
+            "retry",
+        )
+        .unwrap();
+        assert_eq!(second, 0, "同 key 二次建行应返回 0 而非报错");
+
+        // 查回仍是首行（未被覆盖）
+        let row = find_by_idempotency_key(&db, "dup-key").unwrap().unwrap();
+        assert_eq!(row.turn_id, first);
+        assert_eq!(row.input_snapshot, "hello");
+    }
+
+    #[test]
     fn scan_unfinished_returns_only_active() {
         let db = test_db();
-        let a = create_turn(&db, "2026-08-10T18:00:00+08:00", "k-a", "TUI", "ID:000001", "a", None, "retry").unwrap();
-        let b = create_turn(&db, "2026-08-10T18:01:00+08:00", "k-b", "TUI", "ID:000001", "b", None, "mark_failed").unwrap();
-        let c = create_turn(&db, "2026-08-10T18:02:00+08:00", "k-c", "TUI", "ID:000001", "c", None, "retry").unwrap();
+        let a = create_turn(
+            &db,
+            "2026-08-10T18:00:00+08:00",
+            "k-a",
+            "TUI",
+            "ID:000001",
+            "a",
+            None,
+            "retry",
+        )
+        .unwrap();
+        let b = create_turn(
+            &db,
+            "2026-08-10T18:01:00+08:00",
+            "k-b",
+            "TUI",
+            "ID:000001",
+            "b",
+            None,
+            "mark_failed",
+        )
+        .unwrap();
+        let c = create_turn(
+            &db,
+            "2026-08-10T18:02:00+08:00",
+            "k-c",
+            "TUI",
+            "ID:000001",
+            "c",
+            None,
+            "retry",
+        )
+        .unwrap();
         set_state(&db, a, "running").unwrap();
         mark_finished(&db, b, "completed", "2026-08-10T18:03:00+08:00").unwrap();
         mark_finished(&db, c, "cancelled", "2026-08-10T18:03:00+08:00").unwrap();
@@ -255,7 +329,17 @@ mod tests {
     #[test]
     fn bump_attempt_increments() {
         let db = test_db();
-        let id = create_turn(&db, "2026-08-10T18:00:00+08:00", "k-d", "TUI", "ID:000001", "d", None, "retry").unwrap();
+        let id = create_turn(
+            &db,
+            "2026-08-10T18:00:00+08:00",
+            "k-d",
+            "TUI",
+            "ID:000001",
+            "d",
+            None,
+            "retry",
+        )
+        .unwrap();
         assert_eq!(bump_attempt(&db, id).unwrap(), 2);
         assert_eq!(bump_attempt(&db, id).unwrap(), 3);
         let t = get_turn(&db, id).unwrap().unwrap();
@@ -266,7 +350,17 @@ mod tests {
     fn find_by_idempotency_key_roundtrip() {
         // A4（审计修复）：入口幂等校验的数据层支撑
         let db = test_db();
-        let id = create_turn(&db, "2026-08-10T18:00:00+08:00", "k-e", "TUI", "ID:000001", "e", None, "retry").unwrap();
+        let id = create_turn(
+            &db,
+            "2026-08-10T18:00:00+08:00",
+            "k-e",
+            "TUI",
+            "ID:000001",
+            "e",
+            None,
+            "retry",
+        )
+        .unwrap();
         mark_finished(&db, id, "completed", "2026-08-10T18:01:00+08:00").unwrap();
 
         let hit = find_by_idempotency_key(&db, "k-e").unwrap().unwrap();

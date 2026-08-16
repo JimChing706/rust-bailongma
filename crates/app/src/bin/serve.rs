@@ -26,12 +26,15 @@ async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--port" {
-            let value = args.next().ok_or_else(|| {
-                CoreError::Api("--port 需要端口号参数".into())
-            })?;
-            port = Some(value.trim().parse::<u16>().map_err(|e| {
-                CoreError::Api(format!("--port 参数非法: {value} ({e})"))
-            })?);
+            let value = args
+                .next()
+                .ok_or_else(|| CoreError::Api("--port 需要端口号参数".into()))?;
+            port = Some(
+                value
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|e| CoreError::Api(format!("--port 参数非法: {value} ({e})")))?,
+            );
         }
     }
     match port {

@@ -195,10 +195,7 @@ pub struct RecoverySummary {
 pub fn recover_unfinished_turns(db: &Db) -> crate::error::Result<RecoverySummary> {
     let mut summary = RecoverySummary::default();
     for row in turn_state::scan_unfinished(db)? {
-        let state: TurnState = row
-            .state
-            .parse()
-            .map_err(|e: String| CoreError::State(e))?;
+        let state: TurnState = row.state.parse().map_err(|e: String| CoreError::State(e))?;
         let policy: RecoverPolicy = row
             .recover_policy
             .parse()
@@ -209,12 +206,25 @@ pub fn recover_unfinished_turns(db: &Db) -> crate::error::Result<RecoverySummary
                     turn_state::bump_attempt(db, row.turn_id)?;
                 }
                 turn_state::set_state(db, row.turn_id, "running")?;
+                // M24（审计修复）：当前无 resume 执行路径——恢复为 running 的 turn 不会被真正
+                // 重放，显式告警避免「名义恢复」无人知晓。
+                tracing::warn!(
+                    turn_id = row.turn_id,
+                    "[turn] 恢复为 running，但无 resume 执行路径，需人工介入"
+                );
                 summary.recovered += 1;
             }
             RecoverDecision::MarkFailed => {
                 let note = format!("startup recovery: {} policy", policy.as_str());
                 turn_state::set_error(db, row.turn_id, &note)?;
-                turn_state::mark_finished(db, row.turn_id, "failed", &now_ts())?;
+                // M23（审计修复）：received→failed 违反转移白名单（received 只能→running/cancelled）。
+                // 未启动即失败的 turn 按 cancelled 终态收口，保持状态机一致。
+                let target = if state.can_transition_to(TurnState::Failed) {
+                    "failed"
+                } else {
+                    "cancelled"
+                };
+                turn_state::mark_finished(db, row.turn_id, target, &now_ts())?;
                 summary.marked_failed += 1;
             }
             RecoverDecision::Hold => {
@@ -278,10 +288,7 @@ mod tests {
             "mark_failed".parse::<RecoverPolicy>().unwrap(),
             RecoverPolicy::MarkFailed
         );
-        assert_eq!(
-            RecoverPolicy::Retry.as_str(),
-            "retry"
-        );
+        assert_eq!(RecoverPolicy::Retry.as_str(), "retry");
     }
 
     #[test]
@@ -348,28 +355,46 @@ mod tests {
         let db = open_database(dir.path().join("t.db")).unwrap();
 
         // resume → recovered（running，attempt 不动）
-        let a = turn_state::create_turn(&db, "t1", "rk-a", "TUI", "ID:000001", "a", None, "resume").unwrap();
+        let a = turn_state::create_turn(&db, "t1", "rk-a", "TUI", "ID:000001", "a", None, "resume")
+            .unwrap();
         turn_state::set_state(&db, a, "running").unwrap();
         // retry 未超限 → recovered（running，attempt+1）
-        let f = turn_state::create_turn(&db, "t6", "rk-f", "TUI", "ID:000001", "f", None, "retry").unwrap();
+        let f = turn_state::create_turn(&db, "t6", "rk-f", "TUI", "ID:000001", "f", None, "retry")
+            .unwrap();
         turn_state::set_state(&db, f, "running").unwrap();
         // retry 超限（attempt=3 = max）→ marked_failed
-        let b = turn_state::create_turn(&db, "t2", "rk-b", "TUI", "ID:000001", "b", None, "retry").unwrap();
+        let b = turn_state::create_turn(&db, "t2", "rk-b", "TUI", "ID:000001", "b", None, "retry")
+            .unwrap();
         turn_state::set_state(&db, b, "running").unwrap();
         turn_state::bump_attempt(&db, b).unwrap(); // 2
         turn_state::bump_attempt(&db, b).unwrap(); // 3
-        // mark_failed 策略 → marked_failed
-        let c = turn_state::create_turn(&db, "t3", "rk-c", "TUI", "ID:000001", "c", None, "mark_failed").unwrap();
+                                                   // mark_failed 策略 → marked_failed
+        let c = turn_state::create_turn(
+            &db,
+            "t3",
+            "rk-c",
+            "TUI",
+            "ID:000001",
+            "c",
+            None,
+            "mark_failed",
+        )
+        .unwrap();
         turn_state::set_state(&db, c, "running").unwrap();
         // waiting_approval（即使 retry 策略）→ held
-        let d = turn_state::create_turn(&db, "t4", "rk-d", "TUI", "ID:000001", "d", None, "retry").unwrap();
+        let d = turn_state::create_turn(&db, "t4", "rk-d", "TUI", "ID:000001", "d", None, "retry")
+            .unwrap();
         turn_state::set_state(&db, d, "waiting_approval").unwrap();
         // 终态不参与扫描
-        let e = turn_state::create_turn(&db, "t5", "rk-e", "TUI", "ID:000001", "e", None, "retry").unwrap();
+        let e = turn_state::create_turn(&db, "t5", "rk-e", "TUI", "ID:000001", "e", None, "retry")
+            .unwrap();
         turn_state::mark_finished(&db, e, "completed", "now").unwrap();
 
         let summary = recover_unfinished_turns(&db).unwrap();
-        assert_eq!(summary.recovered, 2, "a(resume) + f(retry未超限) 恢复为 running");
+        assert_eq!(
+            summary.recovered, 2,
+            "a(resume) + f(retry未超限) 恢复为 running"
+        );
         assert_eq!(summary.marked_failed, 2, "b(retry超限) + c(mark_failed)");
         assert_eq!(summary.held, 1, "d(waiting_approval) 保持挂起");
 
@@ -382,12 +407,42 @@ mod tests {
         let tb = turn_state::get_turn(&db, b).unwrap().unwrap();
         assert_eq!(tb.state, "failed");
         assert_eq!(tb.attempt, 3);
-        assert!(tb.last_error.contains("startup recovery"), "失败原因落审计: {}", tb.last_error);
+        assert!(
+            tb.last_error.contains("startup recovery"),
+            "失败原因落审计: {}",
+            tb.last_error
+        );
         let tc = turn_state::get_turn(&db, c).unwrap().unwrap();
         assert_eq!(tc.state, "failed");
         let td = turn_state::get_turn(&db, d).unwrap().unwrap();
         assert_eq!(td.state, "waiting_approval", "人工确认绝不自动终结");
         let te = turn_state::get_turn(&db, e).unwrap().unwrap();
         assert_eq!(te.state, "completed");
+    }
+
+    /// M23（审计修复）：received→failed 违反白名单，未启动的 turn 按 cancelled 收口。
+    #[test]
+    fn received_turn_mark_failed_becomes_cancelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_database(dir.path().join("t.db")).unwrap();
+        let id = turn_state::create_turn(
+            &db,
+            "t1",
+            "rk-mf",
+            "TUI",
+            "ID:000001",
+            "x",
+            None,
+            "mark_failed",
+        )
+        .unwrap();
+        // 不 set_state → 保持 received（模拟建行后、跑起来前崩溃）
+        let summary = recover_unfinished_turns(&db).unwrap();
+        assert_eq!(summary.marked_failed, 1);
+        let row = turn_state::get_turn(&db, id).unwrap().unwrap();
+        assert_eq!(
+            row.state, "cancelled",
+            "received 未启动应 cancelled 而非 failed（M23）"
+        );
     }
 }

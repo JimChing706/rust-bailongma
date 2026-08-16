@@ -120,12 +120,7 @@ impl WindowManagerState {
     }
 }
 
-fn capture_window(
-    window: &Window,
-    state: &mut PersistedWindowState,
-    visible: bool,
-    open: bool,
-) {
+fn capture_window(window: &Window, state: &mut PersistedWindowState, visible: bool, open: bool) {
     let size = window.inner_size();
     state.width = size.width as f64;
     state.height = size.height as f64;

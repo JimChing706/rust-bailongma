@@ -1,4 +1,4 @@
-﻿//! ApprovalGate —— 高风险工具人工确认门（Phase 1 安全基线）。
+//! ApprovalGate —— 高风险工具人工确认门（Phase 1 安全基线）。
 //!
 //! 计划（bailongma-multiagent-enhancement Phase 1「人工确认机制」）：
 //! 高风险工具调用产生 approval 请求 → WS/scene 面板推送（choice 卡片）→
@@ -134,8 +134,9 @@ impl ApprovalGate {
         *seq += 1;
         // 审计 S3 修复：追加进程级随机熵（RandomState 每次实例化播种不同），
         // 防止仅凭时间戳+序号即可预测/枚举的 id（可被其他会话猜测污染挂起表）。
-        let entropy =
-            std::collections::hash_map::RandomState::new().build_hasher().finish();
+        let entropy = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
         format!("ap_{}_{}_{:016x}", now_ms(), seq, entropy)
     }
 
@@ -158,7 +159,9 @@ impl ApprovalGate {
         let session_ok = self.inner.lock().unwrap().session_approved.contains(tool);
         let decision = {
             let mut inner = self.inner.lock().unwrap();
-            inner.policy.check_tool_call_with_caller(tool, caller, session_ok)
+            inner
+                .policy
+                .check_tool_call_with_caller(tool, caller, session_ok)
         };
         let guard_summary = decision.summary();
         crate::trace::global().record(tool, "guard", &guard_summary, detail, 0, true);
@@ -394,9 +397,7 @@ mod tests {
     fn modify_returns_modified_with_new_params() {
         let g = gate();
         let g2 = g.clone();
-        let handle = thread::spawn(move || {
-            g2.guard_tool_call("exec_command", "dir").unwrap()
-        });
+        let handle = thread::spawn(move || g2.guard_tool_call("exec_command", "dir").unwrap());
         let id = wait_pending(&g);
         g.submit(&id, "modify:dir /b").unwrap();
         assert_eq!(
@@ -451,7 +452,10 @@ mod tests {
 
     #[test]
     fn choice_parse_roundtrip() {
-        assert_eq!(ApprovalChoice::parse("allow_once"), ApprovalChoice::AllowOnce);
+        assert_eq!(
+            ApprovalChoice::parse("allow_once"),
+            ApprovalChoice::AllowOnce
+        );
         assert_eq!(ApprovalChoice::parse("deny"), ApprovalChoice::Deny);
         // Phase 2：未知值 fail-closed 按拒绝处理（原兜底会静默变成改参意图）
         assert_eq!(ApprovalChoice::parse("anything_else"), ApprovalChoice::Deny);
@@ -470,6 +474,9 @@ mod tests {
         let id = wait_pending(&g);
         g.submit(&id, "allow_once").unwrap();
         assert_eq!(handle.join().unwrap(), GuardResult::Proceed);
-        assert_eq!(seen.lock().unwrap().as_slice(), &["exec_command".to_string()]);
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["exec_command".to_string()]
+        );
     }
 }

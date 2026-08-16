@@ -16,6 +16,7 @@ use crate::db::repositories::llm_metrics::{
     find_tool_call_result, upsert_tool_calls_batch, LlmToolCallRow,
 };
 use crate::db::Db;
+use crate::llm::types::{mask_tool_args_for_ledger, stable_stringify};
 
 /// 工具防重放守卫（可插拔；DB 实现见 [`DbToolReplayGuard`]）。
 pub trait ToolReplayGuard: Send + Sync {
@@ -63,8 +64,13 @@ impl ToolReplayGuard for DbToolReplayGuard {
         tool_name: &str,
         args: &Value,
     ) -> Option<String> {
-        match find_tool_call_result(&self.db, request_id, round as i64, tool_name, &args.to_string())
-        {
+        match find_tool_call_result(
+            &self.db,
+            request_id,
+            round as i64,
+            tool_name,
+            &stable_stringify(&mask_tool_args_for_ledger(tool_name, args)),
+        ) {
             Ok(Some(r)) => Some(r),
             Ok(None) => None,
             Err(e) => {
@@ -92,7 +98,7 @@ impl ToolReplayGuard for DbToolReplayGuard {
                 round: round as i64,
                 attempt: 1,
                 tool_name: tool_name.to_string(),
-                args_json: args.to_string(),
+                args_json: stable_stringify(&mask_tool_args_for_ledger(tool_name, args)),
                 result_json: result.to_string(),
                 status: status.to_string(),
                 duration_ms,

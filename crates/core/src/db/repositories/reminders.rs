@@ -102,7 +102,14 @@ mod tests {
         conn.execute(
             "INSERT INTO reminders (user_id, due_at, task, system_message, status, source)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params!["ID:000001", due_at, task, format!("sys:{task}"), status, "test"],
+            rusqlite::params![
+                "ID:000001",
+                due_at,
+                task,
+                format!("sys:{task}"),
+                status,
+                "test"
+            ],
         )
         .unwrap();
         conn.last_insert_rowid()
@@ -137,11 +144,9 @@ mod tests {
 
         let conn = db.conn();
         let fired_at: String = conn
-            .query_row(
-                "SELECT fired_at FROM reminders WHERE id = ?1",
-                [a],
-                |r| r.get(0),
-            )
+            .query_row("SELECT fired_at FROM reminders WHERE id = ?1", [a], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(fired_at, "2026-08-10T09:00:00+08:00");
     }
@@ -149,7 +154,10 @@ mod tests {
     #[test]
     fn mark_fired_empty_noop() {
         let db = test_db();
-        assert_eq!(mark_fired(&db, &[], "2026-08-10T09:00:00+08:00").unwrap(), 0);
+        assert_eq!(
+            mark_fired(&db, &[], "2026-08-10T09:00:00+08:00").unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -176,7 +184,10 @@ mod tests {
         //   d: 2026-08-09T23:30:00Z（早于 now）
         // 四条全部 <= now（含等号边界）→ 全到期，且顺序按 UTC 升序：c(16:00) < d(23:30) < a=b(00:00)
         assert_eq!(due.len(), 4, "四条均到期（<= 含边界）");
-        assert_eq!(due[0].task, "晚1h", "UTC 最早：+09:00 对应 UTC 前一日 16:00");
+        assert_eq!(
+            due[0].task, "晚1h",
+            "UTC 最早：+09:00 对应 UTC 前一日 16:00"
+        );
         assert_eq!(due[1].task, "早0.5h", "其次 23:30Z");
         // a 与 b 为同一 UTC 时刻，两者相对顺序不保证（无稳定排序），仅断言集合
         let mut tail: Vec<&str> = due[2..4].iter().map(|r| r.task.as_str()).collect();

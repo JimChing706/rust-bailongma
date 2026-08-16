@@ -258,13 +258,7 @@ pub fn create(
 }
 
 /// 授权/收回某个决策点（命题6）。只有发起人（人类）能改委托地图。
-pub fn delegate(
-    db: &Db,
-    id: i64,
-    actor: &str,
-    point: DecisionPoint,
-    allowed: bool,
-) -> Result<()> {
+pub fn delegate(db: &Db, id: i64, actor: &str, point: DecisionPoint, allowed: bool) -> Result<()> {
     let row = crate::db::repositories::matters::get(db, id)?
         .ok_or_else(|| crate::error::CoreError::NotFound(format!("事项不存在: {id}")))?;
     if row.creator_id != actor {
@@ -452,7 +446,9 @@ pub fn detect_ghosts(db: &Db, stale_before: &str) -> Result<Vec<GhostCandidate>>
                 db,
                 row.id,
                 "ghost_candidate",
-                format!("幽灵事项：挂起无主且 {stale_before} 前无进展且无验收判据，建议终止或显式搁置"),
+                format!(
+                    "幽灵事项：挂起无主且 {stale_before} 前无进展且无验收判据，建议终止或显式搁置"
+                ),
             )?;
             ghosts.push(GhostCandidate {
                 id: row.id,
@@ -717,7 +713,9 @@ mod tests {
             "",
         )
         .unwrap();
-        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        let row = crate::db::repositories::matters::get(&db, id)
+            .unwrap()
+            .unwrap();
         assert_eq!(delegation_map(&row), DelegationMap::default());
         // 人类发起人始终放行
         assert!(decision_allowed(&db, id, "ID:000001", DecisionPoint::Execute).unwrap());
@@ -742,7 +740,10 @@ mod tests {
         )
         .unwrap();
         // 未授权 execute：执行者不能开工
-        assert!(start(&db, id, "codex").unwrap_err().to_string().contains("未获授权"));
+        assert!(start(&db, id, "codex")
+            .unwrap_err()
+            .to_string()
+            .contains("未获授权"));
 
         // 授权 execute 后走到 awaiting_verification，再分别验证 verify/terminate 门禁
         delegate(&db, id, "ID:000001", DecisionPoint::Execute, true).unwrap();
@@ -784,7 +785,10 @@ mod tests {
         start(&db, id, "codex").unwrap();
         // 收回后再次拒绝
         delegate(&db, id, "ID:000001", DecisionPoint::Execute, false).unwrap();
-        assert!(start(&db, id, "codex").unwrap_err().to_string().contains("非法状态转移"));
+        assert!(start(&db, id, "codex")
+            .unwrap_err()
+            .to_string()
+            .contains("非法状态转移"));
     }
 
     #[test]
@@ -793,22 +797,25 @@ mod tests {
         let id = seed(&db);
 
         start(&db, id, "codex").unwrap();
-        assert!(start(&db, id, "codex").unwrap_err().to_string().contains("非法状态转移"));
+        assert!(start(&db, id, "codex")
+            .unwrap_err()
+            .to_string()
+            .contains("非法状态转移"));
 
         submit_evidence(&db, id, "codex", "工具调用 trace 已落库").unwrap();
-        assert!(
-            submit_evidence(&db, id, "codex", "再次提交")
-                .unwrap_err()
-                .to_string()
-                .contains("非法状态转移")
-        );
+        assert!(submit_evidence(&db, id, "codex", "再次提交")
+            .unwrap_err()
+            .to_string()
+            .contains("非法状态转移"));
 
         // 非登记验证者被拒
         let err = verify(&db, id, "codex").unwrap_err();
         assert!(err.to_string().contains("验证者必须是登记的 jarvis"));
 
         verify(&db, id, "jarvis").unwrap();
-        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        let row = crate::db::repositories::matters::get(&db, id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "completed");
         assert_eq!(row.death_reason, "completed");
         assert!(row.finished_at.is_some());
@@ -830,14 +837,18 @@ mod tests {
         let db = test_db();
         let a = seed(&db);
         cancel(&db, a, "codex").unwrap();
-        let row = crate::db::repositories::matters::get(&db, a).unwrap().unwrap();
+        let row = crate::db::repositories::matters::get(&db, a)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "cancelled");
         assert_eq!(row.death_reason, "cancelled");
 
         let b = seed(&db);
         start(&db, b, "codex").unwrap();
         shelve(&db, b, "codex").unwrap();
-        let row = crate::db::repositories::matters::get(&db, b).unwrap().unwrap();
+        let row = crate::db::repositories::matters::get(&db, b)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "shelved");
     }
 
@@ -857,7 +868,9 @@ mod tests {
 
         let dead = expire_stale(&db, "2026-06-01 00:00:00").unwrap();
         assert_eq!(dead, vec![id]);
-        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        let row = crate::db::repositories::matters::get(&db, id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "expired");
         assert_eq!(row.death_reason, "expired");
         assert!(list_active(&db).unwrap().is_empty());
@@ -971,18 +984,38 @@ mod tests {
             "",
         )
         .unwrap();
-        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        let row = crate::db::repositories::matters::get(&db, id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.intent_original, "让协作者独立跑通工具循环");
 
         // 理解漂移：原=做A 理解=做B → 未对齐，落信号
-        let v = intent_drift_report(&db, id, "让协作者独立跑通消息回复", "让协作者独立跑通消息回复").unwrap();
+        let v = intent_drift_report(
+            &db,
+            id,
+            "让协作者独立跑通消息回复",
+            "让协作者独立跑通消息回复",
+        )
+        .unwrap();
         assert!(!v.aligned);
         assert!(v.report.contains("理解漂移"));
-        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
-        assert!(row.signals.contains("intent_drift"), "signals: {}", row.signals);
+        let row = crate::db::repositories::matters::get(&db, id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.signals.contains("intent_drift"),
+            "signals: {}",
+            row.signals
+        );
 
         // 完全对齐 → aligned
-        let v2 = intent_drift_report(&db, id, "让协作者独立跑通工具循环", "让协作者独立跑通工具循环").unwrap();
+        let v2 = intent_drift_report(
+            &db,
+            id,
+            "让协作者独立跑通工具循环",
+            "让协作者独立跑通工具循环",
+        )
+        .unwrap();
         assert!(v2.aligned);
     }
 
@@ -1034,7 +1067,9 @@ mod tests {
         submit_evidence(&db, parent, "codex", "全部子项已处理").unwrap();
         verify(&db, parent, "jarvis").unwrap();
 
-        let prow = crate::db::repositories::matters::get(&db, parent).unwrap().unwrap();
+        let prow = crate::db::repositories::matters::get(&db, parent)
+            .unwrap()
+            .unwrap();
         assert!(
             prow.signals.contains("additivity_violation"),
             "signals: {}",
@@ -1048,7 +1083,18 @@ mod tests {
     fn verifier_defaults_to_executor_self_verified() {
         let db = test_db();
         let id = create(
-            &db, "自证事项", "e", "c", "g", "crit", "ID:000001", Some("codex"), None, None, "", "",
+            &db,
+            "自证事项",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            None,
+            None,
+            "",
+            "",
         )
         .unwrap();
         delegate(&db, id, "ID:000001", DecisionPoint::Execute, true).unwrap();
@@ -1057,19 +1103,39 @@ mod tests {
         submit_evidence(&db, id, "codex", "证据").unwrap();
         verify(&db, id, "codex").unwrap();
 
-        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        let row = crate::db::repositories::matters::get(&db, id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "completed");
         assert!(row.self_verified, "执行者自证应落 self_verified=true");
-        assert!(row.signals.contains("self_verified"), "signals: {}", row.signals);
+        assert!(
+            row.signals.contains("self_verified"),
+            "signals: {}",
+            row.signals
+        );
         let events = crate::db::repositories::matters::list_events(&db, id).unwrap();
-        assert!(events.iter().any(|e| e.event_type == "completed"), "应记录 completed 事件");
+        assert!(
+            events.iter().any(|e| e.event_type == "completed"),
+            "应记录 completed 事件"
+        );
     }
 
     #[test]
     fn explicit_verifier_not_self_verified() {
         let db = test_db();
         let id = create(
-            &db, "独立验证", "e", "c", "g", "crit", "ID:000001", Some("codex"), Some("jarvis"), None, "", "",
+            &db,
+            "独立验证",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            Some("jarvis"),
+            None,
+            "",
+            "",
         )
         .unwrap();
         delegate(&db, id, "ID:000001", DecisionPoint::Execute, true).unwrap();
@@ -1078,7 +1144,9 @@ mod tests {
         submit_evidence(&db, id, "codex", "证据").unwrap();
         verify(&db, id, "jarvis").unwrap();
 
-        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
+        let row = crate::db::repositories::matters::get(&db, id)
+            .unwrap()
+            .unwrap();
         assert_eq!(row.status, "completed");
         assert!(!row.self_verified, "独立验证者完成不应标记 self_verified");
     }
@@ -1087,7 +1155,18 @@ mod tests {
     fn self_verify_requires_executor() {
         let db = test_db();
         let id = create(
-            &db, "自证越权", "e", "c", "g", "crit", "ID:000001", Some("codex"), None, None, "", "",
+            &db,
+            "自证越权",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            None,
+            None,
+            "",
+            "",
         )
         .unwrap();
         delegate(&db, id, "ID:000001", DecisionPoint::Verify, true).unwrap();
@@ -1104,9 +1183,15 @@ mod tests {
         shelve(&db, c2, "ID:000001").unwrap();
 
         let ev1 = crate::db::repositories::matters::list_events(&db, c1).unwrap();
-        assert!(ev1.iter().any(|e| e.event_type == "cancelled"), "缺 cancelled 事件");
+        assert!(
+            ev1.iter().any(|e| e.event_type == "cancelled"),
+            "缺 cancelled 事件"
+        );
         let ev2 = crate::db::repositories::matters::list_events(&db, c2).unwrap();
-        assert!(ev2.iter().any(|e| e.event_type == "shelved"), "缺 shelved 事件");
+        assert!(
+            ev2.iter().any(|e| e.event_type == "shelved"),
+            "缺 shelved 事件"
+        );
     }
 
     #[test]
@@ -1133,7 +1218,18 @@ mod tests {
     fn ghost_detected_when_orphan_idle_no_criteria() {
         let db = test_db();
         let id = create(
-            &db, "幽灵", "e", "c", "g", "crit", "ID:000001", None, None, None, "", "",
+            &db,
+            "幽灵",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            None,
+            None,
+            None,
+            "",
+            "",
         )
         .unwrap();
         // 模拟老数据：无验收判据 + 长时间未动
@@ -1146,8 +1242,14 @@ mod tests {
         let ghosts = detect_ghosts(&db, "2021-01-01 00:00:00").unwrap();
         assert_eq!(ghosts.len(), 1, "应识别 1 个幽灵事项: {ghosts:?}");
         assert_eq!(ghosts[0].id, id);
-        let row = crate::db::repositories::matters::get(&db, id).unwrap().unwrap();
-        assert!(row.signals.contains("ghost_candidate"), "signals: {}", row.signals);
+        let row = crate::db::repositories::matters::get(&db, id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            row.signals.contains("ghost_candidate"),
+            "signals: {}",
+            row.signals
+        );
     }
 
     #[test]
@@ -1155,7 +1257,18 @@ mod tests {
         let db = test_db();
         // 有主 + 老 + 无判据 → 不算幽灵（有主）
         let owned = create(
-            &db, "有主", "e", "c", "g", "crit", "ID:000001", Some("codex"), None, None, "", "",
+            &db,
+            "有主",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            Some("codex"),
+            None,
+            None,
+            "",
+            "",
         )
         .unwrap();
         db.conn()
@@ -1166,7 +1279,18 @@ mod tests {
             .unwrap();
         // 无主 + 新 + 无判据 → 不算幽灵（有进展）
         let fresh = create(
-            &db, "活跃", "e", "c", "g", "crit", "ID:000001", None, None, None, "", "",
+            &db,
+            "活跃",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            None,
+            None,
+            None,
+            "",
+            "",
         )
         .unwrap();
         db.conn()
@@ -1177,11 +1301,25 @@ mod tests {
             .unwrap();
         // 无主 + 老 + 有判据 → 不算幽灵（有验收判据）
         let crit = create(
-            &db, "有判据", "e", "c", "g", "crit", "ID:000001", None, None, None, "", "",
+            &db,
+            "有判据",
+            "e",
+            "c",
+            "g",
+            "crit",
+            "ID:000001",
+            None,
+            None,
+            None,
+            "",
+            "",
         )
         .unwrap();
         db.conn()
-            .execute("UPDATE matters SET updated_at = '2020-01-01 00:00:00' WHERE id = ?1", (crit,))
+            .execute(
+                "UPDATE matters SET updated_at = '2020-01-01 00:00:00' WHERE id = ?1",
+                (crit,),
+            )
             .unwrap();
 
         let ghosts = detect_ghosts(&db, "2021-01-01 00:00:00").unwrap();

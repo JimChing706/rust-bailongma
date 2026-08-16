@@ -49,10 +49,7 @@ pub enum MetricEvent {
         stage: String,
     },
     /// 首个内容 chunk（TTFT；reasoning / 正文 / 工具调用任一先到即算）
-    Ttft {
-        request_id: String,
-        ttft_ms: i64,
-    },
+    Ttft { request_id: String, ttft_ms: i64 },
     /// 流正常收尾（含外部中止）
     CallFinished {
         request_id: String,
@@ -134,7 +131,8 @@ impl MetricsCollector {
 #[derive(Clone)]
 pub struct FlusherHandle {
     tx: mpsc::UnboundedSender<FlushCmd>,
-    #[allow(dead_code)] // 预留：shutdown 完整等待用（当前只发命令不 await，进程退出最多丢最后 30s）
+    #[allow(dead_code)]
+    // 预留：shutdown 完整等待用（当前只发命令不 await，进程退出最多丢最后 30s）
     join: Arc<JoinHandle<()>>,
 }
 
@@ -306,15 +304,14 @@ fn apply_event(
             // 重试的第 2+ 次 attempt 也发 CallStarted：entry 已存在则保留首条（不覆盖）
             let day = started_at.get(..10).unwrap_or("").to_string();
             let is_new = !agg.contains_key(request_id);
-            agg.entry(request_id.clone())
-                .or_insert_with(|| {
-                    let mut a = LlmCallAgg::new(request_id, provider, model, started_at, &day);
-                    a.stage = stage.clone();
-                    AggEntry {
-                        row: a,
-                        daily: DailyState::Open,
-                    }
-                });
+            agg.entry(request_id.clone()).or_insert_with(|| {
+                let mut a = LlmCallAgg::new(request_id, provider, model, started_at, &day);
+                a.stage = stage.clone();
+                AggEntry {
+                    row: a,
+                    daily: DailyState::Open,
+                }
+            });
             // M3（波3·片3）：ContextStats 先到时（真实装配顺序 record_context_stats →
             // CallStarted）补挂暂存的 context_bytes
             if is_new {
@@ -751,32 +748,67 @@ pub fn compute_context_stats(out: &crate::memory::injector::InjectorOutput) -> C
         };
     }
     section!("memories", !out.memories.is_empty(), "{:?}", out.memories);
-    section!("active_policies", !out.active_policies.is_empty(), "{:?}", out.active_policies);
-    section!("recall_memories", !out.recall_memories.is_empty(), "{:?}", out.recall_memories);
+    section!(
+        "active_policies",
+        !out.active_policies.is_empty(),
+        "{:?}",
+        out.active_policies
+    );
+    section!(
+        "recall_memories",
+        !out.recall_memories.is_empty(),
+        "{:?}",
+        out.recall_memories
+    );
     section!(
         "conversation_window",
         !out.conversation_window.is_empty(),
         "{:?}",
         out.conversation_window
     );
-    section!("person_memory", out.person_memory.is_some(), "{:?}", out.person_memory);
+    section!(
+        "person_memory",
+        out.person_memory.is_some(),
+        "{:?}",
+        out.person_memory
+    );
     section!(
         "user_profile",
         !out.user_profile.as_deref().unwrap_or("").is_empty(),
         "{:?}",
         out.user_profile
     );
-    section!("directions", !out.directions.is_empty(), "{:?}", out.directions);
-    section!("constraints", !out.constraints.is_empty(), "{:?}", out.constraints);
+    section!(
+        "directions",
+        !out.directions.is_empty(),
+        "{:?}",
+        out.directions
+    );
+    section!(
+        "constraints",
+        !out.constraints.is_empty(),
+        "{:?}",
+        out.constraints
+    );
     section!(
         "thought",
         !out.thought.as_deref().unwrap_or("").is_empty(),
         "{:?}",
         out.thought
     );
-    section!("task_knowledge", !out.task_knowledge.is_empty(), "{:?}", out.task_knowledge);
+    section!(
+        "task_knowledge",
+        !out.task_knowledge.is_empty(),
+        "{:?}",
+        out.task_knowledge
+    );
     section!("tools", !out.tools.is_empty(), "{:?}", out.tools);
-    section!("action_log", !out.action_log.is_empty(), "{:?}", out.action_log);
+    section!(
+        "action_log",
+        !out.action_log.is_empty(),
+        "{:?}",
+        out.action_log
+    );
     section!(
         "prefetched_items",
         !out.prefetched_items.is_empty(),
@@ -789,7 +821,12 @@ pub fn compute_context_stats(out: &crate::memory::injector::InjectorOutput) -> C
         "{:?}",
         out.ui_signal_summary
     );
-    section!("temporal_recall", out.temporal_recall.is_some(), "{:?}", out.temporal_recall);
+    section!(
+        "temporal_recall",
+        out.temporal_recall.is_some(),
+        "{:?}",
+        out.temporal_recall
+    );
     section!(
         "self_perception",
         !out.self_perception.as_deref().unwrap_or("").is_empty(),
@@ -802,22 +839,21 @@ pub fn compute_context_stats(out: &crate::memory::injector::InjectorOutput) -> C
         "{:?}",
         out.self_snapshot
     );
-    section!("self_evolution", !out.self_evolution.is_empty(), "{:?}", out.self_evolution);
+    section!(
+        "self_evolution",
+        !out.self_evolution.is_empty(),
+        "{:?}",
+        out.self_evolution
+    );
     section!(
         "browser_runtime_text",
-        !out.browser_runtime_text
-            .as_deref()
-            .unwrap_or("")
-            .is_empty(),
+        !out.browser_runtime_text.as_deref().unwrap_or("").is_empty(),
         "{:?}",
         out.browser_runtime_text
     );
     section!(
         "weather_runtime_text",
-        !out.weather_runtime_text
-            .as_deref()
-            .unwrap_or("")
-            .is_empty(),
+        !out.weather_runtime_text.as_deref().unwrap_or("").is_empty(),
         "{:?}",
         out.weather_runtime_text
     );
@@ -828,7 +864,6 @@ pub fn compute_context_stats(out: &crate::memory::injector::InjectorOutput) -> C
     }
 }
 
-
 /// P3-1 数据驱动缓存友好化：基于历史命中统计重排上下文 section 顺序。
 /// `history`：(section 名, 字节波动率 std/mean)。波动率低 → 内容稳定 → 应前置；
 /// 波动率高 → 内容常变 → 应后置（避免打断 prompt 前缀命中）。
@@ -838,9 +873,8 @@ pub fn relocate_sections(history: &[(String, f64)]) -> Vec<String> {
     // 静态稳定级（0 = 最稳定；与 injector_format::CACHE_FRIENDLY_ORDER 一致）
     let level = |name: &str| -> u32 {
         match name {
-            "self_evolution" | "self_perception" | "constraints" | "active_policies"
-            | "person" | "user_profile" | "task" | "thread" | "threads_background"
-            | "task_knowledge" => 0,
+            "self_evolution" | "self_perception" | "constraints" | "active_policies" | "person"
+            | "user_profile" | "task" | "thread" | "threads_background" | "task_knowledge" => 0,
             "self_snapshot" => 1,
             "temporal" | "memories" | "directions" | "extra" => 2,
             _ => 9,
@@ -848,7 +882,13 @@ pub fn relocate_sections(history: &[(String, f64)]) -> Vec<String> {
     };
     let mut items: Vec<(u32, f64, String)> = history
         .iter()
-        .map(|(name, vol)| (level(name), if vol.is_finite() { vol.abs() } else { f64::MAX }, name.clone()))
+        .map(|(name, vol)| {
+            (
+                level(name),
+                if vol.is_finite() { vol.abs() } else { f64::MAX },
+                name.clone(),
+            )
+        })
         .collect();
     // 补上静态表中未出现在历史里的 section（波动率按最大 → 排同级别末尾）
     let known: std::collections::HashSet<&str> = history.iter().map(|(n, _)| n.as_str()).collect();
@@ -857,7 +897,10 @@ pub fn relocate_sections(history: &[(String, f64)]) -> Vec<String> {
             items.push((level(name), f64::MAX, (*name).to_string()));
         }
     }
-    items.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)));
+    items.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
     items.into_iter().map(|(_, _, n)| n).collect()
 }
 
@@ -993,7 +1036,9 @@ mod tests {
         // 日聚合已累加（total_calls=1，重放未重复计）
         let calls: i64 = db
             .conn()
-            .query_row("SELECT total_calls FROM llm_metrics_daily", [], |r| r.get(0))
+            .query_row("SELECT total_calls FROM llm_metrics_daily", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(calls, 1);
     }
@@ -1262,7 +1307,10 @@ mod tests {
         let ordered = relocate_sections(&hist);
         let i = |n: &str| ordered.iter().position(|s| s == n).unwrap();
         assert!(i("constraints") < i("memories"), "低波动 constraints 前置");
-        assert!(i("directions") < i("memories"), "directions 波动低于 memories 应前置");
+        assert!(
+            i("directions") < i("memories"),
+            "directions 波动低于 memories 应前置"
+        );
         assert!(i("extra") > i("memories"), "extra 波动最高应最后");
 
         // 未知 section 置尾
@@ -1384,7 +1432,10 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(after, "done", "跨 flush 的 round_limit 不得把已落库的 done 降级（L6）");
+        assert_eq!(
+            after, "done",
+            "跨 flush 的 round_limit 不得把已落库的 done 降级（L6）"
+        );
         assert_eq!(err_count, 1, "日聚合错误计数必须 +1");
     }
 
@@ -1516,7 +1567,11 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(ctx_bytes, Some(36), "先到的 ContextStats 必须补挂到 llm_calls");
+        assert_eq!(
+            ctx_bytes,
+            Some(36),
+            "先到的 ContextStats 必须补挂到 llm_calls"
+        );
     }
 
     #[tokio::test]
@@ -1525,7 +1580,8 @@ mod tests {
         let (col, flusher) = init_with(db.clone(), Duration::from_secs(60_000), 10_000);
         let mut session = TurnSession::begin(col.clone());
         let rid = session.request_id().to_string();
-        let stats = session.record_context_stats(&crate::memory::injector::InjectorOutput::default());
+        let stats =
+            session.record_context_stats(&crate::memory::injector::InjectorOutput::default());
         assert_eq!(stats.sections_hit, 0);
         session.finish("created", true, 1);
         flusher.flush_now().await;

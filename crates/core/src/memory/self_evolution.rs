@@ -13,9 +13,9 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::db::models::Memory;
 use crate::db::repositories::config::{get_config, set_config};
 use crate::db::repositories::memories::get_by_mem_id;
-use crate::db::models::Memory;
 use crate::db::Db;
 use crate::error::Result;
 
@@ -131,17 +131,23 @@ fn normalize_state(raw: &str) -> EvolutionState {
             .and_then(|x| x.as_i64())
             .unwrap_or(0)
             .max(0),
-        last_at: v.get("last_at").and_then(|x| x.as_str()).map(str::to_string),
+        last_at: v
+            .get("last_at")
+            .and_then(|x| x.as_str())
+            .map(str::to_string),
         recent,
     }
 }
 
 fn save_state(db: &Db, state: &EvolutionState) -> EvolutionState {
-    let mut normalized = normalize_state(
-        &serde_json::to_string(state).unwrap_or_else(|_| "{}".to_string()),
-    );
+    let mut normalized =
+        normalize_state(&serde_json::to_string(state).unwrap_or_else(|_| "{}".to_string()));
     normalized.recent.truncate(MAX_RECENT);
-    let _ = set_config(db, STATE_KEY, &serde_json::to_string(&normalized).unwrap_or_default());
+    let _ = set_config(
+        db,
+        STATE_KEY,
+        &serde_json::to_string(&normalized).unwrap_or_default(),
+    );
     normalized
 }
 
@@ -199,16 +205,17 @@ fn memory_to_entry(m: &Memory) -> EvolutionEntry {
         })
         .pipe_or(|| m.mem_id.as_deref().and_then(actionable_mem_id))
         .unwrap_or_else(|| "policy".to_string());
-    let mem_id = m
-        .mem_id
-        .clone()
-        .unwrap_or_else(|| format!("row:{}", m.id));
+    let mem_id = m.mem_id.clone().unwrap_or_else(|| format!("row:{}", m.id));
     EvolutionEntry {
         mem_id,
         kind,
         action: "observed".to_string(),
         title: truncate(
-            if !m.title.is_empty() { &m.title } else { &m.content },
+            if !m.title.is_empty() {
+                &m.title
+            } else {
+                &m.content
+            },
             96,
         ),
         content: truncate(&m.content, 240),
@@ -251,7 +258,9 @@ pub fn record_self_evolution_from_memories(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in memories {
         // 对齐 Node：无 mem_id 的条目直接跳过（没有可引用的标识）
-        let Some(mem_id) = item.mem_id.clone() else { continue };
+        let Some(mem_id) = item.mem_id.clone() else {
+            continue;
+        };
         if !seen.insert(mem_id.clone()) {
             continue;
         }
@@ -271,7 +280,8 @@ pub fn record_self_evolution_from_memories(
     }
 
     // 合并旧 recent（按 mem_id 去重，新条目优先），按 learned_at 倒序，截 24
-    let mut by_id: std::collections::HashMap<String, EvolutionEntry> = std::collections::HashMap::new();
+    let mut by_id: std::collections::HashMap<String, EvolutionEntry> =
+        std::collections::HashMap::new();
     for e in learned.iter() {
         by_id.insert(e.mem_id.clone(), e.clone());
     }
@@ -385,17 +395,47 @@ mod tests {
 
     #[test]
     fn classification_rules() {
-        assert!(is_self_evolution_memory(&mem("m1", "memory", "x", &["kind:procedure"])));
-        assert!(is_self_evolution_memory(&mem("m2", "self_constraint", "x", &[])));
-        assert!(is_self_evolution_memory(&mem("policy_abc", "memory", "x", &[])));
-        assert!(!is_self_evolution_memory(&mem("m3", "memory", "x", &["kind:chat"])));
-        assert!(!is_self_evolution_memory(&mem("other_x", "memory", "x", &[])));
+        assert!(is_self_evolution_memory(&mem(
+            "m1",
+            "memory",
+            "x",
+            &["kind:procedure"]
+        )));
+        assert!(is_self_evolution_memory(&mem(
+            "m2",
+            "self_constraint",
+            "x",
+            &[]
+        )));
+        assert!(is_self_evolution_memory(&mem(
+            "policy_abc",
+            "memory",
+            "x",
+            &[]
+        )));
+        assert!(!is_self_evolution_memory(&mem(
+            "m3",
+            "memory",
+            "x",
+            &["kind:chat"]
+        )));
+        assert!(!is_self_evolution_memory(&mem(
+            "other_x",
+            "memory",
+            "x",
+            &[]
+        )));
     }
 
     #[test]
     fn record_dedup_and_counts() {
         let db = test_db();
-        let a = mem("policy_deploy", "memory", "部署前先跑 lint", &["kind:policy"]);
+        let a = mem(
+            "policy_deploy",
+            "memory",
+            "部署前先跑 lint",
+            &["kind:policy"],
+        );
         let b = mem("m_note", "memory", "普通对话", &["kind:chat"]);
         let out = record_self_evolution_from_memories(&db, &[a.clone(), b.clone()]).unwrap();
         assert_eq!(out.len(), 1, "只有策略记忆被记录");
@@ -436,7 +476,12 @@ mod tests {
         assert_eq!(format_self_evolution_for_prompt(&db, 3), "");
         record_self_evolution_from_memories(
             &db,
-            &[mem("procedure_release", "memory", "发版先跑回归", &["kind:procedure"])],
+            &[mem(
+                "procedure_release",
+                "memory",
+                "发版先跑回归",
+                &["kind:procedure"],
+            )],
         )
         .unwrap();
         let text = format_self_evolution_for_prompt(&db, 3);

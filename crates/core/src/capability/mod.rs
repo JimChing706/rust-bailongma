@@ -187,7 +187,15 @@ impl ToolCapability {
 
 /// 敏感路径 denylist（文件工具共用）：密钥 / 凭据 / 配置目录。
 /// 注意：这些是组件级子串匹配（fail-closed 方向，宁可误伤不可漏放）。
-const SENSITIVE_DENY: &[&str] = &[".ssh", "id_rsa", "id_ed25519", ".env", "credentials", "secret"];
+/// H5（审计修复）：公开供 tools 层文件工具执行时强制校验。
+pub const SENSITIVE_DENY: &[&str] = &[
+    ".ssh",
+    "id_rsa",
+    "id_ed25519",
+    ".env",
+    "credentials",
+    "secret",
+];
 
 /// 内建能力表（11 个工具，与 `tools/` 注册表一一对应）。
 const BUILTIN: &[ToolCapability] = &[
@@ -311,7 +319,6 @@ const BUILTIN: &[ToolCapability] = &[
         output_policy: OutputPolicy::Passthrough,
         requires_approval: false,
     },
-
     ToolCapability {
         name: "matter_create",
         risk_level: RiskLevel::Medium,
@@ -332,7 +339,6 @@ const BUILTIN: &[ToolCapability] = &[
         output_policy: OutputPolicy::Passthrough,
         requires_approval: false,
     },
-
     ToolCapability {
         name: "delegate_to_agent",
         risk_level: RiskLevel::High,
@@ -353,9 +359,7 @@ const BUILTIN: &[ToolCapability] = &[
         output_policy: OutputPolicy::Passthrough,
         requires_approval: true,
     },
-
     // ── 第一批 sys_tools（对齐 Node capabilities：memory/task/system/process）──
-
     ToolCapability {
         name: "upsert_memory",
         risk_level: RiskLevel::Medium,
@@ -536,11 +540,9 @@ const BUILTIN: &[ToolCapability] = &[
         output_policy: OutputPolicy::Passthrough,
         requires_approval: true,
     },
-
     // ── 第二批 web_tools（对齐 Node：TOOL_RISK 为 high 仅为审计/成本考量，
     //    不在 AUTONOMOUS_USER_AUTH_REQUIRED 集合 → 自主可执行、无需人工确认；
     //    故用 Medium 而非 High（Rust 的 High 会自动触发 needs_approval））──
-
     ToolCapability {
         name: "web_search",
         risk_level: RiskLevel::Medium,
@@ -578,6 +580,81 @@ const BUILTIN: &[ToolCapability] = &[
         scopes: &[Scope::Network, Scope::Files],
         allowed_paths: None,
         deny_paths: SENSITIVE_DENY,
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    // ── 第三批 browser_tools（对齐 Node TOOL_RISK：sessions=low / open|navigate|tabs=medium /
+    //    inspect=low / close=low。browser_act 在 Node AUTONOMOUS_USER_AUTH_REQUIRED 集合 →
+    //    Rust 用 High 自动触发 needs_approval，与 Node 的人工确认语义一致。
+    //    注意：Node 在 browser_close + clear_profile=true 时动态提升为 high；Rust 端目前
+    //    尚未接入参数级审批（工具级 close=low 不加确认），需参数敏感 gate 支持后对齐。）──
+    ToolCapability {
+        name: "browser_sessions",
+        risk_level: RiskLevel::Low,
+        side_effects: &[SideEffect::Pure],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "browser_open",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::Spawn, SideEffect::Network],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "browser_navigate",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::Network],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "browser_inspect",
+        risk_level: RiskLevel::Low,
+        side_effects: &[SideEffect::Pure],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "browser_act",
+        risk_level: RiskLevel::High,
+        side_effects: &[SideEffect::Spawn, SideEffect::Network],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: true,
+    },
+    ToolCapability {
+        name: "browser_tabs",
+        risk_level: RiskLevel::Medium,
+        side_effects: &[SideEffect::Spawn],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
+        output_policy: OutputPolicy::Passthrough,
+        requires_approval: false,
+    },
+    ToolCapability {
+        name: "browser_close",
+        risk_level: RiskLevel::Low,
+        side_effects: &[SideEffect::Write],
+        scopes: &[Scope::Network],
+        allowed_paths: None,
+        deny_paths: &[],
         output_policy: OutputPolicy::Passthrough,
         requires_approval: false,
     },
@@ -670,10 +747,24 @@ mod tests {
             assert_eq!(trust_tier(n), TrustTier::Approval, "{n}");
         }
         // 纯查询 / 沙箱内读写 / 对外发送（Medium 可控，文档既定）→ Trusted
-        for n in ["get_timestamp", "read_file", "write_file", "list_dir", "make_dir",
-                  "search_memory", "collect_agents", "remind", "set_reminder", "send_message",
-                  "matter_create", "matter_query",
-                  "web_search", "web_read", "fetch_url", "download_file"] {
+        for n in [
+            "get_timestamp",
+            "read_file",
+            "write_file",
+            "list_dir",
+            "make_dir",
+            "search_memory",
+            "collect_agents",
+            "remind",
+            "set_reminder",
+            "send_message",
+            "matter_create",
+            "matter_query",
+            "web_search",
+            "web_read",
+            "fetch_url",
+            "download_file",
+        ] {
             assert_eq!(trust_tier(n), TrustTier::Trusted, "{n}");
         }
         // 未知工具 → Denied
@@ -695,7 +786,10 @@ mod tests {
             assert_eq!(rl.as_str(), s.to_lowercase());
         }
         assert!("nope".parse::<RiskLevel>().is_err());
-        assert_eq!("sanitize".parse::<OutputPolicy>().unwrap(), OutputPolicy::Sanitize);
+        assert_eq!(
+            "sanitize".parse::<OutputPolicy>().unwrap(),
+            OutputPolicy::Sanitize
+        );
         assert!("nope".parse::<OutputPolicy>().is_err());
     }
 
@@ -703,10 +797,23 @@ mod tests {
     #[test]
     fn builtin_table_sane() {
         let names = [
-            "get_timestamp", "read_file", "list_dir", "write_file", "make_dir",
-            "delete_file", "exec_command", "search_memory", "send_message",
-            "collect_agents", "remind", "matter_create", "matter_query",
-            "web_search", "web_read", "fetch_url", "download_file",
+            "get_timestamp",
+            "read_file",
+            "list_dir",
+            "write_file",
+            "make_dir",
+            "delete_file",
+            "exec_command",
+            "search_memory",
+            "send_message",
+            "collect_agents",
+            "remind",
+            "matter_create",
+            "matter_query",
+            "web_search",
+            "web_read",
+            "fetch_url",
+            "download_file",
         ];
         for n in names {
             assert!(builtin(n).is_some(), "能力表缺工具: {n}");

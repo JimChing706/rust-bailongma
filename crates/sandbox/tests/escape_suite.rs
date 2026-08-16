@@ -132,7 +132,11 @@ fn escape_mixed_separators_rejected() {
 
     let mut child = spawn_sandbox(&root, &[]);
     // 正反斜杠混用 + 多级 .. 归一化后仍越界
-    for payload in ["../..\\..\\secret.txt", "a\\..\\..\\secret.txt", "....//secret.txt"] {
+    for payload in [
+        "../..\\..\\secret.txt",
+        "a\\..\\..\\secret.txt",
+        "....//secret.txt",
+    ] {
         let r = rpc(
             &mut child,
             &json!({ "id": 1, "method": "read_file", "params": { "path": payload } }),
@@ -225,9 +229,8 @@ fn escape_symlink_write_path_new_file_rejected() {
         "写路径经 junction 父目录必须被拒（目标不存在也要校验）: {r}"
     );
     assert_eq!(r2["ok"], true, "拒绝逃逸后正常写路径应放行: {r2}");
-    assert_eq!(
+    assert!(
         std::fs::read_to_string(outside.join("new.txt")).is_err(),
-        true,
         "outside 目录必须无落盘文件（逃逸写入未发生）"
     );
 }
@@ -321,7 +324,10 @@ fn cmd_output_truncation_marked() {
     );
     kill(&mut child);
     assert_eq!(r["ok"], true, "exec 应成功返回: {r}");
-    assert_eq!(r["result"]["timed_out"], false, "大输出不应触发超时死锁: {r}");
+    assert_eq!(
+        r["result"]["timed_out"], false,
+        "大输出不应触发超时死锁: {r}"
+    );
     assert_eq!(r["result"]["truncated"], true, "大输出应标记截断: {r}");
     assert!(
         r["result"]["stdout"].as_str().unwrap_or("").len() <= 64 * 1024,
@@ -355,7 +361,11 @@ fn write_escape_rejected() {
     let root = dir.path().join("root");
     std::fs::create_dir_all(&root).unwrap();
     let mut child = spawn_sandbox(&root, &[]);
-    for payload in ["../evil.txt", "C:\\Windows\\evil.txt", "..\\root2\\evil.txt"] {
+    for payload in [
+        "../evil.txt",
+        "C:\\Windows\\evil.txt",
+        "..\\root2\\evil.txt",
+    ] {
         let r = rpc(
             &mut child,
             &json!({ "id": 1, "method": "write_file", "params": { "path": payload, "content": "PWNED" } }),
@@ -364,7 +374,10 @@ fn write_escape_rejected() {
     }
     kill(&mut child);
     // 确认磁盘上没有越界写入产物
-    assert!(!dir.path().join("evil.txt").exists(), "root 外不得出现写入产物");
+    assert!(
+        !dir.path().join("evil.txt").exists(),
+        "root 外不得出现写入产物"
+    );
     assert!(!dir.path().join("root2").exists(), "root 外不得创建目录");
 }
 

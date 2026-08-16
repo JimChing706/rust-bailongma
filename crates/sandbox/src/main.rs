@@ -153,9 +153,7 @@ impl Sandbox {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("命令启动失败: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| format!("命令启动失败: {e}"))?;
 
         // 立即用读线程排空 stdout/stderr：进程运行期间不读管道的话，
         // 输出超过 pipe 缓冲时子进程写阻塞，与父进程互相等待 → 超时死锁。
@@ -323,10 +321,7 @@ impl Sandbox {
             .get("path")
             .and_then(Value::as_str)
             .ok_or_else(|| "参数非法: path 缺失".to_string())?;
-        let content = params
-            .get("content")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let content = params.get("content").and_then(Value::as_str).unwrap_or("");
         if content.len() > MAX_WRITE_BYTES {
             return Err(format!("写入超限（>{MAX_WRITE_BYTES} 字节）"));
         }
@@ -396,8 +391,7 @@ impl Sandbox {
         // 2. 校验通过后返回「真实父目录 + 文件名」的落点路径，后续 IO 直接作用于
         //    真实路径，顺带消除词法校验 → 实际 IO 之间的 TOCTOU 窗口（审计 B4）；
         // 3. 目标已存在且自身是链接 → 再解析一次，防 symlink 文件指向 root 外。
-        let canon_root =
-            std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
+        let canon_root = std::fs::canonicalize(&self.root).unwrap_or_else(|_| self.root.clone());
         if let (Some(file_name), Some(parent)) = (normalized.file_name(), normalized.parent()) {
             if let Ok(canon_parent) = std::fs::canonicalize(parent) {
                 // 判定对象是「真实父目录 + 文件名」的落点而非父目录本身：
@@ -496,11 +490,17 @@ fn same_path_prefix(a: &Path, b: &Path) -> bool {
         let b_lower = b.to_string_lossy().to_lowercase();
         let a = Path::new(&a_lower);
         let b = Path::new(&b_lower);
-        a == b || a.strip_prefix(b).map(|r| !r.as_os_str().is_empty()).unwrap_or(false)
+        a == b
+            || a.strip_prefix(b)
+                .map(|r| !r.as_os_str().is_empty())
+                .unwrap_or(false)
     }
     #[cfg(not(windows))]
     {
-        a == b || a.strip_prefix(b).map(|r| !r.as_os_str().is_empty()).unwrap_or(false)
+        a == b
+            || a.strip_prefix(b)
+                .map(|r| !r.as_os_str().is_empty())
+                .unwrap_or(false)
     }
 }
 
@@ -747,8 +747,7 @@ fn main() {
 // ─────────────────────────────────────────────────────────────
 
 fn self_test() {
-    let dir =
-        std::env::temp_dir().join(format!("bailongma-sandbox-test-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("bailongma-sandbox-test-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let sb = Sandbox::new(dir.clone(), vec![]);
 
@@ -784,7 +783,8 @@ fn self_test() {
     );
 
     // 5. 路径穿越被拒
-    let escape = sb.handle(&json!({ "id": 6, "method": "read_file", "params": { "path": "../secret.txt" } }));
+    let escape = sb
+        .handle(&json!({ "id": 6, "method": "read_file", "params": { "path": "../secret.txt" } }));
     assert_eq!(escape["ok"], false, "穿越应被拒: {escape}");
     assert!(
         escape["error"].as_str().unwrap_or("").contains("越界"),
@@ -792,7 +792,9 @@ fn self_test() {
     );
 
     // 6. 绝对路径越界被拒
-    let abs = sb.handle(&json!({ "id": 7, "method": "read_file", "params": { "path": "C:\\Windows\\win.ini" } }));
+    let abs = sb.handle(
+        &json!({ "id": 7, "method": "read_file", "params": { "path": "C:\\Windows\\win.ini" } }),
+    );
     assert_eq!(abs["ok"], false, "绝对路径越界应被拒: {abs}");
 
     // 7. 未知方法
@@ -801,9 +803,11 @@ fn self_test() {
 
     // 8. 命令白名单生效
     let strict = Sandbox::new(dir.clone(), vec!["echo".to_string()]);
-    let denied = strict.handle(&json!({ "id": 9, "method": "exec", "params": { "command": "format c:" } }));
+    let denied =
+        strict.handle(&json!({ "id": 9, "method": "exec", "params": { "command": "format c:" } }));
     assert_eq!(denied["ok"], false, "白名单拒绝: {denied}");
-    let allowed = strict.handle(&json!({ "id": 10, "method": "exec", "params": { "command": "echo ok" } }));
+    let allowed =
+        strict.handle(&json!({ "id": 10, "method": "exec", "params": { "command": "echo ok" } }));
     assert_eq!(allowed["ok"], true, "白名单放行: {allowed}");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -829,14 +833,17 @@ mod tests {
         let (sb, _d) = test_sandbox();
         let w = sb.handle(&json!({ "id": 1, "method": "write_file", "params": { "path": "t/中文.txt", "content": "你好，世界" } }));
         assert_eq!(w["ok"], true);
-        let r = sb.handle(&json!({ "id": 2, "method": "read_file", "params": { "path": "t/中文.txt" } }));
+        let r = sb
+            .handle(&json!({ "id": 2, "method": "read_file", "params": { "path": "t/中文.txt" } }));
         assert_eq!(r["result"]["content"], "你好，世界");
     }
 
     #[test]
     fn path_traversal_rejected() {
         let (sb, _d) = test_sandbox();
-        let r = sb.handle(&json!({ "id": 1, "method": "read_file", "params": { "path": "../../etc/passwd" } }));
+        let r = sb.handle(
+            &json!({ "id": 1, "method": "read_file", "params": { "path": "../../etc/passwd" } }),
+        );
         assert_eq!(r["ok"], false);
         assert!(r["error"].as_str().unwrap().contains("越界"));
     }
@@ -844,11 +851,16 @@ mod tests {
     #[test]
     fn exec_runs_and_captures() {
         let (sb, _d) = test_sandbox();
-        let r = sb.handle(&json!({ "id": 1, "method": "exec", "params": { "command": "echo sandbox-ok" } }));
+        let r = sb.handle(
+            &json!({ "id": 1, "method": "exec", "params": { "command": "echo sandbox-ok" } }),
+        );
         assert_eq!(r["ok"], true, "exec 应成功: {r}");
         assert_eq!(r["result"]["exit_code"], 0, "exit 0: {r}");
         assert!(
-            r["result"]["stdout"].as_str().unwrap_or("").contains("sandbox-ok"),
+            r["result"]["stdout"]
+                .as_str()
+                .unwrap_or("")
+                .contains("sandbox-ok"),
             "stdout 捕获: {r}"
         );
     }
@@ -866,11 +878,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sb = Sandbox::new(dir.path().to_path_buf(), vec!["echo".into()]);
         assert_eq!(
-            sb.handle(&json!({ "id": 1, "method": "exec", "params": { "command": "del *.*" } }))["ok"],
+            sb.handle(&json!({ "id": 1, "method": "exec", "params": { "command": "del *.*" } }))
+                ["ok"],
             false
         );
         assert_eq!(
-            sb.handle(&json!({ "id": 2, "method": "exec", "params": { "command": "echo allowed" } }))["ok"],
+            sb.handle(
+                &json!({ "id": 2, "method": "exec", "params": { "command": "echo allowed" } })
+            )["ok"],
             true
         );
     }
@@ -929,10 +944,12 @@ mod tests {
         let chain = sb.handle(&json!({ "id": 1, "method": "exec", "params": { "command": "echo hi && echo BYPASS-OK" } }));
         assert_eq!(chain["ok"], false, "白名单应拒绝 shell 链: {chain}");
         // 普通白名单命令仍放行
-        let plain = sb.handle(&json!({ "id": 2, "method": "exec", "params": { "command": "echo allowed" } }));
+        let plain = sb
+            .handle(&json!({ "id": 2, "method": "exec", "params": { "command": "echo allowed" } }));
         assert_eq!(plain["ok"], true, "白名单普通命令: {plain}");
         // 大小写不敏感（Windows 命令语义）
-        let case = sb.handle(&json!({ "id": 3, "method": "exec", "params": { "command": "ECHO hi" } }));
+        let case =
+            sb.handle(&json!({ "id": 3, "method": "exec", "params": { "command": "ECHO hi" } }));
         assert_eq!(case["ok"], true, "大小写不敏感: {case}");
     }
 
@@ -947,7 +964,11 @@ mod tests {
     #[test]
     fn parse_args_requires_root() {
         // 无 --root 时拒绝启动（不再默认进程 cwd 作沙箱根）
-        let args = vec!["bailongma-sandbox.exe".to_string(), "--allow".to_string(), "echo".to_string()];
+        let args = vec![
+            "bailongma-sandbox.exe".to_string(),
+            "--allow".to_string(),
+            "echo".to_string(),
+        ];
         assert!(
             parse_args(&args).is_err(),
             "缺少 --root 应拒绝启动: {args:?}"

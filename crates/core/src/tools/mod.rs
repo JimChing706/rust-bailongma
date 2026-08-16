@@ -21,9 +21,9 @@
 //! `..` 越界、绝对路径越界与同名前缀兄弟目录越界一律拒绝
 //! （对齐 sandbox crate 的路径策略）。
 
-use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::path::Component;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -38,10 +38,9 @@ use crate::capability::{builtin, CallerTrust};
 use crate::db::Db;
 use crate::error::{CoreError, Result};
 use crate::llm::tool_loop::ToolExecutor;
-use crate::llm::tools::{
-    enum_param, integer_param, string_param, ToolSchema,
-};
+use crate::llm::tools::{enum_param, integer_param, string_param, ToolSchema};
 
+pub mod browser_tools;
 pub mod extra;
 pub mod matter_tools;
 pub mod sys_tools;
@@ -232,11 +231,24 @@ impl NativeToolExecutor {
     /// 工具是否已接线（供上层决定是否把工具暴露给 LLM）。
     pub fn is_ready(&self, name: &str) -> bool {
         match name {
-            "search_memory" | "collect_agents" | "remind" | "set_reminder"
-            | "matter_create" | "matter_query" | "delegate_to_agent" | "grant_agent_delegation"
-            | "upsert_memory" | "probe_memory" | "recall_memory" | "merge_memories"
-            | "downgrade_memory" | "set_agent_name" | "set_location"
-            | "complete_startup_self_check" | "set_task" | "complete_task"
+            "search_memory"
+            | "collect_agents"
+            | "remind"
+            | "set_reminder"
+            | "matter_create"
+            | "matter_query"
+            | "delegate_to_agent"
+            | "grant_agent_delegation"
+            | "upsert_memory"
+            | "probe_memory"
+            | "recall_memory"
+            | "merge_memories"
+            | "downgrade_memory"
+            | "set_agent_name"
+            | "set_location"
+            | "complete_startup_self_check"
+            | "set_task"
+            | "complete_task"
             | "update_task_step" => self.db.is_some(),
             "send_message" => self.send_message.is_some(),
             "set_tick_interval" => self.set_tick_interval.is_some(),
@@ -247,10 +259,7 @@ impl NativeToolExecutor {
     // ── 工具实现 ──
 
     fn get_timestamp(&self, args: &Value) -> Result<Value> {
-        let format = args
-            .get("format")
-            .and_then(Value::as_str)
-            .unwrap_or("iso");
+        let format = args.get("format").and_then(Value::as_str).unwrap_or("iso");
         let now = chrono::Local::now();
         let out = match format {
             "unix" => json!({ "unix": now.timestamp() }),
@@ -266,6 +275,7 @@ impl NativeToolExecutor {
             .and_then(Value::as_str)
             .ok_or_else(|| CoreError::Tool("read_file 缺 path".into()))?;
         let full = resolve_under_root(&self.root, Path::new(path))?;
+        ensure_not_sensitive_path(&full)?;
         if !full.is_file() {
             return Err(CoreError::Tool(format!("文件不存在: {path}")));
         }
@@ -310,9 +320,12 @@ impl NativeToolExecutor {
             .and_then(Value::as_str)
             .ok_or_else(|| CoreError::Tool("write_file 缺 content".into()))?;
         if content.len() > MAX_WRITE_BYTES {
-            return Err(CoreError::Tool(format!("写入超限（>{MAX_WRITE_BYTES} 字节）")));
+            return Err(CoreError::Tool(format!(
+                "写入超限（>{MAX_WRITE_BYTES} 字节）"
+            )));
         }
         let full = resolve_under_root(&self.root, Path::new(path))?;
+        ensure_not_sensitive_path(&full)?;
         if let Some(parent) = full.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| CoreError::Tool(format!("创建目录失败: {e}")))?;
@@ -329,12 +342,13 @@ impl NativeToolExecutor {
             .filter(|s| !s.is_empty())
             .unwrap_or(".");
         let full = resolve_under_root(&self.root, Path::new(path))?;
+        ensure_not_sensitive_path(&full)?;
         if !full.is_dir() {
             return Err(CoreError::Tool(format!("目录不存在: {path}")));
         }
         let mut entries: Vec<Value> = Vec::new();
-        for entry in std::fs::read_dir(&full)
-            .map_err(|e| CoreError::Tool(format!("读取目录失败: {e}")))?
+        for entry in
+            std::fs::read_dir(&full).map_err(|e| CoreError::Tool(format!("读取目录失败: {e}")))?
         {
             let entry = entry.map_err(|e| CoreError::Tool(format!("读取目录项失败: {e}")))?;
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -350,6 +364,7 @@ impl NativeToolExecutor {
             .and_then(Value::as_str)
             .ok_or_else(|| CoreError::Tool("make_dir 缺 path".into()))?;
         let full = resolve_under_root(&self.root, Path::new(path))?;
+        ensure_not_sensitive_path(&full)?;
         std::fs::create_dir_all(&full)
             .map_err(|e| CoreError::Tool(format!("创建目录失败: {e}")))?;
         Ok(json!({ "ok": true, "path": path }))
@@ -361,6 +376,7 @@ impl NativeToolExecutor {
             .and_then(Value::as_str)
             .ok_or_else(|| CoreError::Tool("delete_file 缺 path".into()))?;
         let full = resolve_under_root(&self.root, Path::new(path))?;
+        ensure_not_sensitive_path(&full)?;
         if !full.exists() {
             return Err(CoreError::Tool(format!("文件不存在: {path}")));
         }
@@ -368,8 +384,7 @@ impl NativeToolExecutor {
             std::fs::remove_dir_all(&full)
                 .map_err(|e| CoreError::Tool(format!("删除目录失败: {e}")))?;
         } else {
-            std::fs::remove_file(&full)
-                .map_err(|e| CoreError::Tool(format!("删除失败: {e}")))?;
+            std::fs::remove_file(&full).map_err(|e| CoreError::Tool(format!("删除失败: {e}")))?;
         }
         Ok(json!({ "ok": true, "path": path, "deleted": true }))
     }
@@ -414,14 +429,38 @@ impl NativeToolExecutor {
             ("sh", vec!["-c".to_string(), command.clone()])
         };
         let start = Instant::now();
-        let mut child = Command::new(program)
-            .args(&shell_args)
+        let mut cmd = Command::new(program);
+        cmd.args(&shell_args)
             .current_dir(&cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // M17（审计修复）：最小环境——旧实现继承父进程完整环境，向子进程泄露
+            // BAILONGMA_API_TOKEN/OPENAI_API_KEY/DEEPSEEK_API_KEY 等敏感变量。
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("TEMP", std::env::temp_dir().to_string_lossy().into_owned())
+            .env("TMP", std::env::temp_dir().to_string_lossy().into_owned());
+        let mut child = cmd
             .spawn()
             .map_err(|e| CoreError::Tool(format!("命令启动失败: {e}")))?;
+
+        // M17（审计修复）：边读边排空——旧实现在子进程退出后才 read_to_end，输出超管道
+        // 缓冲（~4KB）即互相等待死锁（>4KB 输出的命令被判超时强杀）。先取出句柄交给读线程持续排空。
+        let stdout_reader = child.stdout.take().map(|mut s| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut s, &mut buf);
+                buf
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut s| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut s, &mut buf);
+                buf
+            })
+        });
 
         let deadline = start + Duration::from_millis(timeout_ms);
         let mut timed_out = false;
@@ -448,19 +487,12 @@ impl NativeToolExecutor {
             }
         }
 
-        use std::io::Read;
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let Some(mut o) = child.stdout.take() {
-            let mut buf = Vec::new();
-            let _ = o.read_to_end(&mut buf);
-            stdout = String::from_utf8_lossy(&buf).into_owned();
-        }
-        if let Some(mut o) = child.stderr.take() {
-            let mut buf = Vec::new();
-            let _ = o.read_to_end(&mut buf);
-            stderr = String::from_utf8_lossy(&buf).into_owned();
-        }
+        let join_reader = |r: Option<std::thread::JoinHandle<Vec<u8>>>| -> Vec<u8> {
+            r.map(|h| h.join().unwrap_or_default()).unwrap_or_default()
+        };
+        // H5（审计修复）：exec 输出脱敏——命令输出可能含密钥（如 cat .env），命中即替换占位
+        let stdout = crate::policy::redact_output(&String::from_utf8_lossy(&join_reader(stdout_reader)));
+        let stderr = crate::policy::redact_output(&String::from_utf8_lossy(&join_reader(stderr_reader)));
         let exit_code = child
             .try_wait()
             .ok()
@@ -532,10 +564,19 @@ impl NativeToolExecutor {
                     .to_string(),
             ));
         }
+        // H5（审计修复）：sandbox 路径输出脱敏——result.stdout/stderr 同样可能含密钥
+        let mut result = resp.get("result").cloned().unwrap_or(Value::Null);
+        if let Some(obj) = result.as_object_mut() {
+            for key in ["stdout", "stderr"] {
+                if let Some(v) = obj.get(key).and_then(Value::as_str) {
+                    obj.insert(key.to_string(), Value::String(crate::policy::redact_output(v)));
+                }
+            }
+        }
         Ok(json!({
             "ok": true,
             "sandbox": true,
-            "result": resp.get("result").cloned().unwrap_or(Value::Null),
+            "result": result,
         }))
     }
 
@@ -651,6 +692,13 @@ impl ToolExecutor for NativeToolExecutor {
             "web_read" => web_tools::web_read_impl(self, &args),
             "fetch_url" => web_tools::fetch_url_impl(self, &args),
             "download_file" => web_tools::download_file_impl(self, &args),
+            "browser_sessions" => browser_tools::browser_sessions_impl(self, &args),
+            "browser_open" => browser_tools::browser_open_impl(self, &args),
+            "browser_navigate" => browser_tools::browser_navigate_impl(self, &args),
+            "browser_inspect" => browser_tools::browser_inspect_impl(self, &args),
+            "browser_act" => browser_tools::browser_act_impl(self, &args),
+            "browser_tabs" => browser_tools::browser_tabs_impl(self, &args),
+            "browser_close" => browser_tools::browser_close_impl(self, &args),
             "delegate_to_agent" => {
                 let Some(db) = &self.db else {
                     return Err(CoreError::Tool(
@@ -695,27 +743,42 @@ impl ToolExecutor for NativeToolExecutor {
 /// 全部内置工具 schema（供 LLM 工具循环注册）。
 pub fn all_tool_schemas() -> Vec<ToolSchema> {
     let mut tools = vec![
-        ToolSchema::new("get_timestamp", "获取当前时间（iso / unix / human 三种格式）")
-            .param("format", enum_param("时间格式", &["iso", "unix", "human"])),
-        ToolSchema::new("read_file", "读取文件内容（限定在沙箱根目录内；max_bytes 控制读取上限）")
-            .required("path", string_param("文件路径（相对沙箱根或绝对路径）"))
-            .param("max_bytes", integer_param("最大读取字节数，默认 256KB")),
-        ToolSchema::new("write_file", "写入文件（限定在沙箱根目录内，自动创建父目录）")
-            .required("path", string_param("文件路径"))
-            .required("content", string_param("文件内容")),
+        ToolSchema::new(
+            "get_timestamp",
+            "获取当前时间（iso / unix / human 三种格式）",
+        )
+        .param("format", enum_param("时间格式", &["iso", "unix", "human"])),
+        ToolSchema::new(
+            "read_file",
+            "读取文件内容（限定在沙箱根目录内；max_bytes 控制读取上限）",
+        )
+        .required("path", string_param("文件路径（相对沙箱根或绝对路径）"))
+        .param("max_bytes", integer_param("最大读取字节数，默认 256KB")),
+        ToolSchema::new(
+            "write_file",
+            "写入文件（限定在沙箱根目录内，自动创建父目录）",
+        )
+        .required("path", string_param("文件路径"))
+        .required("content", string_param("文件内容")),
         ToolSchema::new("list_dir", "列出目录条目（目录优先，按名称排序）")
             .param("path", string_param("目录路径，默认沙箱根")),
         ToolSchema::new("make_dir", "创建目录（递归创建缺失的父目录）")
             .required("path", string_param("目录路径")),
         ToolSchema::new("delete_file", "删除文件或目录（限定在沙箱根目录内）")
             .required("path", string_param("文件/目录路径")),
-        ToolSchema::new("exec_command", "执行 shell 命令（超时强杀；stdout/stderr 各截断 64KB）")
-            .required("command", string_param("要执行的命令"))
-            .param("timeout_ms", integer_param("超时毫秒，默认 30000"))
-            .param("cwd", string_param("工作目录（沙箱根内），默认沙箱根")),
-        ToolSchema::new("search_memory", "按关键词检索记忆（FTS5 全文搜索，返回近期相关记忆）")
-            .required("keyword", string_param("检索关键词"))
-            .param("limit", integer_param("返回条数，默认 10，最大 50")),
+        ToolSchema::new(
+            "exec_command",
+            "执行 shell 命令（超时强杀；stdout/stderr 各截断 64KB）",
+        )
+        .required("command", string_param("要执行的命令"))
+        .param("timeout_ms", integer_param("超时毫秒，默认 30000"))
+        .param("cwd", string_param("工作目录（沙箱根内），默认沙箱根")),
+        ToolSchema::new(
+            "search_memory",
+            "按关键词检索记忆（FTS5 全文搜索，返回近期相关记忆）",
+        )
+        .required("keyword", string_param("检索关键词"))
+        .param("limit", integer_param("返回条数，默认 10，最大 50")),
         ToolSchema::new("send_message", "向指定对象发送消息（投递最终回复给用户）")
             .required("target_id", string_param("接收方 ID，如 ID:000001"))
             .required("content", string_param("消息正文")),
@@ -724,6 +787,7 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
     tools.extend(matter_tools::matter_tool_schemas());
     tools.extend(sys_tools::sys_tool_schemas());
     tools.extend(web_tools::web_tool_schemas());
+    tools.extend(browser_tools::browser_tool_schemas());
     tools.push(delegate_to_agent_schema());
     tools.push(grant_agent_delegation_schema());
     tools
@@ -733,8 +797,14 @@ pub fn all_tool_schemas() -> Vec<ToolSchema> {
 // 路径安全
 // ─────────────────────────────────────────────────────────────
 
-/// 将路径解析到 root 内（词法归一化 `.` / `..`，Windows 统一盘符大小写）；
-/// 越界返回 Err。与 sandbox crate 的 `normalize_absolute` 策略一致。
+/// 将路径解析到 root 内：先词法归一化（`.` / `..`，Windows 统一盘符大小写），
+/// 再对**父目录** canonicalize 校验真实落点，防 junction/symlink 逃逸；越界返回 Err。
+///
+/// 审计 H2：旧实现纯词法校验——`root` 内一旦存在 junction/symlink（如经一次已审批的
+/// `mklink /J link <外目录>` 种下），后续 write_file/read_file/delete_file 会穿过链接
+/// 读写沙箱根外文件。现对齐 sandbox 的 `resolve_in_root`：以父目录为锚点 canonicalize，
+/// 校验「真实父目录 + 文件名」仍在 canonical root 内，并返回真实落点路径（顺带消除
+/// 词法校验与实际 IO 之间的 TOCTOU 窗口）。
 fn resolve_under_root(root: &Path, path: &Path) -> Result<PathBuf> {
     let joined = if path.is_absolute() {
         path.to_path_buf()
@@ -749,7 +819,56 @@ fn resolve_under_root(root: &Path, path: &Path) -> Result<PathBuf> {
             path.display()
         )));
     }
+    // 双保险：词法判定通过后，解析父目录链接校验真实落点（对齐 sandbox B1 修复）。
+    let canon_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    if let (Some(file_name), Some(parent)) = (normalized.file_name(), normalized.parent()) {
+        if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+            let real = canon_parent.join(file_name);
+            if !path_prefix_within(&real, &canon_root) {
+                return Err(CoreError::Tool(format!(
+                    "路径越界（父目录链接解析后，沙箱根 {}）: {}",
+                    root.display(),
+                    path.display()
+                )));
+            }
+            // 目标已存在且为链接 → 校验其真实落点（防文件级 symlink 逃逸）
+            if let Ok(canon) = std::fs::canonicalize(&real) {
+                if !path_prefix_within(&canon, &canon_root) {
+                    return Err(CoreError::Tool(format!(
+                        "路径越界（链接解析后，沙箱根 {}）: {}",
+                        root.display(),
+                        path.display()
+                    )));
+                }
+            }
+            return Ok(real);
+        }
+        // 父目录尚不存在：词法判定已通过；create_dir_all 新建的是普通目录（无预置链接）
+    }
+    // 目标已存在 → 自身 canonicalize 兜底（无父目录/父目录不可解析场景）
+    if let Ok(canon) = std::fs::canonicalize(&normalized) {
+        if !path_prefix_within(&canon, &canon_root) {
+            return Err(CoreError::Tool(format!(
+                "路径越界（链接解析后，沙箱根 {}）: {}",
+                root.display(),
+                path.display()
+            )));
+        }
+    }
     Ok(normalized)
+}
+
+/// H5（审计修复）：敏感路径 denylist 执行校验——.ssh/.env/id_rsa/credentials/secret 等
+/// 凭据/密钥路径，文件工具（read/write/delete/list/make）在根约束之外一律拒绝。
+/// 旧实现只做根约束，沙箱根内若存在凭据文件（如克隆仓库含 .env）可被 read_file 读走。
+fn ensure_not_sensitive_path(full: &Path) -> Result<()> {
+    let s = full.to_string_lossy();
+    if crate::capability::is_path_denied(&s, crate::capability::SENSITIVE_DENY) {
+        return Err(CoreError::Tool(format!(
+            "路径命中敏感 denylist（凭据/密钥，拒绝访问）: {s}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(windows)]
@@ -805,11 +924,17 @@ fn path_prefix_within(a: &Path, b: &Path) -> bool {
         let b_lower = b.to_string_lossy().to_lowercase();
         let a = Path::new(&a_lower);
         let b = Path::new(&b_lower);
-        a == b || a.strip_prefix(b).map(|r| !r.as_os_str().is_empty()).unwrap_or(false)
+        a == b
+            || a.strip_prefix(b)
+                .map(|r| !r.as_os_str().is_empty())
+                .unwrap_or(false)
     }
     #[cfg(not(windows))]
     {
-        a == b || a.strip_prefix(b).map(|r| !r.as_os_str().is_empty()).unwrap_or(false)
+        a == b
+            || a.strip_prefix(b)
+                .map(|r| !r.as_os_str().is_empty())
+                .unwrap_or(false)
     }
 }
 
@@ -842,10 +967,7 @@ mod tests {
         let ex = executor(dir.path());
         for fmt in ["iso", "unix", "human"] {
             let r = ex
-                .execute(
-                    "get_timestamp",
-                    &json!({ "format": fmt }),
-                )
+                .execute("get_timestamp", &json!({ "format": fmt }))
                 .unwrap();
             let v: Value = serde_json::from_str(&r).unwrap();
             assert_eq!(v["ok"], true, "{fmt}");
@@ -942,7 +1064,10 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["count"], 1, "{v}");
-        assert!(v["memories"][0]["content"].as_str().unwrap().contains("咖啡"));
+        assert!(v["memories"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("咖啡"));
     }
 
     #[test]
@@ -962,12 +1087,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let sent = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let sent2 = sent.clone();
-        let ex = executor(dir.path()).with_send_message(Arc::new(
-            move |target: &str, content: &str| {
+        let ex =
+            executor(dir.path()).with_send_message(Arc::new(move |target: &str, content: &str| {
                 sent2.lock().unwrap().push(format!("{target}:{content}"));
                 Ok("delivered".into())
-            },
-        ));
+            }));
         let r = ex
             .execute(
                 "send_message",
@@ -1052,6 +1176,54 @@ mod tests {
         assert!(r.is_err(), "前缀碰撞穿越应被拒: {r:?}");
     }
 
+    /// 在 root 内创建指向 outside 的链接；失败返回 false（调用方跳过用例）。
+    #[cfg(windows)]
+    fn make_link(root: &Path, outside: &Path) -> bool {
+        Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("leak").to_string_lossy().as_ref())
+            .arg(outside.to_string_lossy().as_ref())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(not(windows))]
+    fn make_link(root: &Path, outside: &Path) -> bool {
+        std::os::unix::fs::symlink(outside, root.join("leak")).is_ok()
+    }
+
+    #[test]
+    fn junction_or_symlink_escape_rejected() {
+        // 审计 H2：core 文件工具经 junction/symlink 逃逸沙箱根必须被拒（含目标尚不存在的写路径）。
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "LINK-ESCAPE-SECRET").unwrap();
+
+        if !make_link(&root, &outside) {
+            eprintln!("SKIP: 无法创建链接（权限/平台限制），本用例不判定");
+            return;
+        }
+
+        let ex = executor(&root);
+        // 读：经链接读 root 外文件必须被拒
+        let r = ex.execute("read_file", &json!({ "path": "leak/secret.txt" }));
+        assert!(r.is_err(), "经链接读 root 外必须被拒: {r:?}");
+        // 写：经链接写 root 外新文件必须被拒，且 outside 无落盘
+        let w = ex
+            .execute("write_file", &json!({ "path": "leak/new.txt", "content": "ESCAPED" }));
+        assert!(w.is_err(), "经链接写 root 外必须被拒: {w:?}");
+        assert!(
+            std::fs::read_to_string(outside.join("new.txt")).is_err(),
+            "outside 目录必须无落盘文件（逃逸写入未发生）"
+        );
+    }
+
     #[test]
     fn read_file_rejects_oversized_before_reading() {
         let dir = tempdir().unwrap();
@@ -1064,6 +1236,36 @@ mod tests {
         assert!(r.is_err(), "超大文件应拒绝而非整读截断: {r:?}");
     }
 
+    #[test]
+    fn sensitive_paths_denied_in_file_tools() {
+        // H5（审计修复）：文件工具拒绝敏感路径（.env/.ssh/id_rsa/credentials/secret），
+        // 即便路径在沙箱根内也不得读/写/删（防凭据外泄）。
+        let dir = tempdir().unwrap();
+        let ex = executor(dir.path());
+        for p in ["config/.env", ".ssh/id_rsa", "credentials.json", "notes/secret.txt"] {
+            let r = ex.execute("read_file", &json!({ "path": p }));
+            assert!(r.is_err(), "敏感路径 {p} 应被拒: {r:?}");
+        }
+        // 普通路径不受影响
+        let w = ex.execute("write_file", &json!({ "path": "notes.md", "content": "ok" }));
+        assert!(w.is_ok(), "普通路径应放行: {w:?}");
+    }
+
+    #[test]
+    fn exec_command_output_redacts_secrets() {
+        // H5（审计修复）：exec 输出含密钥时脱敏为占位，不把密钥回喂 LLM/台账。
+        let dir = tempdir().unwrap();
+        let ex = executor(dir.path());
+        let secret = "sk-abcdefghijklmnopqrstuvwx";
+        let r = ex
+            .execute("exec_command", &json!({ "command": format!("echo {secret}") }))
+            .unwrap();
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let stdout = v["stdout"].as_str().unwrap();
+        assert!(!stdout.contains(secret), "stdout 不得含原始密钥: {stdout}");
+        assert!(stdout.contains("[REDACTED"), "stdout 应含脱敏占位: {stdout}");
+    }
+
     // ── Phase 1 修复 B：delete_file 挂 ApprovalGate（原仅 exec_command 挂门）──
 
     #[test]
@@ -1072,13 +1274,11 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("victim.txt"), "x").unwrap();
         let gate = Arc::new(
-            ApprovalGate::new(dir.path().to_path_buf())
-                .with_timeout(Duration::from_millis(300)),
+            ApprovalGate::new(dir.path().to_path_buf()).with_timeout(Duration::from_millis(300)),
         );
         let ex = executor(dir.path()).with_approval(gate.clone());
-        let handle = std::thread::spawn(move || {
-            ex.execute("delete_file", &json!({ "path": "victim.txt" }))
-        });
+        let handle =
+            std::thread::spawn(move || ex.execute("delete_file", &json!({ "path": "victim.txt" })));
         let mut id = None;
         for _ in 0..100 {
             if let Some(first) = gate.pending_ids().first() {
@@ -1100,8 +1300,7 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::write(dir.path().join("victim.txt"), "x").unwrap();
         let gate = Arc::new(
-            ApprovalGate::new(dir.path().to_path_buf())
-                .with_timeout(Duration::from_millis(150)),
+            ApprovalGate::new(dir.path().to_path_buf()).with_timeout(Duration::from_millis(150)),
         );
         let ex = executor(dir.path()).with_approval(gate.clone());
         let r = ex.execute("delete_file", &json!({ "path": "victim.txt" }));
@@ -1135,8 +1334,14 @@ mod tests {
     fn delegate_tools_registered_and_gated() {
         let schemas = all_tool_schemas();
         let names: Vec<&str> = schemas.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"delegate_to_agent"), "schema 缺失 delegate_to_agent");
-        assert!(names.contains(&"grant_agent_delegation"), "schema 缺失 grant_agent_delegation");
+        assert!(
+            names.contains(&"delegate_to_agent"),
+            "schema 缺失 delegate_to_agent"
+        );
+        assert!(
+            names.contains(&"grant_agent_delegation"),
+            "schema 缺失 grant_agent_delegation"
+        );
         // 无 db：未接线错误（不执行真实进程）
         let dir = tempdir().unwrap();
         let ex = executor(dir.path());
@@ -1150,7 +1355,10 @@ mod tests {
         // 能力声明：High + 需确认（与文档一致）
         assert!(builtin("delegate_to_agent").unwrap().needs_approval());
         assert!(builtin("grant_agent_delegation").unwrap().needs_approval());
-        assert_eq!(crate::capability::trust_tier("delegate_to_agent"), crate::capability::TrustTier::Approval);
+        assert_eq!(
+            crate::capability::trust_tier("delegate_to_agent"),
+            crate::capability::TrustTier::Approval
+        );
     }
 
     // ── Phase 1 修复 E：execute stage 全工具统一记录 ──
@@ -1167,8 +1375,14 @@ mod tests {
             .filter(|t| t.stage == "execute" && t.decision == "ok")
             .map(|t| t.tool.as_str())
             .collect();
-        assert!(tools_with_execute.contains(&"get_timestamp"), "recent={recent:?}");
-        assert!(tools_with_execute.contains(&"list_dir"), "recent={recent:?}");
+        assert!(
+            tools_with_execute.contains(&"get_timestamp"),
+            "recent={recent:?}"
+        );
+        assert!(
+            tools_with_execute.contains(&"list_dir"),
+            "recent={recent:?}"
+        );
         // 失败也记录 err
         let _ = ex.execute("read_file", &json!({ "path": "no-such.txt" }));
         let recent = crate::trace::global().recent(5, "read_file");

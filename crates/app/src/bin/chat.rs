@@ -72,7 +72,9 @@ async fn run_once(runtime: &AppRuntime, message: &str) -> anyhow::Result<()> {
         channel: "TUI".into(),
         meta: json!({}),
     };
-    let reply: TurnReply = runtime.run_message_turn(msg, Some(on_stream()), Some(on_tool_call())).await;
+    let reply: TurnReply = runtime
+        .run_message_turn(msg, Some(on_stream()), Some(on_tool_call()))
+        .await;
 
     println!();
     if !reply.ok {

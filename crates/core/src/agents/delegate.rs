@@ -28,7 +28,7 @@ use serde_json::{json, Value};
 
 use crate::db::models::KnownAgent;
 use crate::db::repositories::agents::{
-    get_agent_by_id, is_delegation_allowed, revoke_delegation, grant_delegation,
+    get_agent_by_id, grant_delegation, is_delegation_allowed, revoke_delegation,
 };
 use crate::db::Db;
 use crate::llm::tools::{boolean_param, number_param, string_param, ToolSchema};
@@ -75,13 +75,10 @@ fn tool_json(obj: serde_json::Map<String, Value>) -> String {
 }
 
 fn error_result(message: impl Into<String>) -> String {
-    tool_json(serde_json::Map::from_iter([(
-        "ok".into(),
-        Value::Bool(false),
-    ), (
-        "error".into(),
-        Value::String(message.into()),
-    )]))
+    tool_json(serde_json::Map::from_iter([
+        ("ok".into(), Value::Bool(false)),
+        ("error".into(), Value::String(message.into())),
+    ]))
 }
 
 /// 超时收敛（对齐 `Math.min(Math.max(Number(timeout) || 60, 5), 300)`）：
@@ -158,26 +155,20 @@ fn spawn_and_wait(program: &str, args: &[String], timeout_sec: u64) -> String {
         Err(e) => return error_result(format!("命令启动失败: {e}")),
     };
 
-    let stdout_reader = child
-        .stdout
-        .take()
-        .map(|mut s| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = s.read_to_end(&mut buf);
-                buf
-            })
-        });
-    let stderr_reader = child
-        .stderr
-        .take()
-        .map(|mut s| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = s.read_to_end(&mut buf);
-                buf
-            })
-        });
+    let stdout_reader = child.stdout.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
+    let stderr_reader = child.stderr.take().map(|mut s| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf);
+            buf
+        })
+    });
 
     let deadline = Instant::now() + Duration::from_secs(timeout_sec.max(1));
     let status = loop {
@@ -286,7 +277,9 @@ pub fn exec_delegate_to_agent(db: &Db, args: &Value) -> String {
     match is_delegation_allowed(db) {
         Ok(true) => {}
         Ok(false) => {
-            return error_result("尚未获得 Agent 委托权限，请先询问用户并通过 grant_agent_delegation 获取授权。");
+            return error_result(
+                "尚未获得 Agent 委托权限，请先询问用户并通过 grant_agent_delegation 获取授权。",
+            );
         }
         Err(e) => return error_result(format!("读取委托权限失败: {e}")),
     }
@@ -395,10 +388,16 @@ pub fn exec_delegate_to_agent(db: &Db, args: &Value) -> String {
                         .take(500)
                         .collect::<String>();
                     merged.insert("verify_hint".into(), Value::String(verify_hint.clone()));
-                    merged.insert("verify_status".into(), Value::String("pending_manual_check".into()));
+                    merged.insert(
+                        "verify_status".into(),
+                        Value::String("pending_manual_check".into()),
+                    );
                     merged.insert(
                         "verify_note".into(),
-                        Value::String("Agent 声称已完成；请按 verify_hint 对照输出快照复核，不要只信 done".into()),
+                        Value::String(
+                            "Agent 声称已完成；请按 verify_hint 对照输出快照复核，不要只信 done"
+                                .into(),
+                        ),
                     );
                     if !snapshot.is_empty() {
                         merged.insert("output_snapshot".into(), Value::String(snapshot));
@@ -420,7 +419,10 @@ pub fn exec_delegate_to_agent(db: &Db, args: &Value) -> String {
 /// `grant_agent_delegation` 执行体（对齐 `execGrantAgentDelegation`）：
 /// `allowed=true` 授权 / `false` 撤销，并返回状态文本。
 pub fn exec_grant_agent_delegation(db: &Db, args: &Value) -> String {
-    let allowed = args.get("allowed").and_then(Value::as_bool).unwrap_or(false);
+    let allowed = args
+        .get("allowed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let result = if allowed {
         grant_delegation(db)
     } else {
@@ -438,7 +440,11 @@ pub fn exec_grant_agent_delegation(db: &Db, args: &Value) -> String {
         ),
         format!(
             "已授权状态：{}。",
-            if granted_now { "已授权" } else { "未授权" }
+            if granted_now {
+                "已授权"
+            } else {
+                "未授权"
+            }
         ),
         "如需修改，请再次调用 grant_agent_delegation。".to_string(),
     ];
@@ -457,9 +463,7 @@ mod tests {
     use super::*;
     use crate::db::models::NewKnownAgent;
     use crate::db::open_database;
-    use crate::db::repositories::agents::{
-        grant_delegation, is_delegation_allowed, upsert_agents,
-    };
+    use crate::db::repositories::agents::{grant_delegation, is_delegation_allowed, upsert_agents};
 
     fn test_db() -> Db {
         let dir = tempfile::tempdir().unwrap();
@@ -470,7 +474,12 @@ mod tests {
         open_database(path).unwrap()
     }
 
-    fn agent(id: &str, invoke_type: &str, invoke_cmd: &str, invoke_args: Vec<&str>) -> NewKnownAgent {
+    fn agent(
+        id: &str,
+        invoke_type: &str,
+        invoke_cmd: &str,
+        invoke_args: Vec<&str>,
+    ) -> NewKnownAgent {
         NewKnownAgent {
             id: id.into(),
             name: format!("agent-{id}"),
@@ -602,7 +611,13 @@ mod tests {
         assert_eq!(v["ok"], true, "result: {r}");
         assert_eq!(v["verify_hint"], "stdout 应包含 hello");
         assert_eq!(v["verify_status"], "pending_manual_check");
-        assert!(v["output_snapshot"].as_str().unwrap_or("").contains("hello"), "快照应含输出: {r}");
+        assert!(
+            v["output_snapshot"]
+                .as_str()
+                .unwrap_or("")
+                .contains("hello"),
+            "快照应含输出: {r}"
+        );
     }
 
     #[test]
@@ -611,13 +626,13 @@ mod tests {
         grant_delegation(&db).unwrap();
         let (cmd, args) = echo_invoke();
         upsert_agents(&db, &[agent("nvh-agent", "cli", cmd, args)]).unwrap();
-        let r = exec_delegate_to_agent(
-            &db,
-            &json!({"agent_id": "nvh-agent", "prompt": "hello"}),
-        );
+        let r = exec_delegate_to_agent(&db, &json!({"agent_id": "nvh-agent", "prompt": "hello"}));
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["ok"], true, "result: {r}");
-        assert!(v.get("verify_hint").is_none(), "未提供 verify_hint 时不注入: {r}");
+        assert!(
+            v.get("verify_hint").is_none(),
+            "未提供 verify_hint 时不注入: {r}"
+        );
     }
 
     #[test]
@@ -631,10 +646,7 @@ mod tests {
             ("false", vec![])
         };
         upsert_agents(&db, &[agent("fail-agent", "cli", cmd, args)]).unwrap();
-        let r = exec_delegate_to_agent(
-            &db,
-            &json!({"agent_id": "fail-agent", "prompt": "boom"}),
-        );
+        let r = exec_delegate_to_agent(&db, &json!({"agent_id": "fail-agent", "prompt": "boom"}));
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["ok"], false);
         assert_eq!(v["exit_code"], 1);
@@ -652,10 +664,7 @@ mod tests {
         let (cmd, args) = echo_invoke();
         upsert_agents(&db, &[agent("meta-agent", "cli", cmd, args)]).unwrap();
         let payload = "hi & echo PWNED_7f3a | more \"quoted\" %PATH%";
-        let r = exec_delegate_to_agent(
-            &db,
-            &json!({"agent_id": "meta-agent", "prompt": payload}),
-        );
+        let r = exec_delegate_to_agent(&db, &json!({"agent_id": "meta-agent", "prompt": payload}));
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["ok"], true, "result: {r}");
         assert_eq!(v["exit_code"], 0, "result: {r}");
@@ -765,7 +774,10 @@ mod tests {
         let props = &d["function"]["parameters"]["properties"];
         assert!(props.get("agent_id").is_some());
         assert!(props.get("prompt").is_some());
-        assert!(props.get("verify_hint").is_some(), "schema 必须声明 verify_hint");
+        assert!(
+            props.get("verify_hint").is_some(),
+            "schema 必须声明 verify_hint"
+        );
         let g = grant_agent_delegation_schema().to_openai_value();
         assert_eq!(g["function"]["name"], "grant_agent_delegation");
         assert!(g["function"]["parameters"]["properties"]

@@ -88,6 +88,7 @@ fn ensure_index(conn: &Connection, sql: &str) -> Result<()> {
 /// 1. 按键分组找出重复键（`HAVING COUNT(*)>1`）；
 /// 2. 逐键保留最小 id 行、删除其余重复行；
 /// 3. 再建唯一索引。
+///
 /// `extra_where` 用于部分唯一索引（如 `WHERE mem_id IS NOT NULL`，原样拼 SQL，
 /// 仅内部常量，无注入面）。
 fn ensure_unique_index_dedup(
@@ -311,7 +312,13 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         "#,
     )?;
     // D2（审计修复）：mem_id 唯一索引先去重老库重复行，防启动中断
-    ensure_unique_index_dedup(conn, "idx_memories_mem_id", "memories", "mem_id", "WHERE mem_id IS NOT NULL")?;
+    ensure_unique_index_dedup(
+        conn,
+        "idx_memories_mem_id",
+        "memories",
+        "mem_id",
+        "WHERE mem_id IS NOT NULL",
+    )?;
 
     // ── memories_fts：FTS5 trigram 外部内容表 + 3 触发器 ──
     conn.execute_batch(
@@ -678,7 +685,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           duration_ms   INTEGER NOT NULL DEFAULT 0,
           delegated_from TEXT   NOT NULL DEFAULT '',
           created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-          UNIQUE(request_id, round, attempt, tool_name)
+          UNIQUE(request_id, round, attempt, tool_name, args_json)
         );
 
         CREATE TABLE IF NOT EXISTS llm_metrics_daily (
@@ -787,17 +794,62 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     ensure_column(conn, "llm_calls", "stage", "stage TEXT NOT NULL DEFAULT ''")?;
 
     // ── M4：matter ledger 三缺口补列（命题2/3/6；幂等；新库 CREATE 已带） ──
-    ensure_column(conn, "matters", "delegation_choose", "delegation_choose INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "matters", "delegation_path", "delegation_path INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "matters", "delegation_execute", "delegation_execute INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "matters", "delegation_verify", "delegation_verify INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "matters", "delegation_terminate", "delegation_terminate INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(conn, "matters", "intent_original", "intent_original TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(conn, "matters", "additivity_decl", "additivity_decl TEXT NOT NULL DEFAULT ''")?;
-    ensure_column(conn, "matters", "signals", "signals TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(
+        conn,
+        "matters",
+        "delegation_choose",
+        "delegation_choose INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "matters",
+        "delegation_path",
+        "delegation_path INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "matters",
+        "delegation_execute",
+        "delegation_execute INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "matters",
+        "delegation_verify",
+        "delegation_verify INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "matters",
+        "delegation_terminate",
+        "delegation_terminate INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "matters",
+        "intent_original",
+        "intent_original TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "matters",
+        "additivity_decl",
+        "additivity_decl TEXT NOT NULL DEFAULT ''",
+    )?;
+    ensure_column(
+        conn,
+        "matters",
+        "signals",
+        "signals TEXT NOT NULL DEFAULT '[]'",
+    )?;
 
     // ── M5：验证者分离收口（命题4/7；幂等；新库 CREATE 已带） ──
-    ensure_column(conn, "matters", "self_verified", "self_verified INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(
+        conn,
+        "matters",
+        "self_verified",
+        "self_verified INTEGER NOT NULL DEFAULT 0",
+    )?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS matter_events (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -811,12 +863,14 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         )",
     )?;
     conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_matter_events_matter ON matter_events(matter_id)"
+        "CREATE INDEX IF NOT EXISTS idx_matter_events_matter ON matter_events(matter_id)",
     )?;
-
 
     // ── 一次性历史迁移：外部渠道前缀 ID 统一为 canonical 用户（与 Node 版相同，flag 守卫） ──
     migrate_canonical_user(conn)?;
+
+    // ── H8（审计修复）：llm_tool_calls 唯一键纳入 args_json 维度 ──
+    migrate_llm_tool_calls_unique_args(conn)?;
 
     // ── 重建 FTS 索引（覆盖已有历史数据；对老库是幂等全量重建） ──
     // D3（审计修复）：不再每次启动无条件全量 rebuild——大库启动慢（分钟级）且磨损磁盘。
@@ -885,6 +939,66 @@ fn migrate_canonical_user(conn: &Connection) -> Result<()> {
             chrono::Utc::now().to_rfc3339(),
         ),
     )?;
+    Ok(())
+}
+
+/// H8（审计修复）：llm_tool_calls 台账唯一键纳入 args_json 维度。
+///
+/// 旧 schema 的 `UNIQUE(request_id, round, attempt, tool_name)` 不含参数——同一轮内 LLM
+/// 两次调用同名工具（不同参数）时，第二次写入覆盖首行（ON CONFLICT DO UPDATE），首调用的
+/// 台账丢失；响应丢失重试时按首调用参数查不到 → 副作用工具被重复执行。改为
+/// `UNIQUE(..., args_json)` 让不同参数各占一行。SQLite 无法直接修改内联唯一约束，故对
+/// 老库做「重建表 + 拷贝数据」迁移（幂等：探测唯一约束是否已含 args_json 维度）。
+fn migrate_llm_tool_calls_unique_args(conn: &Connection) -> Result<()> {
+    // 找到内联唯一约束的自动索引（origin='u' 且 unique=1）
+    let index_name: Option<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT name FROM pragma_index_list('llm_tool_calls') WHERE \"unique\" = 1 AND origin = 'u'",
+        )?;
+        let mut rows = stmt.query([])?;
+        rows.next()?.map(|r| r.get(0)).transpose()?
+    };
+    let Some(index_name) = index_name else {
+        return Ok(()); // 无内联唯一约束（异常），跳过
+    };
+    let cols: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_index_info(?1)",
+        [&index_name],
+        |r| r.get(0),
+    )?;
+    if cols >= 5 {
+        return Ok(()); // 已含 args_json 维度（新表/已迁移），跳过
+    }
+
+    info!("[db schema] llm_tool_calls 唯一键纳入 args_json 维度（重建表迁移）");
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("ALTER TABLE llm_tool_calls RENAME TO llm_tool_calls_old_arghash;")?;
+    tx.execute_batch(
+        r#"
+        CREATE TABLE llm_tool_calls (
+          id            INTEGER PRIMARY KEY AUTOINCREMENT,
+          request_id    TEXT    NOT NULL,
+          round         INTEGER NOT NULL,
+          attempt       INTEGER NOT NULL DEFAULT 1,
+          tool_name     TEXT    NOT NULL,
+          args_json     TEXT    NOT NULL DEFAULT '{}',
+          result_json   TEXT    NOT NULL DEFAULT '',
+          status        TEXT    NOT NULL DEFAULT 'ok',
+          duration_ms   INTEGER NOT NULL DEFAULT 0,
+          delegated_from TEXT   NOT NULL DEFAULT '',
+          created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+          UNIQUE(request_id, round, attempt, tool_name, args_json)
+        );
+        "#,
+    )?;
+    tx.execute_batch(
+        "INSERT INTO llm_tool_calls
+           (id, request_id, round, attempt, tool_name, args_json, result_json, status, duration_ms, delegated_from, created_at)
+         SELECT id, request_id, round, attempt, tool_name, args_json, result_json, status, duration_ms, delegated_from, created_at
+         FROM llm_tool_calls_old_arghash;",
+    )?;
+    tx.execute_batch("DROP TABLE llm_tool_calls_old_arghash;")?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -961,13 +1075,25 @@ mod tests {
         }
 
         // LLM 指标表关键结构（M1）
-        for col in ["request_id", "attempt", "finish_reason", "context_bytes", "stage"] {
+        for col in [
+            "request_id",
+            "attempt",
+            "finish_reason",
+            "context_bytes",
+            "stage",
+        ] {
             assert!(
                 has_column(&conn, "llm_calls", col).unwrap(),
                 "缺列 llm_calls.{col}"
             );
         }
-        for col in ["request_id", "round", "attempt", "tool_name", "delegated_from"] {
+        for col in [
+            "request_id",
+            "round",
+            "attempt",
+            "tool_name",
+            "delegated_from",
+        ] {
             assert!(
                 has_column(&conn, "llm_tool_calls", col).unwrap(),
                 "缺列 llm_tool_calls.{col}"

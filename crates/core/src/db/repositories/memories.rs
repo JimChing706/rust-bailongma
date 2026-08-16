@@ -567,7 +567,14 @@ pub fn merge_update(
           content = ?1, detail = ?2, entities = ?3, salience = ?4, timestamp = ?5
         WHERE mem_id = ?6
         "#,
-        params![merged_content, detail, entities_json, merged_salience, now_iso(), keep_mem_id],
+        params![
+            merged_content,
+            detail,
+            entities_json,
+            merged_salience,
+            now_iso(),
+            keep_mem_id
+        ],
     )?;
     Ok(n > 0)
 }

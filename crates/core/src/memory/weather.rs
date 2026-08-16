@@ -173,7 +173,8 @@ pub fn url_encode(input: &str) -> String {
 }
 
 fn as_f64(v: &Value) -> Option<f64> {
-    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
 }
 
 /// 拉取并解析 wttr.in（对齐 `fetchWeatherData`；预报取 7 天，格式化时按模式裁剪）。
@@ -186,7 +187,10 @@ async fn fetch_weather_data(location: &str) -> Result<WeatherData> {
     let resp = resp.error_for_status()?;
     let data: Value = resp.json().await?;
 
-    let current_cond = data["current_condition"].get(0).cloned().unwrap_or_default();
+    let current_cond = data["current_condition"]
+        .get(0)
+        .cloned()
+        .unwrap_or_default();
     let nearest = data["nearest_area"].get(0).cloned().unwrap_or_default();
     let city = nearest["areaName"][0]["value"]
         .as_str()
@@ -317,8 +321,14 @@ pub fn format_weather_reference(data: &WeatherData, mode: &str) -> String {
     if !data.forecast.is_empty() {
         lines.push(format!("未来 {} 天预报：", data.forecast.len().min(days)));
         for day in data.forecast.iter().take(days) {
-            let low = day.low.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
-            let high = day.high.map(|v| v.to_string()).unwrap_or_else(|| "?".to_string());
+            let low = day
+                .low
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            let high = day
+                .high
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "?".to_string());
             let cond = if day.condition.is_empty() {
                 String::new()
             } else {
@@ -354,7 +364,11 @@ pub async fn build_weather_runtime_context(text: &str, db: &Db) -> String {
     if location.is_empty() {
         return String::new();
     }
-    let mode = if is_week_query(text) { "week" } else { "current" };
+    let mode = if is_week_query(text) {
+        "week"
+    } else {
+        "current"
+    };
     match fetch_and_cache_weather(&location).await {
         Some(data) => format_weather_reference(&data, mode),
         None => String::new(),
@@ -384,11 +398,17 @@ mod tests {
     #[test]
     fn location_from_message() {
         // 中文城市表命中
-        assert_eq!(get_location_from_message("上海今天天气", ""), "Shanghai China");
+        assert_eq!(
+            get_location_from_message("上海今天天气", ""),
+            "Shanghai China"
+        );
         // 别名优先（陆丰 → 经纬度）
         assert_eq!(get_location_from_message("陆丰天气", ""), "22.945,115.644");
         // 消息无城市 → 用户配置兜底
-        assert_eq!(get_location_from_message("今天天气", "杭州"), "Hangzhou Zhejiang China");
+        assert_eq!(
+            get_location_from_message("今天天气", "杭州"),
+            "Hangzhou Zhejiang China"
+        );
         // 无城市无配置 → 空（不注入）
         assert_eq!(get_location_from_message("今天天气", ""), "");
         // 未命中天气但含城市（调用方已 gate，此处仅验证提取）
@@ -446,7 +466,9 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn fetch_live_weather() {
-        let data = fetch_weather_data("Shanghai China").await.expect("wttr.in reachable");
+        let data = fetch_weather_data("Shanghai China")
+            .await
+            .expect("wttr.in reachable");
         assert!(!data.city.is_empty());
         assert!(!data.forecast.is_empty());
         assert!(data.current.temp.is_some());

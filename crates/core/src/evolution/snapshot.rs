@@ -101,7 +101,7 @@ mod tests {
     use super::*;
     use crate::db::repositories::conversations::insert;
 
-fn test_db() -> Db {
+    fn test_db() -> Db {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("blm_snap_test_{}_{}", std::process::id(), n));
@@ -133,7 +133,9 @@ fn test_db() -> Db {
         assert_eq!(count_conversations(&db), 1);
         let content: String = db
             .conn()
-            .query_row("SELECT content FROM conversations ORDER BY id", [], |r| r.get(0))
+            .query_row("SELECT content FROM conversations ORDER BY id", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(content, "初始消息");
 
@@ -155,8 +157,16 @@ fn test_db() -> Db {
         let db = test_db();
         let dir = std::env::temp_dir().join(format!("blm_snap_tag_{}", std::process::id()));
         let snap = DbSnapshot::create(&db, &dir, "迭代/轮次:1").unwrap();
-        assert!(snap.path.file_name().unwrap().to_string_lossy().contains("snap_"));
-        assert!(!snap.path.to_string_lossy().contains('/') || !snap.path.to_string_lossy().contains(':'));
+        assert!(snap
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("snap_"));
+        assert!(
+            !snap.path.to_string_lossy().contains('/')
+                || !snap.path.to_string_lossy().contains(':')
+        );
         snap.cleanup().unwrap();
     }
 }

@@ -67,28 +67,28 @@ impl ApiServer {
             message_rate: Arc::new(RateLimiter::default()),
         };
         let state = state.with_guard(guard);
-    // Phase 1 人工确认：审批请求 → scene choice 卡片（用户抉择后由 /approval 回传闭环）
-    {
-        let scene = state.scene.clone();
-        crate::approval::set_global_on_request(Arc::new(move |req| {
-            let surface_id = format!("approval:{}", req.id);
-            let card = json!({
-                "id": surface_id.clone(),
-                "kind": "choice",
-                "intent": "confront",
-                "focus": true,
-                "data": {
-                    "prompt": format!("[审批] {}：{}", req.tool, req.detail),
-                    "options": [
-                        { "value": "allow_once", "label": "允许一次" },
-                        { "value": "allow_session", "label": "本会话允许" },
-                        { "value": "deny", "label": "拒绝" },
-                    ],
-                },
-            });
-            let _ = scene.set(&surface_id, Some(&card));
-        }));
-    }
+        // Phase 1 人工确认：审批请求 → scene choice 卡片（用户抉择后由 /approval 回传闭环）
+        {
+            let scene = state.scene.clone();
+            crate::approval::set_global_on_request(Arc::new(move |req| {
+                let surface_id = format!("approval:{}", req.id);
+                let card = json!({
+                    "id": surface_id.clone(),
+                    "kind": "choice",
+                    "intent": "confront",
+                    "focus": true,
+                    "data": {
+                        "prompt": format!("[审批] {}：{}", req.tool, req.detail),
+                        "options": [
+                            { "value": "allow_once", "label": "允许一次" },
+                            { "value": "allow_session", "label": "本会话允许" },
+                            { "value": "deny", "label": "拒绝" },
+                        ],
+                    },
+                });
+                let _ = scene.set(&surface_id, Some(&card));
+            }));
+        }
         // 启动时补发 agent_name 粘性事件（对齐 api.js 307-310 行）
         let name = (state.agent_name)();
         state
@@ -123,7 +123,10 @@ impl ApiServer {
             .route("/metrics/weekly", get(routes::get_metrics_weekly))
             .route("/scene", get(handle_scene_ws))
             .route("/approval", post(routes::post_approval))
-        .route("/trace", get(routes::get_trace))
+            .route("/intervention/pause", post(routes::post_intervention_pause))
+            .route("/intervention/resume", post(routes::post_intervention_resume))
+            .route("/intervention/rescue", post(routes::post_intervention_rescue))
+            .route("/trace", get(routes::get_trace))
             // 静态资源 fallback（对齐 handleStaticRoutes：API 未匹配时尝试页面/资产）
             .fallback(move |req: Request| async move {
                 match super::static_assets::handle_static(&req, &resources, needs_activation) {
@@ -179,7 +182,14 @@ async fn guard_request(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     if let Some(ref o) = origin {
-        if !is_allowed_origin(o, guard.lan_enabled) {
+        // 安全修复（审计 H1）：opaque origin（`null`）仅在无害 GET 端点放行——桌面
+        // 状态窗口（`with_html` 的 webview 跨源 fetch）依赖 `/status`，且 `/status`、
+        // `/health` 不含记忆/会话/审批等敏感数据。其余路由对 `null` 一律 403，堵死
+        // 任意网页经沙箱 iframe 无凭据读隐私、注入指令、窃取代批。
+        let harmless_null = *o == "null"
+            && req.method() == Method::GET
+            && matches!(req.uri().path(), "/status" | "/health");
+        if !harmless_null && !is_allowed_origin(o, guard.lan_enabled) {
             return json_response(
                 StatusCode::FORBIDDEN,
                 json!({ "ok": false, "error": "forbidden origin" }),
@@ -451,13 +461,11 @@ mod tests {
         assert_eq!(body["ok"], true);
         assert_eq!(body["days"], 7);
         assert_eq!(body["total_calls"], 0);
-        assert!(
-            body["signals"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|s| s.as_str().unwrap().contains("无 LLM 调用"))
-        );
+        assert!(body["signals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str().unwrap().contains("无 LLM 调用")));
     }
 
     #[tokio::test]
@@ -546,11 +554,7 @@ mod tests {
         let router = server.router();
 
         // 回环 + 无 token → 放行（桌面 UI 依赖路径）
-        let no_token_loopback = router
-            .clone()
-            .oneshot(post_message_req())
-            .await
-            .unwrap();
+        let no_token_loopback = router.clone().oneshot(post_message_req()).await.unwrap();
         assert_eq!(
             no_token_loopback.status(),
             StatusCode::OK,
@@ -621,17 +625,10 @@ mod tests {
         let router = server.router();
 
         for _ in 0..3 {
-            let resp = router
-                .clone()
-                .oneshot(post_message_req())
-                .await
-                .unwrap();
+            let resp = router.clone().oneshot(post_message_req()).await.unwrap();
             assert_eq!(resp.status(), StatusCode::OK, "窗口内前 3 条应放行");
         }
-        let blocked = router
-            .oneshot(post_message_req())
-            .await
-            .unwrap();
+        let blocked = router.oneshot(post_message_req()).await.unwrap();
         assert_eq!(
             blocked.status(),
             StatusCode::TOO_MANY_REQUESTS,
@@ -680,18 +677,89 @@ mod tests {
             .oneshot(lan_request("/events/history", None))
             .await
             .unwrap();
-        assert_eq!(no_token.status(), StatusCode::FORBIDDEN, "LAN 无 token 读事件历史应 403");
+        assert_eq!(
+            no_token.status(),
+            StatusCode::FORBIDDEN,
+            "LAN 无 token 读事件历史应 403"
+        );
         let with_token = router
             .clone()
             .oneshot(lan_request("/events/history", Some("secret")))
             .await
             .unwrap();
-        assert_eq!(with_token.status(), StatusCode::OK, "LAN 带 token 读事件历史应放行");
+        assert_eq!(
+            with_token.status(),
+            StatusCode::OK,
+            "LAN 带 token 读事件历史应放行"
+        );
         let wrong = router
             .oneshot(lan_request("/events/history", Some("wrong")))
             .await
             .unwrap();
         assert_eq!(wrong.status(), StatusCode::FORBIDDEN, "LAN 错 token 应 403");
+    }
+
+    /// 构造带 `Origin: null`（浏览器 opaque origin）+ loopback 远端信息的请求。
+    fn null_origin_req(uri: &str) -> HttpRequest<Body> {
+        local_req_with(
+            HttpRequest::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(header::ORIGIN, "null")
+                .body(Body::empty())
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn null_origin_rejected_except_harmless_status() {
+        // 审计 H1：浏览器 opaque origin（Origin: null，来自沙箱 iframe / data: URL）不得
+        // 无凭据读敏感端点；仅无害 GET /status、/health 放行（桌面状态窗口依赖 /status）。
+        let state = test_state();
+        let guard = Guard {
+            lan_enabled: false,
+            token: String::new(),
+            message_rate: Arc::new(RateLimiter::new(Duration::from_secs(60), 1000)),
+        };
+        let server = server_with_guard(state, guard);
+        let router = server.router();
+
+        // 敏感读端点 → 403
+        for uri in ["/events/history", "/trace", "/conversations"] {
+            let resp = router.clone().oneshot(null_origin_req(uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "null origin 读 {uri} 应 403"
+            );
+        }
+
+        // 无害 GET → 放行（桌面状态窗口依赖路径）
+        for uri in ["/status", "/health"] {
+            let resp = router.clone().oneshot(null_origin_req(uri)).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "null origin 读 {uri} 应放行"
+            );
+        }
+
+        // null origin POST /message → 403（不得注入指令）
+        let post = local_req_with(
+            HttpRequest::builder()
+                .method(Method::POST)
+                .uri("/message")
+                .header(header::ORIGIN, "null")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"content":"hello"}"#))
+                .unwrap(),
+        );
+        let resp = router.oneshot(post).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "null origin POST /message 应 403"
+        );
     }
 
     #[tokio::test]
@@ -710,12 +778,20 @@ mod tests {
             .oneshot(lan_request("/events", None))
             .await
             .unwrap();
-        assert_eq!(no_token.status(), StatusCode::FORBIDDEN, "LAN 无 token 的 SSE 流应 403");
+        assert_eq!(
+            no_token.status(),
+            StatusCode::FORBIDDEN,
+            "LAN 无 token 的 SSE 流应 403"
+        );
         let with_token = router
             .oneshot(lan_request("/events", Some("secret")))
             .await
             .unwrap();
-        assert_eq!(with_token.status(), StatusCode::OK, "LAN 带 token 的 SSE 流应放行");
+        assert_eq!(
+            with_token.status(),
+            StatusCode::OK,
+            "LAN 带 token 的 SSE 流应放行"
+        );
     }
 
     #[tokio::test]
@@ -730,18 +806,22 @@ mod tests {
         let server = server_with_guard(state, guard);
         let router = server.router();
 
-        let status = router
-            .clone()
-            .oneshot(local_req("/status"))
-            .await
-            .unwrap();
-        assert_eq!(status.status(), StatusCode::OK, "回环 /status 无 token 应放行");
+        let status = router.clone().oneshot(local_req("/status")).await.unwrap();
+        assert_eq!(
+            status.status(),
+            StatusCode::OK,
+            "回环 /status 无 token 应放行"
+        );
         let history = router
             .clone()
             .oneshot(local_req("/events/history"))
             .await
             .unwrap();
-        assert_eq!(history.status(), StatusCode::OK, "回环 /events/history 无 token 应放行");
+        assert_eq!(
+            history.status(),
+            StatusCode::OK,
+            "回环 /events/history 无 token 应放行"
+        );
         let sse = router.oneshot(local_req("/events")).await.unwrap();
         assert_eq!(sse.status(), StatusCode::OK, "回环 SSE 无 token 应放行");
     }
@@ -763,7 +843,11 @@ mod tests {
         let router = server.router();
 
         for uri in ["/status", "/events/history", "/events"] {
-            let resp = router.clone().oneshot(lan_request(uri, None)).await.unwrap();
+            let resp = router
+                .clone()
+                .oneshot(lan_request(uri, None))
+                .await
+                .unwrap();
             assert_eq!(
                 resp.status(),
                 StatusCode::FORBIDDEN,
@@ -771,5 +855,4 @@ mod tests {
             );
         }
     }
-
 }

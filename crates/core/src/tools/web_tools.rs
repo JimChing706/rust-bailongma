@@ -69,6 +69,8 @@ const FETCH_URL_BODY_CAP: usize = 64 * 1024;
 /// download_file 超时（秒，对齐 Node schema：默认 120，最大 120）
 const DEFAULT_DL_TIMEOUT_SEC: u64 = 120;
 const MAX_DL_TIMEOUT_SEC: u64 = 120;
+/// download_file 下载大小上限（512MB，防无限填满磁盘）
+const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
 /// web_read 长文落盘目录（沙箱内）
 const ARTICLES_DIR: &str = "articles";
 
@@ -86,6 +88,11 @@ static RT: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 
 fn block_on<F: Future>(fut: F) -> F::Output {
     RT.block_on(fut)
+}
+
+/// 供 browser_tools 等模块复用（模块级单例 runtime）。
+pub(crate) fn block_on_shared<F: Future>(fut: F) -> F::Output {
+    block_on(fut)
 }
 
 /// 共享 HTTP client（浏览器头 + 连接超时 + 有限重定向），供不校验用户 URL 的
@@ -154,7 +161,10 @@ fn search_cache_get(key: &str) -> Option<Value> {
     cache.remove(key);
     cache.insert(
         key.to_string(),
-        SearchCacheEntry { payload: payload.clone(), fetched_at },
+        SearchCacheEntry {
+            payload: payload.clone(),
+            fetched_at,
+        },
     );
     Some(payload)
 }
@@ -164,7 +174,10 @@ fn search_cache_set(key: &str, payload: Value) {
     cache.remove(key);
     cache.insert(
         key.to_string(),
-        SearchCacheEntry { payload, fetched_at: Instant::now() },
+        SearchCacheEntry {
+            payload,
+            fetched_at: Instant::now(),
+        },
     );
     // 超量直接清空（HashMap 无法按序淘汰；200 条内极少触发，代价可接受）
     if cache.len() > SEARCH_CACHE_MAX {
@@ -178,7 +191,10 @@ static READ_CACHE: LazyLock<Mutex<HashMap<String, (Value, Instant)>>> =
 
 fn url_ttl(url: &str) -> Duration {
     let v = url.to_lowercase();
-    if v.contains("wttr.in") || v.contains("weather") || v.contains("openweather") || v.contains("tianqi")
+    if v.contains("wttr.in")
+        || v.contains("weather")
+        || v.contains("openweather")
+        || v.contains("tianqi")
     {
         Duration::from_secs(600)
     } else if v.contains("news") || v.contains("rss") || v.contains("feed") {
@@ -246,8 +262,7 @@ static JINA_DESC_RE: LazyLock<Regex> =
 static BING_BLOCKED_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)sorry|captcha|verify|访问被拒绝").unwrap());
 /// Bing ck/a 中转链接检测
-static BING_CK_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)bing\.com/ck/a").unwrap());
+static BING_CK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)bing\.com/ck/a").unwrap());
 
 // ─────────────────────────────────────────────────────────────
 // 工具入口（与 sys_tools 同签名）
@@ -428,35 +443,54 @@ pub fn web_read_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
 
     // 策略零：本地浏览器渲染（仅 render=browser 时启用；对齐 Node 历史 browser_read 路径）
     if render == "browser" {
-        let br = render_with_browser(&url, timeout_ms, max_chars);
-        if br.ok && !is_low_value_page_text(&br.text) {
-            let outcome = ReadOutcome {
-                url: &url,
-                final_url: &br.final_url,
-                status: None,
-                source: "browser",
-                title: &br.title,
-                text: &br.text,
-                is_json: false,
-            };
-            let payload = build_read_payload(ex, &outcome, max_chars);
-            READ_CACHE
-                .lock()
-                .expect("read cache poisoned")
-                .insert(cache_key.clone(), (payload.clone(), Instant::now()));
-            return Ok(payload);
+        // 审计 H3：浏览器渲染路径也必须过 SSRF 校验——旧实现直启 headless Chrome 抓
+        // 任意 URL，云元数据/内网内容可被渲染文本回喂 LLM（直连 HTTP 路径有校验，
+        // 此路径此前缺失）。SSRF 拒绝时不回退浏览器渲染，计入 failures 后走 http/jina。
+        let ssrf_ok = reqwest::Url::parse(&url)
+            .map(|parsed| check_url_ssrf(&parsed, ex.allow_lan_access).is_ok())
+            .unwrap_or(false);
+        if ssrf_ok {
+            let br = render_with_browser(&url, timeout_ms, max_chars);
+            if br.ok && !is_low_value_page_text(&br.text) {
+                let outcome = ReadOutcome {
+                    url: &url,
+                    final_url: &br.final_url,
+                    status: None,
+                    source: "browser",
+                    title: &br.title,
+                    text: &br.text,
+                    is_json: false,
+                };
+                let payload = build_read_payload(ex, &outcome, max_chars);
+                READ_CACHE
+                    .lock()
+                    .expect("read cache poisoned")
+                    .insert(cache_key.clone(), (payload.clone(), Instant::now()));
+                return Ok(payload);
+            }
+            failures.push(json!({
+                "strategy": "browser",
+                "code": br.error.as_ref().map(|e| if e.contains("未找到") { "NO_BROWSER" } else { "BROWSER_FAILED" }),
+                "error": br.error,
+                "low_value": br.ok && is_low_value_page_text(&br.text),
+            }));
+        } else {
+            failures.push(json!({
+                "strategy": "browser",
+                "code": "SSRF_BLOCKED",
+                "error": "URL 被 SSRF 校验拒绝（内网/云元数据/非 http(s)），跳过浏览器渲染",
+            }));
         }
-        failures.push(json!({
-            "strategy": "browser",
-            "code": br.error.as_ref().map(|e| if e.contains("未找到") { "NO_BROWSER" } else { "BROWSER_FAILED" }),
-            "error": br.error,
-            "low_value": br.ok && is_low_value_page_text(&br.text),
-        }));
     }
 
     // 策略一：受保护直连 HTTP
     let allow_lan = ex.allow_lan_access;
-    let direct = block_on(fetch_via_direct(&url, timeout_ms, is_likely_api_url(&url), allow_lan));
+    let direct = block_on(fetch_via_direct(
+        &url,
+        timeout_ms,
+        is_likely_api_url(&url),
+        allow_lan,
+    ));
     if direct.ok {
         let outcome = ReadOutcome {
             url: &url,
@@ -542,8 +576,8 @@ pub fn fetch_url_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
 
     block_on(async move {
         // SSRF 防护：请求前校验 + 每跳重定向校验
-        let parsed = reqwest::Url::parse(&url)
-            .map_err(|e| CoreError::Tool(format!("URL 无效: {e}")))?;
+        let parsed =
+            reqwest::Url::parse(&url).map_err(|e| CoreError::Tool(format!("URL 无效: {e}")))?;
         check_url_ssrf(&parsed, allow_lan).map_err(CoreError::Tool)?;
         let resp = http_client(allow_lan)
             .get(&url)
@@ -562,15 +596,31 @@ pub fn fetch_url_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
         let headers: HashMap<String, String> = resp
             .headers()
             .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string())))
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|s| (k.as_str().to_string(), s.to_string()))
+            })
             .collect();
         let headers = serde_json::to_value(headers).unwrap_or(Value::Null);
-        let raw = resp
-            .text()
-            .await
-            .map_err(|e| CoreError::Tool(format!("fetch_url 读取响应失败: {e}")))?;
-        let bytes = raw.len();
-        let truncated = bytes > FETCH_URL_BODY_CAP;
+        // M16（审计修复）：响应体有界读取——旧 resp.text() 整读入内存再截断，高速恶意源
+        // 可达 GB 级导致 OOM。改为 bytes_stream 边读边限长（最多 FETCH_URL_BODY_CAP 字节）。
+        let mut buf: Vec<u8> = Vec::with_capacity(FETCH_URL_BODY_CAP);
+        let mut truncated = false;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|e| CoreError::Tool(format!("fetch_url 读取响应失败: {e}")))?;
+            let remaining = FETCH_URL_BODY_CAP.saturating_sub(buf.len());
+            if chunk.len() > remaining {
+                buf.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            buf.extend_from_slice(&chunk);
+        }
+        let raw = String::from_utf8_lossy(&buf).into_owned();
+        let bytes = buf.len();
         let body = truncate_chars(&raw, FETCH_URL_BODY_CAP);
         Ok(json!({
             "ok": true, "tool": "fetch_url", "url": url,
@@ -588,7 +638,9 @@ pub fn download_file_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| s.starts_with("http://") || s.starts_with("https://"))
-        .ok_or_else(|| CoreError::Tool("download_file: url 必须以 http:// 或 https:// 开头".into()))?;
+        .ok_or_else(|| {
+            CoreError::Tool("download_file: url 必须以 http:// 或 https:// 开头".into())
+        })?;
     let output_raw = args
         .get("output_path")
         .and_then(Value::as_str)
@@ -621,8 +673,7 @@ pub fn download_file_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value
 
     let result = block_on(async move {
         // SSRF 防护：请求前校验 + 每跳重定向校验
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| format!("URL 无效: {e}"))?;
+        let parsed = reqwest::Url::parse(url).map_err(|e| format!("URL 无效: {e}"))?;
         check_url_ssrf(&parsed, allow_lan)?;
         let resp = http_client(allow_lan)
             .get(url)
@@ -648,6 +699,10 @@ pub fn download_file_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value
         let mut bytes = 0u64;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| e.to_string())?;
+            // M16（审计修复）：下载大小上限，防无限填满磁盘
+            if bytes + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+                return Err(format!("download_file 超过大小上限 {MAX_DOWNLOAD_BYTES} 字节"));
+            }
             file.write_all(&chunk).map_err(|e| e.to_string())?;
             bytes += chunk.len() as u64;
         }
@@ -696,10 +751,19 @@ struct SearchResultItem {
 }
 
 /// 第二梯队并行搜索的未来类型（type_complexity 提示后显式命名）。
-type SearchFut<'a> = Pin<Box<dyn Future<Output = std::result::Result<Vec<SearchResultItem>, String>> + Send + 'a>>;
+type SearchFut<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<Vec<SearchResultItem>, String>> + Send + 'a>>;
 
-async fn search_serper(key: &str, query: &str, limit: usize) -> std::result::Result<Vec<SearchResultItem>, String> {
-    let (hl, gl) = if has_cjk(query) { ("zh-cn", "cn") } else { ("en", "us") };
+async fn search_serper(
+    key: &str,
+    query: &str,
+    limit: usize,
+) -> std::result::Result<Vec<SearchResultItem>, String> {
+    let (hl, gl) = if has_cjk(query) {
+        ("zh-cn", "cn")
+    } else {
+        ("en", "us")
+    };
     let resp = HTTP
         .post("https://google.serper.dev/search")
         .header("X-API-KEY", key)
@@ -711,25 +775,53 @@ async fn search_serper(key: &str, query: &str, limit: usize) -> std::result::Res
         .map_err(|e| format!("network: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let hint = if status.as_u16() == 401 || status.as_u16() == 403 { " (check SERPER_API_KEY)" } else { "" };
+        let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
+            " (check SERPER_API_KEY)"
+        } else {
+            ""
+        };
         return Err(format!("http {status}{hint}"));
     }
     let body: Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
     let mut out = Vec::new();
     if let Some(organic) = body.get("organic").and_then(Value::as_array) {
         for item in organic {
-            let title = item.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-            let url = item.get("link").and_then(Value::as_str).unwrap_or("").to_string();
-            let snippet = item.get("snippet").and_then(Value::as_str).unwrap_or("").to_string();
-            if url.is_empty() { continue; }
-            out.push(SearchResultItem { title, url, snippet });
-            if out.len() >= limit { break; }
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let url = item
+                .get("link")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let snippet = item
+                .get("snippet")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() {
+                continue;
+            }
+            out.push(SearchResultItem {
+                title,
+                url,
+                snippet,
+            });
+            if out.len() >= limit {
+                break;
+            }
         }
     }
     Ok(out)
 }
 
-async fn search_brave(key: &str, query: &str, limit: usize) -> std::result::Result<Vec<SearchResultItem>, String> {
+async fn search_brave(
+    key: &str,
+    query: &str,
+    limit: usize,
+) -> std::result::Result<Vec<SearchResultItem>, String> {
     let url = format!(
         "https://api.search.brave.com/res/v1/web/search?q={}&count={}",
         urlencode(query),
@@ -745,25 +837,57 @@ async fn search_brave(key: &str, query: &str, limit: usize) -> std::result::Resu
         .map_err(|e| format!("network: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let hint = if status.as_u16() == 401 || status.as_u16() == 403 { " (check brave_api_key)" } else { "" };
+        let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
+            " (check brave_api_key)"
+        } else {
+            ""
+        };
         return Err(format!("http {status}{hint}"));
     }
     let body: Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
     let mut out = Vec::new();
-    if let Some(results) = body.get("web").and_then(|w| w.get("results")).and_then(Value::as_array) {
+    if let Some(results) = body
+        .get("web")
+        .and_then(|w| w.get("results"))
+        .and_then(Value::as_array)
+    {
         for item in results {
-            let title = item.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-            let url = item.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-            let snippet = item.get("description").and_then(Value::as_str).unwrap_or("").to_string();
-            if url.is_empty() { continue; }
-            out.push(SearchResultItem { title, url, snippet });
-            if out.len() >= limit { break; }
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let url = item
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let snippet = item
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() {
+                continue;
+            }
+            out.push(SearchResultItem {
+                title,
+                url,
+                snippet,
+            });
+            if out.len() >= limit {
+                break;
+            }
         }
     }
     Ok(out)
 }
 
-async fn search_tavily(key: &str, query: &str, limit: usize) -> std::result::Result<Vec<SearchResultItem>, String> {
+async fn search_tavily(
+    key: &str,
+    query: &str,
+    limit: usize,
+) -> std::result::Result<Vec<SearchResultItem>, String> {
     let resp = HTTP
         .post("https://api.tavily.com/search")
         .header("Content-Type", "application/json")
@@ -779,30 +903,61 @@ async fn search_tavily(key: &str, query: &str, limit: usize) -> std::result::Res
         .map_err(|e| format!("network: {e}"))?;
     let status = resp.status();
     if !status.is_success() {
-        let hint = if status.as_u16() == 401 || status.as_u16() == 403 { " (check tavily_api_key)" } else { "" };
+        let hint = if status.as_u16() == 401 || status.as_u16() == 403 {
+            " (check tavily_api_key)"
+        } else {
+            ""
+        };
         return Err(format!("http {status}{hint}"));
     }
     let body: Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
     let mut out = Vec::new();
     if let Some(results) = body.get("results").and_then(Value::as_array) {
         for item in results {
-            let title = item.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-            let url = item.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-            let snippet = item.get("content").and_then(Value::as_str).unwrap_or("").to_string();
-            if url.is_empty() { continue; }
-            out.push(SearchResultItem { title, url, snippet });
-            if out.len() >= limit { break; }
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let url = item
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let snippet = item
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() {
+                continue;
+            }
+            out.push(SearchResultItem {
+                title,
+                url,
+                snippet,
+            });
+            if out.len() >= limit {
+                break;
+            }
         }
     }
     Ok(out)
 }
 
-async fn search_searxng(base: &str, query: &str, limit: usize) -> std::result::Result<Vec<SearchResultItem>, String> {
+async fn search_searxng(
+    base: &str,
+    query: &str,
+    limit: usize,
+) -> std::result::Result<Vec<SearchResultItem>, String> {
     if !(base.starts_with("http://") || base.starts_with("https://")) {
         return Err("SEARXNG_URL must start with http:// or https://".into());
     }
     let base = base.trim_end_matches('/');
-    let base = base.strip_suffix("/search").unwrap_or(base).trim_end_matches('/');
+    let base = base
+        .strip_suffix("/search")
+        .unwrap_or(base)
+        .trim_end_matches('/');
     let url = format!("{base}/search?q={}&format=json&pageno=1", urlencode(query));
     let resp = HTTP
         .get(&url)
@@ -812,17 +967,39 @@ async fn search_searxng(base: &str, query: &str, limit: usize) -> std::result::R
         .await
         .map_err(|e| format!("network: {e}"))?;
     let status = resp.status();
-    if !status.is_success() { return Err(format!("http {status}")); }
+    if !status.is_success() {
+        return Err(format!("http {status}"));
+    }
     let body: Value = resp.json().await.map_err(|e| format!("json: {e}"))?;
     let mut out = Vec::new();
     if let Some(results) = body.get("results").and_then(Value::as_array) {
         for item in results {
-            let title = item.get("title").and_then(Value::as_str).unwrap_or("").to_string();
-            let url = item.get("url").and_then(Value::as_str).unwrap_or("").to_string();
-            let snippet = item.get("content").and_then(Value::as_str).unwrap_or("").to_string();
-            if url.is_empty() { continue; }
-            out.push(SearchResultItem { title, url, snippet });
-            if out.len() >= limit { break; }
+            let title = item
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let url = item
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let snippet = item
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if url.is_empty() {
+                continue;
+            }
+            out.push(SearchResultItem {
+                title,
+                url,
+                snippet,
+            });
+            if out.len() >= limit {
+                break;
+            }
         }
     }
     Ok(out)
@@ -832,8 +1009,14 @@ async fn search_searxng(base: &str, query: &str, limit: usize) -> std::result::R
 // 搜索引擎（第二梯队：无 key 爬虫兜底，并行抢答）
 // ─────────────────────────────────────────────────────────────
 
-async fn search_bing(query: &str, limit: usize) -> std::result::Result<Vec<SearchResultItem>, String> {
-    let url = format!("https://cn.bing.com/search?q={}&setlang=zh-CN", urlencode(query));
+async fn search_bing(
+    query: &str,
+    limit: usize,
+) -> std::result::Result<Vec<SearchResultItem>, String> {
+    let url = format!(
+        "https://cn.bing.com/search?q={}&setlang=zh-CN",
+        urlencode(query)
+    );
     let resp = HTTP
         .get(&url)
         .header("Accept-Language", "zh-CN,zh;q=0.9")
@@ -854,9 +1037,17 @@ async fn search_bing(query: &str, limit: usize) -> std::result::Result<Vec<Searc
             .or_else(|| caps.get(4))
             .map(|m| html_to_text(m.as_str()))
             .unwrap_or_default();
-        if title.is_empty() || url.is_empty() { continue; }
-        out.push(SearchResultItem { title, url, snippet });
-        if out.len() >= limit { break; }
+        if title.is_empty() || url.is_empty() {
+            continue;
+        }
+        out.push(SearchResultItem {
+            title,
+            url,
+            snippet,
+        });
+        if out.len() >= limit {
+            break;
+        }
     }
     if out.is_empty() {
         let head = &html[..html.len().min(4000)];
@@ -868,7 +1059,10 @@ async fn search_bing(query: &str, limit: usize) -> std::result::Result<Vec<Searc
     Ok(out)
 }
 
-async fn search_jina(query: &str, _limit: usize) -> std::result::Result<Vec<SearchResultItem>, String> {
+async fn search_jina(
+    query: &str,
+    _limit: usize,
+) -> std::result::Result<Vec<SearchResultItem>, String> {
     let url = format!("https://s.jina.ai/{}", urlencode(query));
     let resp = HTTP
         .get(&url)
@@ -887,8 +1081,18 @@ async fn search_jina(query: &str, _limit: usize) -> std::result::Result<Vec<Sear
         };
         return Err(format!("http {status}{hint}"));
     }
-    let text = resp.text().await.map_err(|e| format!("read: {e}"))?.trim().to_string();
-    if text.len() < 50 { return Err(format!("short body ({} chars, likely rate-limited)", text.len())); }
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("read: {e}"))?
+        .trim()
+        .to_string();
+    if text.len() < 50 {
+        return Err(format!(
+            "short body ({} chars, likely rate-limited)",
+            text.len()
+        ));
+    }
     let mut out = Vec::new();
     for block in text.split("\n[") {
         // split 后除第一个元素外丢失了 "["
@@ -899,7 +1103,9 @@ async fn search_jina(query: &str, _limit: usize) -> std::result::Result<Vec<Sear
         };
         let title = JINA_TITLE_RE.captures(&block).and_then(|c| c.get(1));
         let url = JINA_URL_RE.captures(&block).and_then(|c| c.get(1));
-        let (Some(title), Some(url)) = (title, url) else { continue };
+        let (Some(title), Some(url)) = (title, url) else {
+            continue;
+        };
         let snippet = JINA_DESC_RE
             .captures(&block)
             .and_then(|c| c.get(1))
@@ -911,11 +1117,16 @@ async fn search_jina(query: &str, _limit: usize) -> std::result::Result<Vec<Sear
             snippet: html_to_text(&snippet),
         });
     }
-    if out.is_empty() { return Err("parsed 0 results (format may have changed)".into()); }
+    if out.is_empty() {
+        return Err("parsed 0 results (format may have changed)".into());
+    }
     Ok(out)
 }
 
-async fn search_ddg(query: &str, limit: usize) -> std::result::Result<Vec<SearchResultItem>, String> {
+async fn search_ddg(
+    query: &str,
+    limit: usize,
+) -> std::result::Result<Vec<SearchResultItem>, String> {
     let url = format!("https://duckduckgo.com/html/?q={}", urlencode(query));
     let resp = HTTP
         .get(&url)
@@ -923,9 +1134,13 @@ async fn search_ddg(query: &str, limit: usize) -> std::result::Result<Vec<Search
         .send()
         .await
         .map_err(|e| format!("network: {e}"))?;
-    if !resp.status().is_success() { return Err(format!("http {}", resp.status())); }
+    if !resp.status().is_success() {
+        return Err(format!("http {}", resp.status()));
+    }
     let html = resp.text().await.map_err(|e| format!("read: {e}"))?;
-    if !html.contains("result__a") { return Err("blocked or captcha (no result__a)".into()); }
+    if !html.contains("result__a") {
+        return Err("blocked or captcha (no result__a)".into());
+    }
     let mut out = Vec::new();
     for caps in DDG_ITEM_RE.captures_iter(&html) {
         let m = caps.get(0).unwrap();
@@ -943,10 +1158,18 @@ async fn search_ddg(query: &str, limit: usize) -> std::result::Result<Vec<Search
             .and_then(|c| c.get(1).or_else(|| c.get(2)))
             .map(|s| html_to_text(s.as_str()))
             .unwrap_or_default();
-        out.push(SearchResultItem { title, url, snippet });
-        if out.len() >= limit { break; }
+        out.push(SearchResultItem {
+            title,
+            url,
+            snippet,
+        });
+        if out.len() >= limit {
+            break;
+        }
     }
-    if out.is_empty() { return Err("parsed 0 results".into()); }
+    if out.is_empty() {
+        return Err("parsed 0 results".into());
+    }
     Ok(out)
 }
 
@@ -977,20 +1200,32 @@ async fn fetch_via_direct(
         Ok(p) => p,
         Err(e) => {
             return DirectResult {
-                ok: false, status: None, content_type: None,
-                title: String::new(), body: String::new(), is_json: false,
-                final_url: url.to_string(), code: Some("SSRF".into()),
-                error: Some(format!("URL 无效: {e}")), low_value: false,
+                ok: false,
+                status: None,
+                content_type: None,
+                title: String::new(),
+                body: String::new(),
+                is_json: false,
+                final_url: url.to_string(),
+                code: Some("SSRF".into()),
+                error: Some(format!("URL 无效: {e}")),
+                low_value: false,
             };
         }
     };
     // SSRF 防护：请求前校验目标 URL（协议/凭据/本机/私网/云元数据，防 DNS rebinding）
     if let Err(e) = check_url_ssrf(&parsed, allow_lan) {
         return DirectResult {
-            ok: false, status: None, content_type: None,
-            title: String::new(), body: String::new(), is_json: false,
-            final_url: url.to_string(), code: Some("SSRF".into()),
-            error: Some(e), low_value: false,
+            ok: false,
+            status: None,
+            content_type: None,
+            title: String::new(),
+            body: String::new(),
+            is_json: false,
+            final_url: url.to_string(),
+            code: Some("SSRF".into()),
+            error: Some(e),
+            low_value: false,
         };
     }
     let resp = match http_client(allow_lan)
@@ -1007,10 +1242,16 @@ async fn fetch_via_direct(
         Ok(r) => r,
         Err(e) => {
             return DirectResult {
-                ok: false, status: None, content_type: None,
-                title: String::new(), body: String::new(), is_json: false,
-                final_url: url.to_string(), code: Some("NETWORK".into()),
-                error: Some(e.to_string()), low_value: false,
+                ok: false,
+                status: None,
+                content_type: None,
+                title: String::new(),
+                body: String::new(),
+                is_json: false,
+                final_url: url.to_string(),
+                code: Some("NETWORK".into()),
+                error: Some(e.to_string()),
+                low_value: false,
             };
         }
     };
@@ -1025,27 +1266,45 @@ async fn fetch_via_direct(
 
     if !resp.status().is_success() {
         return DirectResult {
-            ok: false, status: Some(status), content_type: Some(content_type.clone()),
-            title: String::new(), body: String::new(), is_json: false,
-            final_url, code: Some("HTTP".into()),
-            error: Some(format!("HTTP {status}")), low_value: false,
+            ok: false,
+            status: Some(status),
+            content_type: Some(content_type.clone()),
+            title: String::new(),
+            body: String::new(),
+            is_json: false,
+            final_url,
+            code: Some("HTTP".into()),
+            error: Some(format!("HTTP {status}")),
+            low_value: false,
         };
     }
     if !content_type.is_empty() && !CT_RE.is_match(&content_type) {
         return DirectResult {
-            ok: false, status: Some(status), content_type: Some(content_type.clone()),
-            title: String::new(), body: String::new(), is_json: false,
-            final_url, code: Some("CONTENT_TYPE".into()),
-            error: Some(format!("不支持的 content-type: {content_type}")), low_value: false,
+            ok: false,
+            status: Some(status),
+            content_type: Some(content_type.clone()),
+            title: String::new(),
+            body: String::new(),
+            is_json: false,
+            final_url,
+            code: Some("CONTENT_TYPE".into()),
+            error: Some(format!("不支持的 content-type: {content_type}")),
+            low_value: false,
         };
     }
     let raw = match resp.text().await {
         Ok(t) => t,
         Err(e) => {
             return DirectResult {
-                ok: false, status: Some(status), content_type: Some(content_type.clone()),
-                title: String::new(), body: String::new(), is_json: false,
-                final_url, code: Some("DECODE".into()), error: Some(e.to_string()),
+                ok: false,
+                status: Some(status),
+                content_type: Some(content_type.clone()),
+                title: String::new(),
+                body: String::new(),
+                is_json: false,
+                final_url,
+                code: Some("DECODE".into()),
+                error: Some(e.to_string()),
                 low_value: false,
             };
         }
@@ -1059,9 +1318,16 @@ async fn fetch_via_direct(
             .and_then(|v| serde_json::to_string_pretty(&v).ok())
             .unwrap_or_else(|| raw.clone());
         return DirectResult {
-            ok: true, status: Some(status), content_type: Some(content_type.clone()),
-            title: String::new(), body, is_json: true,
-            final_url, code: None, error: None, low_value: false,
+            ok: true,
+            status: Some(status),
+            content_type: Some(content_type.clone()),
+            title: String::new(),
+            body,
+            is_json: true,
+            final_url,
+            code: None,
+            error: None,
+            low_value: false,
         };
     }
 
@@ -1069,16 +1335,29 @@ async fn fetch_via_direct(
     let title = extract_title(&raw);
     if is_low_value_page_text(&text) {
         return DirectResult {
-            ok: false, status: Some(status), content_type: Some(content_type.clone()),
-            title, body: String::new(), is_json: false,
-            final_url, code: Some("LOW_VALUE".into()),
-            error: Some("页面无可读内容".into()), low_value: true,
+            ok: false,
+            status: Some(status),
+            content_type: Some(content_type.clone()),
+            title,
+            body: String::new(),
+            is_json: false,
+            final_url,
+            code: Some("LOW_VALUE".into()),
+            error: Some("页面无可读内容".into()),
+            low_value: true,
         };
     }
     DirectResult {
-        ok: true, status: Some(status), content_type: Some(content_type),
-        title, body: text, is_json: false,
-        final_url, code: None, error: None, low_value: false,
+        ok: true,
+        status: Some(status),
+        content_type: Some(content_type),
+        title,
+        body: text,
+        is_json: false,
+        final_url,
+        code: None,
+        error: None,
+        low_value: false,
     }
 }
 
@@ -1106,7 +1385,12 @@ async fn fetch_via_jina(
     if !resp.status().is_success() {
         return Err(format!("Jina HTTP {}", resp.status()));
     }
-    let text = resp.text().await.map_err(|e| format!("read: {e}"))?.trim().to_string();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("read: {e}"))?
+        .trim()
+        .to_string();
     if text.is_empty() || is_low_value_page_text(&text) {
         return Err("Jina returned no readable content".into());
     }
@@ -1121,7 +1405,11 @@ async fn fetch_via_jina(
         .replacen("Markdown Content:", "", 1)
         .trim()
         .to_string();
-    Ok(JinaResult { title, body, final_url: url.to_string() })
+    Ok(JinaResult {
+        title,
+        body,
+        final_url: url.to_string(),
+    })
 }
 
 /// web_read 一次读取的产物（聚合 `build_read_payload` 入参，避免过多参数）。
@@ -1136,7 +1424,11 @@ struct ReadOutcome<'a> {
 }
 
 /// 组装 web_read 返回（对齐 Node buildPayload）：长文落盘 + 摘要。
-fn build_read_payload(ex: &NativeToolExecutor, outcome: &ReadOutcome<'_>, max_chars: usize) -> Value {
+fn build_read_payload(
+    ex: &NativeToolExecutor,
+    outcome: &ReadOutcome<'_>,
+    max_chars: usize,
+) -> Value {
     let ReadOutcome {
         url,
         final_url,
@@ -1269,7 +1561,8 @@ fn normalize_url(raw: &str) -> String {
 }
 
 /// SSRF 防护：IPv4/IPv6 私网判定（对齐 Node `isPrivateAddress`）。
-fn is_private_ip(ip: std::net::IpAddr) -> bool {
+/// 供 browser_tools 的 URL 守卫复用。
+pub(crate) fn is_private_ip(ip: std::net::IpAddr) -> bool {
     use std::net::IpAddr;
     match ip {
         IpAddr::V4(v4) => {
@@ -1306,7 +1599,11 @@ fn is_private_ip(ip: std::net::IpAddr) -> bool {
 /// 注意：域名解析用同步 std `ToSocketAddrs`（重定向策略回调与请求前均同步调用，
 /// 仅在直连工具里使用，频率低可接受阻塞）。
 /// 返回 `std::result::Result` 以避免与 crate 的 `Result<T, CoreError>` 别名冲突。
-fn check_url_ssrf(url: &reqwest::Url, allow_lan: bool) -> std::result::Result<(), String> {
+/// 供 browser_tools 的 URL 守卫复用（`allow_lan` 对齐 Node `allowPrivateNetwork`）。
+pub(crate) fn check_url_ssrf(
+    url: &reqwest::Url,
+    allow_lan: bool,
+) -> std::result::Result<(), String> {
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("仅支持 http/https 协议: {url}"));
     }
@@ -1352,9 +1649,11 @@ fn check_url_ssrf(url: &reqwest::Url, allow_lan: bool) -> std::result::Result<()
 /// SSRF 防护：reqwest 重定向策略——每跳重定向都过 [`check_url_ssrf`]；
 /// 被拒目标通过 `Attempt::error` 使整个请求失败（对齐 Node 的 redirect 检查中止）。
 fn redirect_policy(allow_lan: bool) -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(move |attempt| match check_url_ssrf(attempt.url(), allow_lan) {
-        Ok(()) => attempt.follow(),
-        Err(e) => attempt.error(format!("SSRF 拒绝重定向目标: {e}")),
+    reqwest::redirect::Policy::custom(move |attempt| {
+        match check_url_ssrf(attempt.url(), allow_lan) {
+            Ok(()) => attempt.follow(),
+            Err(e) => attempt.error(format!("SSRF 拒绝重定向目标: {e}")),
+        }
     })
 }
 
@@ -1363,7 +1662,8 @@ fn redirect_policy(allow_lan: bool) -> reqwest::redirect::Policy {
 // ─────────────────────────────────────────────────────────────
 
 /// 可读文本候选选择器（对齐 Node snapshot.js `extractReadablePage`）。
-const READABLE_SELECTOR: &str = "article, main, [role=\"main\"], .article, .post, .content, .entry-content, #content, #main";
+const READABLE_SELECTOR: &str =
+    "article, main, [role=\"main\"], .article, .post, .content, .entry-content, #content, #main";
 /// 提取文本上限（对齐 Node readOnce `extract_max_chars=500_000`）。
 const BROWSER_EXTRACT_MAX: usize = 500_000;
 /// dump-dom 输出读取上限（防止巨页撑爆内存）。
@@ -1403,10 +1703,19 @@ fn find_browser_exe() -> Option<PathBuf> {
     browser_candidates().into_iter().next()
 }
 
+/// 供 browser_tools（browser_open 启动 Chromium）复用。
+pub(crate) fn find_browser_exe_shared() -> Option<PathBuf> {
+    find_browser_exe()
+}
+
 /// 文本清洗（对齐 Node `clean`：压缩水平空白、合并多空行）。
 fn clean_text(s: &str) -> String {
     let mid = Regex::new(r"[ \t]+").unwrap().replace_all(s, " ");
-    Regex::new(r"\n{3,}").unwrap().replace_all(&mid, "\n\n").trim().to_string()
+    Regex::new(r"\n{3,}")
+        .unwrap()
+        .replace_all(&mid, "\n\n")
+        .trim()
+        .to_string()
 }
 
 /// 近似 innerText：收集元素后代文本，跳过 script/style/noscript/template 等嵌入文本。
@@ -1418,7 +1727,10 @@ fn element_text(el: &scraper::ElementRef) -> String {
                     .parent()
                     .and_then(|p| p.value().as_element())
                     .map(|e| e.name().to_string());
-                if matches!(parent_tag.as_deref(), Some("script" | "style" | "noscript" | "template")) {
+                if matches!(
+                    parent_tag.as_deref(),
+                    Some("script" | "style" | "noscript" | "template")
+                ) {
                     None
                 } else {
                     Some(t.text.to_string())
@@ -1502,7 +1814,9 @@ fn render_with_browser(url: &str, timeout_ms: u64, _extract_max: usize) -> Brows
         Err(e) => {
             let _ = std::fs::remove_dir_all(&profile);
             return BrowserRender {
-                ok: false, title: String::new(), text: String::new(),
+                ok: false,
+                title: String::new(),
+                text: String::new(),
                 final_url: url.to_string(),
                 error: Some(format!("启动浏览器失败: {e}")),
             };
@@ -1548,7 +1862,9 @@ fn render_with_browser(url: &str, timeout_ms: u64, _extract_max: usize) -> Brows
 
     if buf.is_empty() {
         return BrowserRender {
-            ok: false, title: String::new(), text: String::new(),
+            ok: false,
+            title: String::new(),
+            text: String::new(),
             final_url: url.to_string(),
             error: Some("浏览器未返回渲染 DOM（可能超时或页面无输出）".into()),
         };
@@ -1556,7 +1872,9 @@ fn render_with_browser(url: &str, timeout_ms: u64, _extract_max: usize) -> Brows
     let dom = String::from_utf8_lossy(&buf);
     let (title, text) = extract_readable_text(&dom);
     BrowserRender {
-        ok: true, title, text,
+        ok: true,
+        title,
+        text,
         final_url: url.to_string(),
         error: None,
     }
@@ -1867,45 +2185,54 @@ mod tests {
     /// 支持自定义响应头的 mock server（重定向测试用）。循环 accept 处理多次连接
     /// （浏览器渲染 + 直连回落可能各请求一次）。
     fn mock_server_with_headers(
-        handler: impl Fn(&str) -> (u16, &'static str, Vec<u8>, Vec<(&'static str, &'static str)>) + Send + Sync + 'static,
+        handler: impl Fn(
+                &str,
+            ) -> (
+                u16,
+                &'static str,
+                Vec<u8>,
+                Vec<(&'static str, &'static str)>,
+            ) + Send
+            + Sync
+            + 'static,
     ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let handler = std::sync::Arc::new(handler);
-        thread::spawn(move || {
-            loop {
-                let Ok((stream, _)) = listener.accept() else { break };
-                let h = handler.clone();
-                thread::spawn(move || {
-                    let mut stream = stream;
-                    let mut buf = vec![0u8; 65536];
-                    let _ = stream.read(&mut buf);
-                    let req = String::from_utf8_lossy(&buf).to_string();
-                    let (status, ctype, body, headers) = h(&req);
-                    let reason = match status {
-                        200 => "OK",
-                        301 => "Moved Permanently",
-                        302 => "Found",
-                        307 => "Temporary Redirect",
-                        308 => "Permanent Redirect",
-                        404 => "Not Found",
-                        403 => "Forbidden",
-                        503 => "Service Unavailable",
-                        _ => "Custom",
-                    };
-                    let mut head = format!(
-                        "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
-                        body.len()
-                    );
-                    for (k, v) in headers {
-                        head.push_str(&format!("{k}: {v}\r\n"));
-                    }
-                    head.push_str("Connection: close\r\n\r\n");
-                    let _ = stream.write_all(head.as_bytes());
-                    let _ = stream.write_all(&body);
-                    let _ = stream.flush();
-                });
-            }
+        thread::spawn(move || loop {
+            let Ok((stream, _)) = listener.accept() else {
+                break;
+            };
+            let h = handler.clone();
+            thread::spawn(move || {
+                let mut stream = stream;
+                let mut buf = vec![0u8; 65536];
+                let _ = stream.read(&mut buf);
+                let req = String::from_utf8_lossy(&buf).to_string();
+                let (status, ctype, body, headers) = h(&req);
+                let reason = match status {
+                    200 => "OK",
+                    301 => "Moved Permanently",
+                    302 => "Found",
+                    307 => "Temporary Redirect",
+                    308 => "Permanent Redirect",
+                    404 => "Not Found",
+                    403 => "Forbidden",
+                    503 => "Service Unavailable",
+                    _ => "Custom",
+                };
+                let mut head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n",
+                    body.len()
+                );
+                for (k, v) in headers {
+                    head.push_str(&format!("{k}: {v}\r\n"));
+                }
+                head.push_str("Connection: close\r\n\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            });
         });
         format!("http://{addr}")
     }
@@ -1927,7 +2254,9 @@ mod tests {
     #[test]
     fn is_low_value_detects_captcha_and_short_pages() {
         assert!(is_low_value_page_text("short"));
-        assert!(is_low_value_page_text("Checking your browser before accessing..."));
+        assert!(is_low_value_page_text(
+            "Checking your browser before accessing..."
+        ));
         assert!(is_low_value_page_text("请稍候，正在安全验证，请勿关闭页面"));
         assert!(!is_low_value_page_text(
             "这是一篇足够长的正文内容，其长度远超八十个字符阈值。它包含多个完整的句子，用于验证低价值页面检测逻辑不会误杀正常的文章正文文本内容，确保网页抓取后正文能够得到保留。"
@@ -1945,9 +2274,15 @@ mod tests {
         let bing = format!("https://www.bing.com/ck/a?u=a1{encoded}&ntb=1");
         assert_eq!(unwrap_redirect_url(&bing), target);
         // 普通链接原样返回
-        assert_eq!(unwrap_redirect_url("https://plain.example/a"), "https://plain.example/a");
+        assert_eq!(
+            unwrap_redirect_url("https://plain.example/a"),
+            "https://plain.example/a"
+        );
         // 协议相对链接补 https
-        assert_eq!(unwrap_redirect_url("//cdn.example/x"), "https://cdn.example/x");
+        assert_eq!(
+            unwrap_redirect_url("//cdn.example/x"),
+            "https://cdn.example/x"
+        );
     }
 
     #[test]
@@ -2024,7 +2359,8 @@ mod tests {
     #[test]
     fn web_read_local_http_server() {
         let body = r#"<html><head><title>本地测试页</title></head><body><h1>你好</h1><p>这是本地 mock 服务器的正文内容，用于验证 web_read 的直连抓取路径。这段文字故意写得很长，需要超过八十个字符的低价值页面判定阈值，这样整段正文才会被识别为正常可读内容，而不会被 is_low_value_page_text 误判并丢弃。</p></body></html>"#;
-        let url = mock_server(move |_req| (200, "text/html; charset=utf-8", body.as_bytes().to_vec()));
+        let url =
+            mock_server(move |_req| (200, "text/html; charset=utf-8", body.as_bytes().to_vec()));
         let dir = tempfile::tempdir().unwrap();
         let ex = test_executor(dir.path());
         let r = ex
@@ -2033,7 +2369,10 @@ mod tests {
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["ok"].as_bool(), Some(true), "r={r}");
         assert_eq!(v["read_source"].as_str(), Some("http"));
-        assert!(v["content"].as_str().unwrap().contains("本地 mock 服务器"), "r={r}");
+        assert!(
+            v["content"].as_str().unwrap().contains("本地 mock 服务器"),
+            "r={r}"
+        );
         assert_eq!(v["title"].as_str(), Some("本地测试页"));
     }
 
@@ -2064,7 +2403,8 @@ mod tests {
             "<html><head><title>长文</title></head><body>{}</body></html>",
             "<p>这一段内容足够长，用于触发落盘阈值。</p>".repeat(120)
         );
-        let url = mock_server(move |_req| (200, "text/html; charset=utf-8", body.clone().into_bytes()));
+        let url =
+            mock_server(move |_req| (200, "text/html; charset=utf-8", body.clone().into_bytes()));
         let dir = tempfile::tempdir().unwrap();
         let ex = test_executor(dir.path());
         let r = ex
@@ -2103,10 +2443,7 @@ mod tests {
             .unwrap();
         let v: Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["ok"].as_bool(), Some(true), "r={r}");
-        assert!(
-            v["content"].as_str().unwrap().contains("可读正文"),
-            "r={r}"
-        );
+        assert!(v["content"].as_str().unwrap().contains("可读正文"), "r={r}");
     }
 
     #[test]
@@ -2134,7 +2471,11 @@ mod tests {
         );
         let (title, text) = extract_readable_text(&dom);
         assert_eq!(title, "Long");
-        assert!(text.starts_with("正文"), "应取 article 文本: len={}", text.len());
+        assert!(
+            text.starts_with("正文"),
+            "应取 article 文本: len={}",
+            text.len()
+        );
         assert!(!text.contains("nav"), "短导航不应混入");
     }
 
@@ -2175,7 +2516,8 @@ mod tests {
         let payload = b"BINARY\x00\x01\x02\x03DATA".to_vec();
         let payload_len = payload.len();
         let server_payload = payload.clone();
-        let url = mock_server(move |_req| (200, "application/octet-stream", server_payload.clone()));
+        let url =
+            mock_server(move |_req| (200, "application/octet-stream", server_payload.clone()));
         let dir = tempfile::tempdir().unwrap();
         let ex = test_executor(dir.path());
         let r = ex
@@ -2242,7 +2584,10 @@ mod tests {
     #[test]
     fn url_ttl_varies_by_kind() {
         assert_eq!(url_ttl("https://wttr.in/beijing"), Duration::from_secs(600));
-        assert_eq!(url_ttl("https://example.com/news/rss"), Duration::from_secs(300));
+        assert_eq!(
+            url_ttl("https://example.com/news/rss"),
+            Duration::from_secs(300)
+        );
         assert_eq!(url_ttl("https://example.com/"), Duration::from_secs(3600));
     }
 
@@ -2328,19 +2673,48 @@ mod tests {
     }
 
     #[test]
+    fn web_read_browser_render_also_ssrf_guarded() {
+        // 审计 H3：render=browser 路径也必须过 SSRF 校验——私网/云元数据 URL 不得进入
+        // headless 浏览器渲染（旧实现直启 Chrome 抓任意 URL）。校验在渲染前拒绝，
+        // 因此本测试无需真实浏览器、无网络请求。
+        let dir = tempfile::tempdir().unwrap();
+        let ex = NativeToolExecutor::new(dir.path().to_path_buf());
+        let r = ex
+            .execute(
+                "web_read",
+                &json!({ "url": "http://169.254.169.254/latest/meta-data/", "render": "browser" }),
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&r).unwrap();
+        let fails = v["failures"].as_array().unwrap();
+        assert!(
+            fails.iter().any(|f| f["code"].as_str() == Some("SSRF_BLOCKED")),
+            "render=browser 私网 URL 应在浏览器策略被 SSRF 拦截: r={r}"
+        );
+    }
+
+    #[test]
     fn ssrf_redirect_to_private_is_rejected() {
         // redirect_policy 与首跳校验共用 check_url_ssrf：直接验证判定函数
         let evil = reqwest::Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
         assert!(check_url_ssrf(&evil, false).is_err());
         assert!(check_url_ssrf(&evil, true).is_ok(), "allow_lan=true 放行");
         let ftp = reqwest::Url::parse("ftp://example.com/x").unwrap();
-        assert!(check_url_ssrf(&ftp, true).is_err(), "非 http/https 协议拒绝");
+        assert!(
+            check_url_ssrf(&ftp, true).is_err(),
+            "非 http/https 协议拒绝"
+        );
         let cred = reqwest::Url::parse("http://u:p@example.com/").unwrap();
         assert!(check_url_ssrf(&cred, true).is_err(), "凭据 URL 拒绝");
 
         // 端到端：mock server 首跳即私网（127.0.0.1）→ no-lan executor 请求前拒绝
         let url = mock_server_with_headers(|_req| {
-            (302, "text/html", Vec::new(), vec![("Location", "http://169.254.169.254/")])
+            (
+                302,
+                "text/html",
+                Vec::new(),
+                vec![("Location", "http://169.254.169.254/")],
+            )
         });
         let dir = tempfile::tempdir().unwrap();
         let ex = NativeToolExecutor::new(dir.path().to_path_buf()); // allow_lan=false

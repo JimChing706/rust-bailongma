@@ -45,13 +45,7 @@ pub struct LlmCallAgg {
 }
 
 impl LlmCallAgg {
-    pub fn new(
-        request_id: &str,
-        provider: &str,
-        model: &str,
-        started_at: &str,
-        day: &str,
-    ) -> Self {
+    pub fn new(request_id: &str, provider: &str, model: &str, started_at: &str, day: &str) -> Self {
         Self {
             request_id: request_id.to_string(),
             provider: provider.to_string(),
@@ -224,7 +218,7 @@ pub fn upsert_tool_calls_batch(db: &Db, rows: &[LlmToolCallRow]) -> Result<()> {
                (request_id, round, attempt, tool_name, args_json, result_json, status,
                 duration_ms, delegated_from)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-             ON CONFLICT(request_id, round, attempt, tool_name) DO UPDATE SET
+             ON CONFLICT(request_id, round, attempt, tool_name, args_json) DO UPDATE SET
                args_json       = excluded.args_json,
                result_json     = excluded.result_json,
                status          = excluded.status,
@@ -447,9 +441,15 @@ impl WeeklyReport {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenGateDecision {
     /// 放行：周窗口已用 tokens + 剩余额度
-    Allow { used_tokens: i64, remaining_tokens: i64 },
+    Allow {
+        used_tokens: i64,
+        remaining_tokens: i64,
+    },
     /// 拦截：周窗口总 tokens 已超预算
-    Blocked { used_tokens: i64, budget_tokens: i64 },
+    Blocked {
+        used_tokens: i64,
+        budget_tokens: i64,
+    },
 }
 
 /// P3-3 基于周报的 token 预算闸门：按周窗口总 tokens（llm_metrics_daily 聚合，含所有 stage）判断是否超预算。
@@ -477,31 +477,40 @@ pub fn token_budget_gate(db: &Db, days: i64, budget_tokens: i64) -> Result<Token
 
 pub fn weekly_report(db: &Db, days: i64) -> Result<WeeklyReport> {
     let window = format!("-{days} days");
-    let (total_calls, error_count, retry_count, fallback_count, aborted_count, total_tokens, cached_tokens, ttft_sum_ms, ttft_count, duration_sum_ms) = db
-        .conn()
-        .query_row(
-            "SELECT COALESCE(SUM(total_calls),0), COALESCE(SUM(error_count),0),
+    let (
+        total_calls,
+        error_count,
+        retry_count,
+        fallback_count,
+        aborted_count,
+        total_tokens,
+        cached_tokens,
+        ttft_sum_ms,
+        ttft_count,
+        duration_sum_ms,
+    ) = db.conn().query_row(
+        "SELECT COALESCE(SUM(total_calls),0), COALESCE(SUM(error_count),0),
                     COALESCE(SUM(retry_count),0), COALESCE(SUM(fallback_count),0),
                     COALESCE(SUM(aborted_count),0), COALESCE(SUM(total_tokens),0),
                     COALESCE(SUM(cached_tokens),0), COALESCE(SUM(ttft_sum_ms),0),
                     COALESCE(SUM(ttft_count),0), COALESCE(SUM(duration_sum_ms),0)
              FROM llm_metrics_daily WHERE day >= date('now', ?1)",
-            [&window],
-            |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, i64>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, i64>(8)?,
-                    r.get::<_, i64>(9)?,
-                ))
-            },
-        )?;
+        [&window],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+                r.get::<_, i64>(9)?,
+            ))
+        },
+    )?;
 
     let mut report = WeeklyReport {
         days,
@@ -630,15 +639,23 @@ impl WakeupCost {
 /// 查询周窗口内唤醒轮成本（stage='wakeup'；llm_calls 明细，2 万行留存内窗口可用）
 pub fn wakeup_cost_weekly(db: &Db, days: i64) -> Result<WakeupCost> {
     let window = format!("-{days} days");
-    let (calls, total_tokens, cached_tokens, ttft_sum_ms, ttft_count, duration_sum_ms) = db
-        .conn()
-        .query_row(
+    let (calls, total_tokens, cached_tokens, ttft_sum_ms, ttft_count, duration_sum_ms) =
+        db.conn().query_row(
             "SELECT COUNT(*), COALESCE(SUM(total_tokens),0), COALESCE(SUM(cached_tokens),0),
                     COALESCE(SUM(ttft_ms),0), COUNT(ttft_ms), COALESCE(SUM(duration_ms),0)
              FROM llm_calls
              WHERE stage = 'wakeup' AND started_at >= date('now', ?1)",
             [&window],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )?;
     Ok(WakeupCost {
         calls,
@@ -699,7 +716,13 @@ mod tests {
     }
 
     fn agg(rid: &str, reason: &str, attempt: u32) -> LlmCallAgg {
-        let mut a = LlmCallAgg::new(rid, "deepseek", "deepseek-v4-pro", "2026-08-10T10:00:00+08:00", "2026-08-10");
+        let mut a = LlmCallAgg::new(
+            rid,
+            "deepseek",
+            "deepseek-v4-pro",
+            "2026-08-10T10:00:00+08:00",
+            "2026-08-10",
+        );
         a.finish_reason = reason.into();
         a.attempt = attempt;
         a.terminal = true;
@@ -805,20 +828,32 @@ mod tests {
         // 先落 error（attempt 1），再落 ok（attempt 2）——模拟重试后成功
         upsert_tool_calls_batch(
             &db,
-            &[row(1, "error", "send_message", r#"{"to":"u"}"#, r#"{"ok":false}"#)],
+            &[row(
+                1,
+                "error",
+                "send_message",
+                r#"{"to":"u"}"#,
+                r#"{"ok":false}"#,
+            )],
         )
         .unwrap();
         upsert_tool_calls_batch(
             &db,
-            &[row(2, "ok", "send_message", r#"{"to":"u"}"#, r#"{"delivered":true}"#)],
+            &[row(
+                2,
+                "ok",
+                "send_message",
+                r#"{"to":"u"}"#,
+                r#"{"delivered":true}"#,
+            )],
         )
         .unwrap();
         // 只复用成功记录，且取最新 attempt
         let hit = find_tool_call_result(&db, "r9", 3, "send_message", r#"{"to":"u"}"#).unwrap();
         assert_eq!(hit.as_deref(), Some(r#"{"delivered":true}"#));
         // 审计 L1：同轮同名工具【不同参数】不得命中复用（必须重新执行）
-        let other_args = find_tool_call_result(&db, "r9", 3, "send_message", r#"{"to":"v"}"#)
-            .unwrap();
+        let other_args =
+            find_tool_call_result(&db, "r9", 3, "send_message", r#"{"to":"v"}"#).unwrap();
         assert!(other_args.is_none(), "不同参数不应复用结果");
         // 未执行过的工具 → None
         assert!(
@@ -829,7 +864,13 @@ mod tests {
         // 只有 error 记录 → None（错误不防重放，允许重试重新执行）
         upsert_tool_calls_batch(
             &db,
-            &[row(1, "error", "express", r#"{"text":"hi"}"#, r#"{"ok":false}"#)],
+            &[row(
+                1,
+                "error",
+                "express",
+                r#"{"text":"hi"}"#,
+                r#"{"ok":false}"#,
+            )],
         )
         .unwrap();
         assert!(
@@ -842,6 +883,50 @@ mod tests {
             find_tool_call_result(&db, "r9", 4, "send_message", r#"{"to":"u"}"#)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn tool_batch_keeps_distinct_args_in_same_round() {
+        // H8（审计修复）：同轮同名工具不同参数必须各占一行（唯一键含 args_json 维度），
+        // 否则第二次覆盖首行、重试时首调用被重复执行。
+        let db = test_db();
+        let row = |args: &str, result: &str| LlmToolCallRow {
+            request_id: "r-h8".into(),
+            round: 3,
+            attempt: 1,
+            tool_name: "send_message".into(),
+            args_json: args.into(),
+            result_json: result.into(),
+            status: "ok".into(),
+            duration_ms: 5,
+            delegated_from: String::new(),
+        };
+        upsert_tool_calls_batch(&db, &[row(r#"{"to":"u"}"#, r#"{"r":1}"#)]).unwrap();
+        upsert_tool_calls_batch(&db, &[row(r#"{"to":"v"}"#, r#"{"r":2}"#)]).unwrap();
+
+        let n: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM llm_tool_calls WHERE request_id = 'r-h8'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2, "同轮同名不同参数应各占一行，不得覆盖");
+
+        // 两个参数各自命中自己的结果
+        assert_eq!(
+            find_tool_call_result(&db, "r-h8", 3, "send_message", r#"{"to":"u"}"#)
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"r":1}"#)
+        );
+        assert_eq!(
+            find_tool_call_result(&db, "r-h8", 3, "send_message", r#"{"to":"v"}"#)
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"r":2}"#)
         );
     }
 
@@ -944,7 +1029,9 @@ mod tests {
         let db = test_db();
         let d = token_budget_gate(&db, 7, 0).unwrap();
         match d {
-            TokenGateDecision::Allow { remaining_tokens, .. } => {
+            TokenGateDecision::Allow {
+                remaining_tokens, ..
+            } => {
                 assert_eq!(remaining_tokens, i64::MAX);
             }
             _ => panic!("预算=0 闸门关闭，应放行"),
@@ -1057,9 +1144,7 @@ mod tests {
         assert_eq!(r.wakeup.avg_ttft_ms(), 500.0);
         assert!((r.wakeup.share_of_total(r.total_tokens) - 40.0).abs() < 1e-9);
         assert!(
-            r.signals
-                .iter()
-                .any(|s| s.contains("唤醒成本占比偏高")),
+            r.signals.iter().any(|s| s.contains("唤醒成本占比偏高")),
             "40% > 25% 必须触发唤醒成本信号"
         );
         let text = r.render();

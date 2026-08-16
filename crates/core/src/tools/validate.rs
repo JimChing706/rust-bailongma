@@ -76,9 +76,9 @@ pub fn validate_against(schema: &ToolSchema, args: &Value) -> Result<()> {
 
     // 4. 逐个在场参数：类型 + enum 校验；未声明参数一律拒绝
     for (k, v) in obj {
-        let prop = props.get(k).ok_or_else(|| {
-            CoreError::Tool(format!("{} 未知参数: {k}", schema.name))
-        })?;
+        let prop = props
+            .get(k)
+            .ok_or_else(|| CoreError::Tool(format!("{} 未知参数: {k}", schema.name)))?;
         check_value(&schema.name, k, v, prop)?;
     }
     Ok(())
@@ -118,7 +118,9 @@ fn check_value(tool: &str, key: &str, v: &Value, prop: &Value) -> Result<()> {
     }
 
     if let (Some(items), Some(arr)) = (
-        prop.get("items").and_then(|i| i.get("type")).and_then(Value::as_str),
+        prop.get("items")
+            .and_then(|i| i.get("type"))
+            .and_then(Value::as_str),
         v.as_array(),
     ) {
         for (i, item) in arr.iter().enumerate() {
@@ -167,15 +169,23 @@ mod tests {
             ("list_dir", json!({ "path": "." })),
             ("make_dir", json!({ "path": "sub" })),
             ("delete_file", json!({ "path": "a.txt" })),
-            ("exec_command", json!({ "command": "echo hi", "timeout_ms": 5000, "cwd": "." })),
+            (
+                "exec_command",
+                json!({ "command": "echo hi", "timeout_ms": 5000, "cwd": "." }),
+            ),
             ("search_memory", json!({ "keyword": "rust", "limit": 5 })),
-            ("send_message", json!({ "target_id": "ID:000001", "content": "hello" })),
-            ("collect_agents", json!({ "include_unavailable": true, "limit": 5 })),
+            (
+                "send_message",
+                json!({ "target_id": "ID:000001", "content": "hello" }),
+            ),
+            (
+                "collect_agents",
+                json!({ "include_unavailable": true, "limit": 5 }),
+            ),
             ("remind", json!({ "action": "list", "limit": 3 })),
         ];
         for (name, args) in cases {
-            validate_args(name, args)
-                .unwrap_or_else(|e| panic!("合法调用被拒 {name}: {e}"));
+            validate_args(name, args).unwrap_or_else(|e| panic!("合法调用被拒 {name}: {e}"));
         }
     }
 
@@ -187,8 +197,7 @@ mod tests {
 
     #[test]
     fn null_required_rejected() {
-        let e = validate_args("write_file", &json!({ "path": null, "content": "x" }))
-            .unwrap_err();
+        let e = validate_args("write_file", &json!({ "path": null, "content": "x" })).unwrap_err();
         assert!(e.to_string().contains("不能为 null"), "{e}");
     }
 
@@ -197,15 +206,11 @@ mod tests {
         let e = validate_args("exec_command", &json!({ "command": 42 })).unwrap_err();
         assert!(e.to_string().contains("类型应为 string"), "{e}");
         // integer 参数传浮点
-        let e = validate_args("read_file", &json!({ "path": "a", "max_bytes": 1.5 }))
-            .unwrap_err();
+        let e = validate_args("read_file", &json!({ "path": "a", "max_bytes": 1.5 })).unwrap_err();
         assert!(e.to_string().contains("类型应为 integer"), "{e}");
         // boolean 参数传字符串
-        let e = validate_args(
-            "collect_agents",
-            &json!({ "include_unavailable": "yes" }),
-        )
-        .unwrap_err();
+        let e =
+            validate_args("collect_agents", &json!({ "include_unavailable": "yes" })).unwrap_err();
         assert!(e.to_string().contains("类型应为 boolean"), "{e}");
     }
 
@@ -220,14 +225,14 @@ mod tests {
 
     #[test]
     fn unknown_param_rejected() {
+        let e =
+            validate_args("read_file", &json!({ "path": "a.txt", "pathx": "b.txt" })).unwrap_err();
+        assert!(e.to_string().contains("未知参数: pathx"), "{e}");
         let e = validate_args(
-            "read_file",
-            &json!({ "path": "a.txt", "pathx": "b.txt" }),
+            "send_message",
+            &json!({ "target_id": "ID:1", "content": "hi", "channel": "TUI" }),
         )
         .unwrap_err();
-        assert!(e.to_string().contains("未知参数: pathx"), "{e}");
-        let e = validate_args("send_message", &json!({ "target_id": "ID:1", "content": "hi", "channel": "TUI" }))
-            .unwrap_err();
         assert!(e.to_string().contains("未知参数: channel"), "{e}");
     }
 

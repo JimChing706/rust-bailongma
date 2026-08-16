@@ -543,10 +543,9 @@ mod tests {
             _ => panic!("expected Patch"),
         }
         // 无变化 → false，不广播
-        assert!(
-            !s.set_many(&[("d".into(), Some(json!({ "kind": "x" })))])
-                .unwrap()
-        );
+        assert!(!s
+            .set_many(&[("d".into(), Some(json!({ "kind": "x" })))])
+            .unwrap());
     }
 
     #[test]
@@ -561,11 +560,10 @@ mod tests {
         assert!(err.is_err());
         assert!(s.get("b").is_none()); // 未应用
         assert_eq!(s.rev(), 1); // 未 bump
-        // 空 id 同样整体拒绝
-        assert!(
-            s.set_many(&[("".into(), Some(json!({ "kind": "text" })))])
-                .is_err()
-        );
+                                // 空 id 同样整体拒绝
+        assert!(s
+            .set_many(&[("".into(), Some(json!({ "kind": "text" })))])
+            .is_err());
         // 空列表 → false 无副作用
         assert!(!s.set_many(&[]).unwrap());
     }

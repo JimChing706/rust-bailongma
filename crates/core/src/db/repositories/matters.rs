@@ -170,9 +170,8 @@ pub fn set_delegation(db: &Db, id: i64, point: &str, allowed: bool) -> Result<()
             )))
         }
     };
-    let sql = format!(
-        "UPDATE matters SET {column} = ?2, updated_at = datetime('now') WHERE id = ?1"
-    );
+    let sql =
+        format!("UPDATE matters SET {column} = ?2, updated_at = datetime('now') WHERE id = ?1");
     let conn = db.conn();
     conn.execute(&sql, rusqlite::params![id, allowed as i64])?;
     Ok(())
@@ -373,8 +372,13 @@ mod tests {
         assert!(m.death_reason.is_empty());
         assert_eq!(m.intent_original, "让协作者能独立跑工具循环");
         // 委托位默认全 false（人类保留）
-        assert!(!m.delegation_choose && !m.delegation_path && !m.delegation_execute
-            && !m.delegation_verify && !m.delegation_terminate);
+        assert!(
+            !m.delegation_choose
+                && !m.delegation_path
+                && !m.delegation_execute
+                && !m.delegation_verify
+                && !m.delegation_terminate
+        );
         assert_eq!(m.signals, "[]");
     }
 
@@ -465,9 +469,17 @@ mod tests {
         set_delegation(&db, id, "execute", false).unwrap();
         assert!(!get(&db, id).unwrap().unwrap().delegation_execute);
         // 信号台账
-        set_signals(&db, id, r#"[{"ts":"2026-08-11 00:00:00","kind":"intent_drift","detail":"x"}]"#)
-            .unwrap();
-        assert!(get(&db, id).unwrap().unwrap().signals.contains("intent_drift"));
+        set_signals(
+            &db,
+            id,
+            r#"[{"ts":"2026-08-11 00:00:00","kind":"intent_drift","detail":"x"}]"#,
+        )
+        .unwrap();
+        assert!(get(&db, id)
+            .unwrap()
+            .unwrap()
+            .signals
+            .contains("intent_drift"));
         assert!(!now_utc(&db).unwrap().is_empty());
     }
 }

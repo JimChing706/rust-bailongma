@@ -107,9 +107,16 @@ pub fn get_web_socket_credential(
 }
 
 /// HTTP origin 是否回环来源（对齐 isLoopbackOrigin）。
+///
+/// 安全修复（审计 H1）：`Origin: null` 是浏览器的 opaque origin（沙箱 iframe /
+/// data: URL 页面），**不是**受信回环客户端——旧实现将其当回环放行，任意网页即可
+/// 无凭据读取本机 API。空 origin（非浏览器客户端，如 curl）仍按回环处理。
 pub fn is_loopback_origin(origin: &str) -> bool {
-    if origin.is_empty() || origin == "null" {
+    if origin.is_empty() {
         return true;
+    }
+    if origin == "null" {
+        return false;
     }
     let Ok(parsed) = url_hostname(origin) else {
         return false;
@@ -132,12 +139,16 @@ pub fn is_allowed_origin(origin: &str, lan_enabled: bool) -> bool {
 }
 
 /// WebSocket 来源是否被允许（对齐 isAllowedWebSocketOrigin）。
-pub fn is_allowed_ws_origin(origin: &str, remote_is_loopback: bool, lan_enabled: bool) -> bool {
+///
+/// 安全修复（审计 H1）：opaque origin（`null`）的 WS 升级一律拒绝——`/scene` 流
+/// 经 hello 快照广播审批卡 id，放行 null origin 会让任意网页窃取代批 exec_command。
+/// 桌面/brain-ui 的 WS 走回环 HTTP origin（`http://127.0.0.1:*`），不受影响。
+pub fn is_allowed_ws_origin(origin: &str, _remote_is_loopback: bool, lan_enabled: bool) -> bool {
     if origin.is_empty() {
         return true;
     }
     if origin == "null" {
-        return remote_is_loopback;
+        return false;
     }
     match url_hostname(origin) {
         Ok(h) => {
@@ -243,10 +254,7 @@ impl RateLimiter {
     /// 尝试放行；窗口内已达上限返回 false。
     pub fn allow(&self, key: &str) -> bool {
         let now = std::time::Instant::now();
-        let mut m = self
-            .inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut m = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let v = m.entry(key.to_string()).or_default();
         v.retain(|t| now.duration_since(*t) < self.window);
         if v.len() >= self.max {
@@ -388,7 +396,8 @@ mod tests {
     #[test]
     fn origin_checks() {
         assert!(is_loopback_origin(""));
-        assert!(is_loopback_origin("null"));
+        // 安全修复（审计 H1）：opaque origin 不再视为回环
+        assert!(!is_loopback_origin("null"));
         assert!(is_loopback_origin("http://127.0.0.1:8080"));
         assert!(is_loopback_origin("http://localhost:3721"));
         assert!(!is_loopback_origin("http://evil.com"));
@@ -398,6 +407,9 @@ mod tests {
         assert!(!is_allowed_origin("http://192.168.1.5", false));
         assert!(is_allowed_origin("http://192.168.1.5", true));
         assert!(!is_allowed_origin("http://8.8.8.8", true));
+        // opaque origin 不被任何 LAN/回环判定放行
+        assert!(!is_allowed_origin("null", false));
+        assert!(!is_allowed_origin("null", true));
     }
 
     #[test]
@@ -410,6 +422,9 @@ mod tests {
         assert!(is_allowed_ws_origin("http://192.168.1.5", false, true));
         // 无 origin（原生客户端）→ 允许
         assert!(is_allowed_ws_origin("", false, false));
+        // 安全修复（审计 H1）：opaque origin 的 WS 升级一律拒绝（无论远端是否回环）
+        assert!(!is_allowed_ws_origin("null", true, false));
+        assert!(!is_allowed_ws_origin("null", false, true));
 
         // 未知路径
         let a = authorize_ws_upgrade_with_credential(

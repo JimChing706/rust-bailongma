@@ -82,10 +82,7 @@ pub fn remind_impl(ex: &NativeToolExecutor, args: &Value) -> Result<Value> {
             "remind 未接线（未注入 Db，当前轮不可用）".into(),
         ));
     };
-    let action = args
-        .get("action")
-        .and_then(Value::as_str)
-        .unwrap_or("list");
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("list");
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
@@ -192,7 +189,10 @@ pub fn extra_tool_schemas() -> Vec<crate::llm::tools::ToolSchema> {
             "collect_agents",
             "列出本机已知 AI Agent（known_agents 表；默认仅可用，不触发探测）",
         )
-        .param("include_unavailable", boolean_param("是否包含不可用 Agent，默认 false"))
+        .param(
+            "include_unavailable",
+            boolean_param("是否包含不可用 Agent，默认 false"),
+        )
         .param("limit", integer_param("返回条数，默认 20，最大 100")),
         ToolSchema::new(
             "remind",
@@ -200,13 +200,22 @@ pub fn extra_tool_schemas() -> Vec<crate::llm::tools::ToolSchema> {
         )
         .param("action", enum_param("操作", &["list"]))
         .param("limit", integer_param("返回条数，默认 10，最大 50"))
-        .param("now", crate::llm::tools::string_param("当前时间 ISO 注入（测试/调试用，默认取系统时间）")),
+        .param(
+            "now",
+            crate::llm::tools::string_param("当前时间 ISO 注入（测试/调试用，默认取系统时间）"),
+        ),
         ToolSchema::new(
             "set_reminder",
             "创建一条到期提醒（写入 reminders 表；到点后自动触发投递，可用 remind 查询）",
         )
-        .required("due_at", crate::llm::tools::string_param("ISO 8601 到期时间（任意时区，存储归一为 UTC）"))
-        .required("task", crate::llm::tools::string_param("提醒内容（非空，≤500 字符）")),
+        .required(
+            "due_at",
+            crate::llm::tools::string_param("ISO 8601 到期时间（任意时区，存储归一为 UTC）"),
+        )
+        .required(
+            "task",
+            crate::llm::tools::string_param("提醒内容（非空，≤500 字符）"),
+        ),
     ]
 }
 
@@ -367,7 +376,10 @@ mod tests {
     fn set_reminder_requires_db() {
         let dir = tempfile::tempdir().unwrap();
         let ex = NativeToolExecutor::new(dir.path().to_path_buf());
-        let r = ex.execute("set_reminder", &json!({ "due_at": "2026-08-12T08:00:00Z", "task": "开会" }));
+        let r = ex.execute(
+            "set_reminder",
+            &json!({ "due_at": "2026-08-12T08:00:00Z", "task": "开会" }),
+        );
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("未接线"));
         assert!(!ex.is_ready("set_reminder"));

@@ -23,12 +23,13 @@ use crate::error::Result;
 use crate::intervention::{InterventionGate, InterventionStatus};
 
 use super::caller::{LlmConfig, StreamContext};
+use super::replay::ToolReplayGuard;
 use super::retry::{stream_once_with_model_fallback, RetryInfo};
 use super::tools::ToolSchema;
-use super::replay::ToolReplayGuard;
 use super::types::{
-    build_tool_fingerprint, parse_xml_tool_calls, ChatCompletionRequest, ChatMessage,
-    StreamOnceResult, ToolCall, ToolCallPayload, ToolFunctionPayload,
+    build_tool_fingerprint, mask_tool_args_for_ledger, parse_xml_tool_calls, stable_stringify,
+    ChatCompletionRequest, ChatMessage, StreamOnceResult, ToolCall, ToolCallPayload,
+    ToolFunctionPayload,
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -554,12 +555,19 @@ pub async fn call_llm(
                     // 每次熔断重置后需再攒 3 次失败才熔断）。收紧到阈值-1：
                     // 下一次失败立即再次熔断；成功则由 record_outcome 清零解除，
                     // 避免「熔断后永久拒绝」的死锁。
-                    state.consecutive_failures = limits
-                        .max_consecutive_failures
-                        .saturating_sub(1);
+                    state.consecutive_failures = limits.max_consecutive_failures.saturating_sub(1);
                     let stopped_result = make_tool_loop_stopped_result(&tc.name, &reason);
                     // ── M2 台账：熔断事件（status=tripped）──
-                    record_tool_call(&round_ctx, round, &tc.name, &normalized, &stopped_result, "tripped", 0, &args.delegated_from);
+                    record_tool_call(
+                        &round_ctx,
+                        round,
+                        &tc.name,
+                        &normalized,
+                        &stopped_result,
+                        "tripped",
+                        0,
+                        &args.delegated_from,
+                    );
                     (stopped_result, true)
                 }
                 None => {
@@ -592,14 +600,32 @@ pub async fn call_llm(
                         // ── P1-2 同步落账（不等 flusher）：执行了就有账，响应丢失后重试可复用 ──
                         if let Some(g) = replay_guard {
                             let status = if is_tool_failure(&r) { "error" } else { "ok" };
-                            g.record(&rid, round, &tc.name, &normalized, &r, status, dur_ms, &args.delegated_from);
+                            g.record(
+                                &rid,
+                                round,
+                                &tc.name,
+                                &normalized,
+                                &r,
+                                status,
+                                dur_ms,
+                                &args.delegated_from,
+                            );
                         }
                         (r, dur_ms)
                     };
                     state.record_outcome(&fingerprint, &r);
                     // ── M2 台账：工具执行结果（键含 attempt，防重试误伤；重放行同键被 IGNORE 去重）──
                     let status = if is_tool_failure(&r) { "error" } else { "ok" };
-                    record_tool_call(&round_ctx, round, &tc.name, &normalized, &r, status, dur_ms, &args.delegated_from);
+                    record_tool_call(
+                        &round_ctx,
+                        round,
+                        &tc.name,
+                        &normalized,
+                        &r,
+                        status,
+                        dur_ms,
+                        &args.delegated_from,
+                    );
                     (r, false)
                 }
             };
@@ -749,7 +775,7 @@ fn record_tool_call(
             round: round as i64,
             attempt: 1,
             tool_name: tool_name.to_string(),
-            args_json: args.to_string(),
+            args_json: stable_stringify(&mask_tool_args_for_ledger(tool_name, args)),
             result_json: result.to_string(),
             status: status.to_string(),
             duration_ms,
@@ -786,8 +812,8 @@ mod tests {
     use super::*;
     use crate::db::open_database;
     use crate::error::CoreError;
-    use crate::llm::metrics::init_with;
     use crate::llm::caller::build_chat_completion_request;
+    use crate::llm::metrics::init_with;
     use crate::llm::types::ChatRole;
     use serde_json::json;
 
@@ -1543,7 +1569,9 @@ mod tests {
         let db = open_database(dir.path().join("t.db")).unwrap();
         let guard = DbToolReplayGuard::new(db);
         let calls = Arc::new(AtomicUsize::new(0));
-        let executor = CountingExecutor { calls: calls.clone() };
+        let executor = CountingExecutor {
+            calls: calls.clone(),
+        };
         let args = CallLlmArgs {
             system_prompt: "你是助手".into(),
             message: "发条消息".into(),
@@ -1551,16 +1579,18 @@ mod tests {
             round_request_id_seed: Some("fault_inject_turn".into()),
             ..Default::default()
         };
-        let script = || vec![
-            StreamOnceResult {
-                tool_calls: vec![tool("send_message", r#"{"to":"u","text":"hi"}"#)],
-                ..Default::default()
-            },
-            StreamOnceResult {
-                content: "已发送".into(),
-                ..Default::default()
-            },
-        ];
+        let script = || {
+            vec![
+                StreamOnceResult {
+                    tool_calls: vec![tool("send_message", r#"{"to":"u","text":"hi"}"#)],
+                    ..Default::default()
+                },
+                StreamOnceResult {
+                    content: "已发送".into(),
+                    ..Default::default()
+                },
+            ]
+        };
 
         // 第 1 次调用：工具真实执行一次，结果同步落账；随后模拟响应在传输中丢失
         // （上层拿不到结果，以同一逻辑请求重试）。
@@ -1596,7 +1626,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "重试不得重复执行副作用工具");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "重试不得重复执行副作用工具"
+        );
         assert_eq!(
             r1.tool_result.as_ref().unwrap().result,
             r2.tool_result.as_ref().unwrap().result,
@@ -1647,7 +1681,9 @@ mod tests {
         flusher.flush_now().await;
         let df: String = db
             .conn()
-            .query_row("SELECT delegated_from FROM llm_tool_calls", [], |r| r.get(0))
+            .query_row("SELECT delegated_from FROM llm_tool_calls", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(df, "collaborator_alpha", "台账必须携带委托来源");
     }

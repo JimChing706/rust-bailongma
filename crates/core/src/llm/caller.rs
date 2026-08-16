@@ -248,15 +248,20 @@ pub async fn stream_once(
 
     // ── M1 埋点：请求开始（request_id 重试共享；t0 用于 TTFT/duration）──
     let started_at = std::time::Instant::now();
-    let request_id =
-        ctx.request_id.clone().unwrap_or_else(super::metrics::new_request_id);
+    let request_id = ctx
+        .request_id
+        .clone()
+        .unwrap_or_else(super::metrics::new_request_id);
     let mut first_chunk_ms: Option<i64> = None;
     if let Some(m) = &ctx.metrics {
         m.record(super::metrics::MetricEvent::CallStarted {
             request_id: request_id.clone(),
             provider: cfg.provider.clone(),
             model: cfg.model.clone(),
-            started_at: chrono::Local::now().to_rfc3339(),
+            // M12（审计修复）：started_at 用 UTC——llm_metrics_daily.day 取 started_at 前 10 位，
+            // 周报/预算窗口用 SQLite date('now')（UTC）；此前本地日 vs UTC 日在 +08:00 时窗口
+            // 边界漂移约 8 小时。统一 UTC 后二者同口径。
+            started_at: chrono::Utc::now().to_rfc3339(),
             stage: ctx.stage.clone(),
         });
     }
@@ -280,7 +285,16 @@ pub async fn stream_once(
     {
         Err(_) => {
             // 建连超时（无响应头，空闲看门狗）
-            record_failure(ctx, &request_id, &started_at, "connect", "timeout", None, false, true);
+            record_failure(
+                ctx,
+                &request_id,
+                &started_at,
+                "connect",
+                "timeout",
+                None,
+                false,
+                true,
+            );
             return Err(CoreError::LlmStream {
                 message: format!(
                     "connect timeout after {}s (no response headers, idle watchdog)",
@@ -291,7 +305,16 @@ pub async fn stream_once(
         }
         Ok(Err(e)) => {
             // 网络层错误（DNS / TCP 拒绝等，可重试）
-            record_failure(ctx, &request_id, &started_at, "connect", "network", None, false, true);
+            record_failure(
+                ctx,
+                &request_id,
+                &started_at,
+                "connect",
+                "network",
+                None,
+                false,
+                true,
+            );
             return Err(CoreError::Llm(format!("连接 {cfg} 失败: {e}")));
         }
         Ok(Ok(resp)) => resp,
@@ -305,7 +328,16 @@ pub async fn stream_once(
             format!("HTTP {status}: {}", truncate(&body, 300))
         };
         let retryable = (500..600).contains(&status) || status == 408;
-        record_failure(ctx, &request_id, &started_at, "http", "http", Some(status), false, retryable);
+        record_failure(
+            ctx,
+            &request_id,
+            &started_at,
+            "http",
+            "http",
+            Some(status),
+            false,
+            retryable,
+        );
         return Err(CoreError::LlmHttp { status, message });
     }
 
@@ -407,7 +439,16 @@ pub async fn stream_once(
         // 对齐 Node llm.js:300-303
         end_text_stream(&mut text_stream_started, ctx);
         let had = has_content(&result, &tool_calls_map);
-        record_failure(ctx, &request_id, &started_at, "stream", "idle_timeout", None, had, !had);
+        record_failure(
+            ctx,
+            &request_id,
+            &started_at,
+            "stream",
+            "idle_timeout",
+            None,
+            had,
+            !had,
+        );
         return Err(CoreError::LlmStream {
             message: format!("stream idle timeout after {}s", idle_timeout.as_secs()),
             had_content: had,
@@ -427,7 +468,16 @@ pub async fn stream_once(
             ) {
                 end_text_stream(&mut text_stream_started, ctx);
                 let had = has_content(&result, &tool_calls_map);
-                record_failure(ctx, &request_id, &started_at, "parse", "protocol", None, had, !had);
+                record_failure(
+                    ctx,
+                    &request_id,
+                    &started_at,
+                    "parse",
+                    "protocol",
+                    None,
+                    had,
+                    !had,
+                );
                 return Err(e);
             }
             // ── M1 埋点：首个内容 chunk（is_none() 守卫保证只记一次）──
@@ -470,7 +520,7 @@ fn finish_result(
     request_id: &str,
 ) -> Result<StreamOnceResult> {
     let _ = first_chunk_ms; // M1 预留：TTFT 已随事件上报；此处保留参数供终态核对
-    // BTreeMap 按 index 升序迭代，保证工具调用顺序与流中一致
+                            // BTreeMap 按 index 升序迭代，保证工具调用顺序与流中一致
     result.tool_calls = tool_calls_map.into_values().collect();
     // 纯文本流（无工具调用、无 </think> 切换）走到 [DONE]/EOF 时补发 End
     end_text_stream(text_stream_started, ctx);
@@ -777,7 +827,11 @@ mod tests {
             api_key: "k".into(),
             base_url: "http://x".into(),
         };
-        assert_eq!(no_fast.route_model("tick"), "deepseek-v4-pro", "无 fast_model 时回退主模型");
+        assert_eq!(
+            no_fast.route_model("tick"),
+            "deepseek-v4-pro",
+            "无 fast_model 时回退主模型"
+        );
     }
 
     #[test]
@@ -948,8 +1002,16 @@ mod tests {
     #[test]
     fn idempotency_key_is_stable_across_retries() {
         let k1 = idempotency_key("req_abc123");
-        assert_eq!(k1, idempotency_key("req_abc123"), "同一逻辑请求幂等键必须稳定");
-        assert_ne!(k1, idempotency_key("req_abc124"), "不同逻辑请求幂等键必须不同");
+        assert_eq!(
+            k1,
+            idempotency_key("req_abc123"),
+            "同一逻辑请求幂等键必须稳定"
+        );
+        assert_ne!(
+            k1,
+            idempotency_key("req_abc124"),
+            "不同逻辑请求幂等键必须不同"
+        );
         assert!(
             reqwest::header::HeaderValue::from_str(&k1).is_ok(),
             "幂等键必须可作为 HTTP header 值"

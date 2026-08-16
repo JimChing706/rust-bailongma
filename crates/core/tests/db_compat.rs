@@ -177,7 +177,11 @@ fn real_db_copy_opens_without_data_loss() {
 
     // 7. FTS5 trigram 在历史数据上真实可搜（库内有可见记忆时才断言）
     let vis_mems: i64 = conn
-        .query_row("SELECT COUNT(*) FROM memories WHERE visibility = 1", [], |r| r.get(0))
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE visibility = 1",
+            [],
+            |r| r.get(0),
+        )
         .unwrap();
     if vis_mems > 0 {
         let hit: i64 = conn

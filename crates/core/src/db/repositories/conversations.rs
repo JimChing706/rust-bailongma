@@ -475,14 +475,9 @@ mod tests {
         )
         .unwrap();
 
-        let found = find_unanswered_delivered_outbound(
-            &db,
-            "ID:000001",
-            "你好",
-            "wechat",
-            "wx:abc",
-        )
-        .unwrap();
+        let found =
+            find_unanswered_delivered_outbound(&db, "ID:000001", "你好", "wechat", "wx:abc")
+                .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().content, "你好");
     }

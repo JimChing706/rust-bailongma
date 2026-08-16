@@ -24,6 +24,7 @@ use super::events::{iso_now, EventBus};
 use super::security::RateLimiter;
 use crate::db::repositories::{brain_ui_events, llm_metrics};
 use crate::db::Db;
+use crate::intervention::InterventionGate;
 use crate::scene::SceneStore;
 
 // ─────────────────────────────────────────────────────────────
@@ -197,6 +198,8 @@ pub struct ApiState {
     /// Scene 场景状态机（Agent 驱动 UI 真相源，WS /scene 与工具层共享）
     pub scene: SceneStore,
     pub guard: Guard,
+    /// M25（审计修复）：人工介入硬通道（默认禁用；app 层注入真实门）
+    pub intervention: Arc<InterventionGate>,
     deduper: Arc<Mutex<Deduper>>,
 }
 
@@ -235,12 +238,18 @@ impl ApiState {
             status,
             scene: SceneStore::new(),
             guard: Guard::default(),
+            intervention: Arc::new(InterventionGate::new(false)),
             deduper: Arc::new(Mutex::new(Deduper::new())),
         }
     }
 
     pub fn with_guard(mut self, guard: Guard) -> Self {
         self.guard = guard;
+        self
+    }
+
+    pub fn with_intervention(mut self, gate: Arc<InterventionGate>) -> Self {
+        self.intervention = gate;
         self
     }
 
@@ -273,9 +282,7 @@ pub struct TraceQuery {
 }
 
 /// GET /trace —— 工具调用轨迹查询（Phase 2 可观测性）。
-pub async fn get_trace(
-    Query(q): Query<TraceQuery>,
-) -> (StatusCode, Json<Value>) {
+pub async fn get_trace(Query(q): Query<TraceQuery>) -> (StatusCode, Json<Value>) {
     let limit = q.limit.unwrap_or(50).min(500);
     let tool = q.tool.unwrap_or_default();
     let traces = crate::trace::global().recent(limit, &tool);
@@ -321,6 +328,54 @@ pub async fn post_approval(
         }
         Err(e) => (
             StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// M25（审计修复）：介入通道请求体。
+#[derive(Debug, Deserialize)]
+pub struct InterventionBody {
+    #[serde(default)]
+    pub notice: String,
+}
+
+/// POST /intervention/pause —— 人工硬停：工具循环在下一检查点停止派发工具。
+pub async fn post_intervention_pause(
+    State(state): State<ApiState>,
+    Json(body): Json<InterventionBody>,
+) -> (StatusCode, Json<Value>) {
+    match state.intervention.request_pause(body.notice) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "ok": true, "paused": true })),
+        ),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+    }
+}
+
+/// POST /intervention/resume —— 解除暂停，继续执行。
+pub async fn post_intervention_resume(State(state): State<ApiState>) -> (StatusCode, Json<Value>) {
+    state.intervention.resume();
+    (StatusCode::OK, Json(json!({ "ok": true, "resumed": true })))
+}
+
+/// POST /intervention/rescue —— 救援回滚：解除暂停并登记一次 rescue。
+pub async fn post_intervention_rescue(State(state): State<ApiState>) -> (StatusCode, Json<Value>) {
+    match state.intervention.request_rescue() {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "rescued": true,
+                "rescue_count": state.intervention.rescue_count(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::CONFLICT,
             Json(json!({ "ok": false, "error": e.to_string() })),
         ),
     }
@@ -408,7 +463,11 @@ pub async fn post_message(
     }
 
     // 入队失败（无 conversation_id）则无可等消息，丢弃订阅
-    let wait_rx = if conversation_id.is_some() { wait_rx } else { None };
+    let wait_rx = if conversation_id.is_some() {
+        wait_rx
+    } else {
+        None
+    };
 
     // 广播 message_in（对齐 emitEvent）
     let attachments = meta.get("attachments").cloned().unwrap_or(Value::Null);
@@ -906,7 +965,9 @@ mod tests {
         assert_eq!(body["total_calls"], 0);
         let signals = body["signals"].as_array().unwrap();
         assert!(
-            signals.iter().any(|s| s.as_str().unwrap().contains("无 LLM 调用")),
+            signals
+                .iter()
+                .any(|s| s.as_str().unwrap().contains("无 LLM 调用")),
             "空窗口应提示无调用，实际: {signals:?}"
         );
         assert!(body["text"].as_str().unwrap().contains("LLM 周报"));
@@ -935,11 +996,7 @@ mod tests {
         )
         .unwrap();
 
-        let resp = get_metrics_weekly(
-            State(state),
-            Query(WeeklyQuery { days: Some(7) }),
-        )
-        .await;
+        let resp = get_metrics_weekly(State(state), Query(WeeklyQuery { days: Some(7) })).await;
         let (_, Json(body)) = resp;
         assert_eq!(body["total_calls"], 100);
         assert_eq!(body["error_count"], 5);

@@ -379,6 +379,38 @@ pub fn build_tool_fingerprint(name: &str, args: &Value) -> String {
     format!("{}:{}", name, stable_stringify(args))
 }
 
+/// 短哈希（SHA-256 前 12 位 hex），用于敏感值脱敏后保留可区分性。
+fn short_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    let hex: String = hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    hex.chars().take(12).collect()
+}
+
+/// M19（审计修复）：browser_act 的 fill/select 敏感表单值（value/values）落台账前脱敏——
+/// 这些参数可能含密码/令牌，明文持久化到 llm_tool_calls.args_json 属隐私泄露。
+/// 替换为 `[redacted:<hash>]`：不存明文，但不同值 hash 不同，防重放键仍可区分不同输入。
+pub fn mask_tool_args_for_ledger(name: &str, args: &Value) -> Value {
+    if name != "browser_act" {
+        return args.clone();
+    }
+    let mut masked = args.clone();
+    if let Some(obj) = masked.as_object_mut() {
+        for key in ["value", "values"] {
+            if let Some(v) = obj.get(key) {
+                let s = serde_json::to_string(v).unwrap_or_default();
+                obj.insert(key.to_string(), Value::String(format!("[redacted:{}]", short_hash(&s))));
+            }
+        }
+    }
+    masked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,5 +526,24 @@ mod tests {
             build_tool_fingerprint("web_search", &args2),
             build_tool_fingerprint("web_search", &args3)
         );
+    }
+
+    #[test]
+    fn mask_tool_args_for_ledger_redacts_browser_act_values() {
+        // M19（审计修复）：browser_act 的 value/values 脱敏为 [redacted:<hash>]，
+        // 明文不入台账；不同值 hash 不同（防重放键仍可区分不同输入）。
+        let args = serde_json::json!({ "action": "fill", "selector": "#pwd", "value": "hunter2" });
+        let masked = mask_tool_args_for_ledger("browser_act", &args);
+        let v = masked["value"].as_str().unwrap();
+        assert!(!v.contains("hunter2"), "不得含明文: {v}");
+        assert!(v.starts_with("[redacted:"), "应为脱敏占位: {v}");
+
+        let args2 = serde_json::json!({ "action": "fill", "selector": "#pwd", "value": "hunter3" });
+        let masked2 = mask_tool_args_for_ledger("browser_act", &args2);
+        assert_ne!(masked["value"], masked2["value"], "不同值应不同指纹");
+
+        // 非 browser_act 不脱敏
+        let other = serde_json::json!({ "to": "u" });
+        assert_eq!(mask_tool_args_for_ledger("send_message", &other), other);
     }
 }

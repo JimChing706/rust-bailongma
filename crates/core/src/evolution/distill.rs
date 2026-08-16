@@ -82,7 +82,16 @@ pub fn rule_intent(content: &str) -> IntentLabel {
         }
     }
     // 规划类
-    for kw in ["计划", "规划", "下一步", "路线图", "里程碑", "方案", "roadmap", "milestone"] {
+    for kw in [
+        "计划",
+        "规划",
+        "下一步",
+        "路线图",
+        "里程碑",
+        "方案",
+        "roadmap",
+        "milestone",
+    ] {
         if c.contains(kw) {
             return IntentLabel::Plan;
         }
@@ -91,15 +100,26 @@ pub fn rule_intent(content: &str) -> IntentLabel {
     if c.ends_with('?') || c.ends_with('？') {
         return IntentLabel::Query;
     }
-    for w in ["什么", "怎么", "为什么", "如何", "哪个", "多少", "是不是", "能否", "吗", "呢"] {
+    for w in [
+        "什么",
+        "怎么",
+        "为什么",
+        "如何",
+        "哪个",
+        "多少",
+        "是不是",
+        "能否",
+        "吗",
+        "呢",
+    ] {
         if c.contains(w) {
             return IntentLabel::Query;
         }
     }
     // 命令类：祈使开头
     for kw in [
-        "跑", "执行", "做", "打开", "继续", "停止", "删除", "更新", "推送", "提交", "查",
-        "写", "建", "改", "修", "看", "run", "exec", "open", "stop",
+        "跑", "执行", "做", "打开", "继续", "停止", "删除", "更新", "推送", "提交", "查", "写",
+        "建", "改", "修", "看", "run", "exec", "open", "stop",
     ] {
         if c.starts_with(kw) || c.starts_with(&format!("{kw} ")) {
             return IntentLabel::Command;
@@ -110,13 +130,13 @@ pub fn rule_intent(content: &str) -> IntentLabel {
 
 /// 敏感形态正则（保守集：只含可确定判定的模式，宁缺毋滥）。
 const SENSITIVE_PATTERNS: &[&str] = &[
-    r"sk-[A-Za-z0-9]{16,}",                    // OpenAI 风格密钥
-    r"AKIA[0-9A-Z]{16}",                       // AWS access key
-    r"gh[pousr]_[A-Za-z0-9]{20,}",             // GitHub token
-    r"-----BEGIN [A-Z ]*-----",                // PEM 私钥
+    r"sk-[A-Za-z0-9]{16,}",        // OpenAI 风格密钥
+    r"AKIA[0-9A-Z]{16}",           // AWS access key
+    r"gh[pousr]_[A-Za-z0-9]{20,}", // GitHub token
+    r"-----BEGIN [A-Z ]*-----",    // PEM 私钥
     r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", // JWT
-    r"1[3-9]\d{9}",                            // 大陆手机号
-    r"\d{17}[\dXx]",                           // 18 位身份证
+    r"1[3-9]\d{9}",                // 大陆手机号
+    r"\d{17}[\dXx]",               // 18 位身份证
 ];
 
 fn sensitive_regexes() -> &'static Vec<Regex> {
@@ -139,7 +159,11 @@ pub fn detect_sensitive(content: &str) -> bool {
 /// - 过滤：内容 trim 后长度 < `min_len` 的丢弃；
 /// - 嵌入判定：非敏感 且 字符数 ∈ [20, 2000]；
 /// - 只读不改写（标注写回由 `write_labels_back` 显式调用）。
-pub fn distill_from_conversations(db: &Db, limit: usize, min_len: usize) -> Result<Vec<DistillEntry>> {
+pub fn distill_from_conversations(
+    db: &Db,
+    limit: usize,
+    min_len: usize,
+) -> Result<Vec<DistillEntry>> {
     let conn = db.conn();
     let mut stmt = conn.prepare(
         "SELECT id, role, content, COALESCE(label, '') FROM conversations ORDER BY id DESC LIMIT ?1",
@@ -213,10 +237,11 @@ mod tests {
     use super::*;
     use crate::db::repositories::conversations::insert;
 
-fn test_db() -> Db {
+    fn test_db() -> Db {
         static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("blm_distill_test_{}_{}", std::process::id(), n));
+        let dir =
+            std::env::temp_dir().join(format!("blm_distill_test_{}_{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         Db::open(dir.join("test.db")).unwrap()
     }
@@ -248,7 +273,9 @@ fn test_db() -> Db {
     fn sensitive_detection_ground_truth() {
         assert!(detect_sensitive("key is sk-abc1234567890abcdefghijklmnop"));
         assert!(detect_sensitive("AKIAIOSFODNN7EXAMPLE 是我的密钥"));
-        assert!(detect_sensitive("token: ghp_abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(detect_sensitive(
+            "token: ghp_abcdefghijklmnopqrstuvwxyz123456"
+        ));
         assert!(detect_sensitive("-----BEGIN RSA PRIVATE KEY-----"));
         assert!(detect_sensitive("JWT: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"));
         assert!(detect_sensitive("电话 13812345678 联系"));
@@ -259,10 +286,22 @@ fn test_db() -> Db {
     #[test]
     fn distill_filters_and_labels() {
         let db = test_db();
-        insert(&db, "user", "ID:000001", "跑一下测试").unwrap();                       // command, 短(4字) → min_len=3 通过
-        insert(&db, "user", "ID:000001", "今天天气怎么样？明天会下雨吗，我需要带伞吗？").unwrap(); // query (>20 字符)
-        insert(&db, "user", "ID:000001", "密钥是 sk-abcdefghijklmnopqrstuvwx1234567890").unwrap(); // sensitive
-        insert(&db, "assistant", "jarvis", "hi").unwrap();                             // 太短 → 过滤
+        insert(&db, "user", "ID:000001", "跑一下测试").unwrap(); // command, 短(4字) → min_len=3 通过
+        insert(
+            &db,
+            "user",
+            "ID:000001",
+            "今天天气怎么样？明天会下雨吗，我需要带伞吗？",
+        )
+        .unwrap(); // query (>20 字符)
+        insert(
+            &db,
+            "user",
+            "ID:000001",
+            "密钥是 sk-abcdefghijklmnopqrstuvwx1234567890",
+        )
+        .unwrap(); // sensitive
+        insert(&db, "assistant", "jarvis", "hi").unwrap(); // 太短 → 过滤
 
         let entries = distill_from_conversations(&db, 100, 3).unwrap();
         let by_id: std::collections::HashMap<i64, &DistillEntry> =
@@ -274,7 +313,10 @@ fn test_db() -> Db {
             assert_eq!(e.source, DISTILL_SOURCE_RULE_V1);
         }
         // 按内容找
-        let cmd = by_id.values().find(|e| e.content.contains("跑一下")).unwrap();
+        let cmd = by_id
+            .values()
+            .find(|e| e.content.contains("跑一下"))
+            .unwrap();
         assert_eq!(cmd.intent, "command");
         assert!(!cmd.sensitive);
         let q = by_id.values().find(|e| e.content.contains("天气")).unwrap();
@@ -290,8 +332,8 @@ fn test_db() -> Db {
         let db = test_db();
         insert(&db, "user", "ID:000001", "明天记得提醒我买咖啡").unwrap();
         let entries = distill_from_conversations(&db, 10, 2).unwrap();
-        let path = std::env::temp_dir()
-            .join(format!("blm_distill_out_{}.jsonl", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("blm_distill_out_{}.jsonl", std::process::id()));
         let n = export_jsonl(&entries, &path).unwrap();
         assert_eq!(n, entries.len());
         let text = std::fs::read_to_string(&path).unwrap();
@@ -324,11 +366,15 @@ fn test_db() -> Db {
         assert_eq!(written, 1);
         let l1: String = db
             .conn()
-            .query_row("SELECT label FROM conversations WHERE id=?1", [id1], |r| r.get(0))
+            .query_row("SELECT label FROM conversations WHERE id=?1", [id1], |r| {
+                r.get(0)
+            })
             .unwrap();
         let l2: String = db
             .conn()
-            .query_row("SELECT label FROM conversations WHERE id=?1", [id2], |r| r.get(0))
+            .query_row("SELECT label FROM conversations WHERE id=?1", [id2], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(l1, "intent:reminder|src:manual");
         assert!(l2.starts_with("intent:command|"));

@@ -342,6 +342,13 @@ mod tests {
         open_database(path).unwrap()
     }
 
+    /// 相对当前时间的 UTC ISO 时间戳（now − n 天，毫秒精度）。
+    /// `load_thread_state` 有 7 天读窗口，硬编码日期会在时钟跨过边界后 flaky。
+    fn iso_days_ago(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
     fn patch(id: &str, topic: &[&str]) -> ThreadPatch {
         ThreadPatch {
             id: id.into(),
@@ -351,8 +358,8 @@ mod tests {
             summary: String::new(),
             conclusions: Vec::new(),
             status: "open".into(),
-            created_at: "2026-08-01T00:00:00.000Z".into(),
-            last_event_at: "2026-08-08T00:00:00.000Z".into(),
+            created_at: iso_days_ago(2),
+            last_event_at: iso_days_ago(1),
             last_event_tick: 1,
             hit_count: 1,
             last_summary_at: String::new(),
@@ -472,7 +479,7 @@ mod tests {
         let db = test_db();
         let mut t2 = patch("th_b", &["乙"]);
         // th_b 超过 7 天窗口 → load 时会被过滤（对齐 Node 版读时选择）
-        t2.last_event_at = "2026-07-01T00:00:00.000Z".into();
+        t2.last_event_at = iso_days_ago(8);
         save_thread_state(&db, &[patch("th_a", &["甲"]), t2], &[], None, None).unwrap();
         save_thread_state(
             &db,

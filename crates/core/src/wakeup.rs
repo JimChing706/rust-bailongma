@@ -54,9 +54,15 @@ pub fn coalesce(reminders: &[ReminderRow]) -> CoalescedWakeup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GateDecision {
     /// 放行：本周已耗唤醒 tokens + 剩余额度
-    Allow { used_tokens: i64, remaining_tokens: i64 },
+    Allow {
+        used_tokens: i64,
+        remaining_tokens: i64,
+    },
     /// 拦截：本周唤醒 tokens 已超预算
-    Blocked { used_tokens: i64, budget_tokens: i64 },
+    Blocked {
+        used_tokens: i64,
+        budget_tokens: i64,
+    },
 }
 
 /// 周窗口预算闸门：消费 M4 唤醒成本账本（stage='wakeup' 周窗口聚合）。
@@ -161,7 +167,13 @@ mod tests {
         let db = test_db();
         // 8 个触发器同时到期
         let ids: Vec<i64> = (1..=8)
-            .map(|i| insert_reminder(&db, &format!("2026-08-10T0{i}:00:00+08:00"), &format!("任务{i}")))
+            .map(|i| {
+                insert_reminder(
+                    &db,
+                    &format!("2026-08-10T0{i}:00:00+08:00"),
+                    &format!("任务{i}"),
+                )
+            })
             .collect();
 
         let wake = coalesced_wakeup(&db, "2026-08-10T08:00:00+08:00", 7, 100_000)
@@ -171,7 +183,11 @@ mod tests {
         // 关键断言：8 个触发器 → 1 条合并消息（1 次 LLM 调用）
         assert_eq!(wake.trigger_count, 8);
         assert_eq!(wake.reminder_ids.len(), 8);
-        assert_eq!(wake.merged_message.lines().count(), 9, "1 行标题 + 8 行明细");
+        assert_eq!(
+            wake.merged_message.lines().count(),
+            9,
+            "1 行标题 + 8 行明细"
+        );
         assert!(wake.merged_message.contains("8 条到期提醒"));
         assert!(wake.merged_message.contains("任务1"));
         assert!(wake.merged_message.contains("任务8"));
@@ -266,7 +282,9 @@ mod tests {
         // 提醒保持 pending，未被消费
         let conn = db.conn();
         let status: String = conn
-            .query_row("SELECT status FROM reminders WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT status FROM reminders WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(status, "pending");
     }
@@ -287,7 +305,9 @@ mod tests {
         let id = insert_reminder(&db, "2026-08-10T08:00:00+08:00", "到期提醒");
         let now = "2026-08-10T08:30:00+08:00";
 
-        let w = due_wakeup(&db, now, 7, 100_000).unwrap().expect("有到期提醒");
+        let w = due_wakeup(&db, now, 7, 100_000)
+            .unwrap()
+            .expect("有到期提醒");
         assert_eq!(w.trigger_count, 1);
         assert_eq!(w.reminder_ids, vec![id]);
 
@@ -297,7 +317,10 @@ mod tests {
 
         // 交付成功后再消费 → 不再返回
         mark_fired(&db, &w.reminder_ids, now).unwrap();
-        assert!(due_wakeup(&db, now, 7, 100_000).unwrap().is_none(), "消费后不再唤醒");
+        assert!(
+            due_wakeup(&db, now, 7, 100_000).unwrap().is_none(),
+            "消费后不再唤醒"
+        );
     }
 
     #[test]
@@ -312,7 +335,9 @@ mod tests {
 
         let conn = db.conn();
         let status: String = conn
-            .query_row("SELECT status FROM reminders WHERE id = ?1", [id], |r| r.get(0))
+            .query_row("SELECT status FROM reminders WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(status, "pending");
     }
