@@ -71,7 +71,7 @@ fn row_to_focus_frame(row: &rusqlite::Row<'_>) -> rusqlite::Result<FocusFrame> {
     })
 }
 
-/// 解析毫秒时间戳：兼容 ISO-8601（带时区）与 SQLite `datetime('now')` 格式（无时区、按 UTC）。
+/// 解析毫秒时间戳：兼容 ISO-8601（带时区）与历史 space-naive 格式（`YYYY-MM-DD HH:MM:SS`，无时区、按 UTC）。
 fn parse_iso_ms(ts: &str) -> Option<u128> {
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
         return Some(dt.timestamp_millis() as u128);
@@ -110,13 +110,13 @@ pub fn save_thread_state(
                 INSERT INTO threads
                   (id, topic, signature, label, summary, conclusions, status,
                    created_at, last_event_at, last_event_tick, hit_count, last_summary_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
                 ON CONFLICT(id) DO UPDATE SET
                   topic = excluded.topic, signature = excluded.signature, label = excluded.label,
                   summary = excluded.summary, conclusions = excluded.conclusions, status = excluded.status,
                   last_event_at = excluded.last_event_at, last_event_tick = excluded.last_event_tick,
                   hit_count = excluded.hit_count, last_summary_at = excluded.last_summary_at,
-                  updated_at = datetime('now')
+                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
                 "#,
             )?;
             for t in threads {
@@ -160,7 +160,7 @@ pub fn save_thread_state(
         )?;
         if let Some(ids) = merged_away_ids {
             let mut close = tx.prepare(
-                "UPDATE threads SET status = 'merged', updated_at = datetime('now') WHERE id = ?1",
+                "UPDATE threads SET status = 'merged', updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
             )?;
             for id in ids {
                 close.execute(params![id])?;
@@ -170,7 +170,7 @@ pub fn save_thread_state(
     })
 }
 
-/// 内存线索 → 写库入参（updated_at 由 SQLite `datetime('now')` 生成，丢弃内存值）。
+/// 内存线索 → 写库入参（updated_at 由 SQLite 生成 UTC-Z 毫秒，丢弃内存值）。
 impl From<&Thread> for ThreadPatch {
     fn from(t: &Thread) -> Self {
         ThreadPatch {
@@ -277,8 +277,8 @@ pub fn save_focus_stack(db: &Db, frames: &[FocusFrame]) -> Result<()> {
         let mut insert = tx.prepare(
             r#"
             INSERT INTO focus_stack
-              (depth, topic, started_at, started_at_tick, last_seen_tick, hit_count, conclusions)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+              (depth, topic, started_at, started_at_tick, last_seen_tick, hit_count, conclusions, updated_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             "#,
         )?;
         for (i, f) in frames.iter().enumerate() {

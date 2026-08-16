@@ -17,8 +17,9 @@ pub fn insert_conversation(db: &Db, msg: &NewConversation) -> Result<i64> {
         r#"
         INSERT INTO conversations
           (role, from_id, to_id, content, timestamp, channel,
-           external_party_id, focus_topic, open_question, thread_id, delivery_status)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+           external_party_id, focus_topic, open_question, thread_id, delivery_status, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         "#,
         rusqlite::params![
             msg.role,

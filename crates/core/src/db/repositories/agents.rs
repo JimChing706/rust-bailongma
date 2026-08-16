@@ -44,7 +44,7 @@ pub fn get_agent_by_id(db: &Db, id: &str) -> Result<Option<KnownAgent>> {
 }
 
 /// 批量 upsert 一批 Agent 探测结果（对齐 `saveAgents`：INSERT ... ON CONFLICT(id) UPDATE，
-/// 全部字段以新值为准，`updated_at` 由 SQLite 取 `datetime('now')`）。
+/// 全部字段以新值为准，`updated_at` 由 SQLite 取 UTC-Z 毫秒）。
 pub fn upsert_agents(db: &Db, agents: &[NewKnownAgent]) -> Result<()> {
     let conn = db.conn();
     let mut stmt = conn.prepare(
@@ -52,7 +52,7 @@ pub fn upsert_agents(db: &Db, agents: &[NewKnownAgent]) -> Result<()> {
         INSERT INTO known_agents
           (id, name, description, available, version, invoke_type, invoke_cmd,
            invoke_args, notes, docs_url, docs_search_query, detected_at, updated_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         ON CONFLICT(id) DO UPDATE SET
           name              = excluded.name,
           description       = excluded.description,
@@ -65,7 +65,7 @@ pub fn upsert_agents(db: &Db, agents: &[NewKnownAgent]) -> Result<()> {
           docs_url          = excluded.docs_url,
           docs_search_query = excluded.docs_search_query,
           detected_at       = excluded.detected_at,
-          updated_at        = datetime('now')
+          updated_at        = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         "#,
     )?;
     for a in agents {
@@ -99,7 +99,7 @@ fn get_config(db: &Db, key: &str) -> Result<Option<String>> {
 fn set_config(db: &Db, key: &str, value: &str) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, datetime('now'))",
+        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![key, value],
     )?;
     Ok(())

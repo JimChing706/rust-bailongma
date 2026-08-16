@@ -141,8 +141,9 @@ pub fn upsert_calls_batch(db: &Db, rows: &[LlmCallAgg]) -> Result<()> {
                (request_id, provider, model, started_at, ttft_ms, duration_ms, total_tokens,
                 cached_tokens, usage_raw, finish_reason, error_stage, error_class, http_status,
                 had_content, retryable, attempt, last_error, fallback_used, context_bytes,
-                stage)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
+                stage, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              ON CONFLICT(request_id) DO UPDATE SET
                ttft_ms       = COALESCE(excluded.ttft_ms, llm_calls.ttft_ms),
                duration_ms   = CASE WHEN excluded.finish_reason = 'done' OR llm_calls.finish_reason != 'done'
@@ -216,8 +217,9 @@ pub fn upsert_tool_calls_batch(db: &Db, rows: &[LlmToolCallRow]) -> Result<()> {
         let mut stmt = tx.prepare(
             "INSERT INTO llm_tool_calls
                (request_id, round, attempt, tool_name, args_json, result_json, status,
-                duration_ms, delegated_from)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                duration_ms, delegated_from, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+                     strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              ON CONFLICT(request_id, round, attempt, tool_name, args_json) DO UPDATE SET
                args_json       = excluded.args_json,
                result_json     = excluded.result_json,
@@ -276,8 +278,8 @@ pub fn upsert_context_sections_batch(db: &Db, rows: &[LlmContextSectionRow]) -> 
     db.transaction(|tx| {
         let mut stmt = tx.prepare(
             "INSERT OR IGNORE INTO llm_context_sections
-               (request_id, section, bytes)
-             VALUES (?1, ?2, ?3)",
+               (request_id, section, bytes, created_at)
+             VALUES (?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         )?;
         for r in rows {
             stmt.execute(params![r.request_id, r.section, r.bytes])?;
@@ -295,8 +297,8 @@ pub fn upsert_turns_batch(db: &Db, rows: &[LlmTurnRow]) -> Result<()> {
         let mut stmt = tx.prepare(
             "INSERT OR IGNORE INTO llm_turns
                (turn_id, started_at, duration_ms, attribution, is_tick, sections_hit,
-                context_bytes, calls)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                context_bytes, calls, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         )?;
         for r in rows {
             stmt.execute(params![
@@ -319,8 +321,8 @@ pub fn upsert_daily(db: &Db, day: &str, d: &DailyDelta) -> Result<()> {
     db.conn().execute(
         "INSERT INTO llm_metrics_daily
            (day, total_calls, error_count, retry_count, fallback_count, aborted_count,
-            total_tokens, cached_tokens, ttft_sum_ms, ttft_count, duration_sum_ms)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)
+            total_tokens, cached_tokens, ttft_sum_ms, ttft_count, duration_sum_ms, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          ON CONFLICT(day) DO UPDATE SET
            total_calls     = total_calls     + excluded.total_calls,
            error_count     = error_count     + excluded.error_count,
@@ -332,7 +334,7 @@ pub fn upsert_daily(db: &Db, day: &str, d: &DailyDelta) -> Result<()> {
            ttft_sum_ms     = ttft_sum_ms     + excluded.ttft_sum_ms,
            ttft_count      = ttft_count      + excluded.ttft_count,
            duration_sum_ms = duration_sum_ms + excluded.duration_sum_ms,
-           updated_at      = datetime('now')",
+           updated_at      = strftime('%Y-%m-%dT%H:%M:%fZ','now')",
         params![
             day,
             d.total_calls,

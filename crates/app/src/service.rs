@@ -514,7 +514,7 @@ impl AppRuntime {
                         tracing::warn!("[P1] turn_state set_error 失败: {e}");
                     }
                 }
-                if let Err(e) = turn_state::mark_finished(&self.db, id, state, &now_input_ts()) {
+                if let Err(e) = turn_state::mark_finished(&self.db, id, state, &now_utc_iso()) {
                     tracing::warn!("[P1] turn_state mark_finished({state}) 失败: {e}");
                 }
             }

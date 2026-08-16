@@ -79,8 +79,9 @@ pub fn create(
         "INSERT INTO matters
            (title, expectation, current_state, gap_desc, acceptance_criteria,
             status, creator_id, executor_id, verifier_id, parent_id,
-            intent_original, additivity_decl)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8, ?9, ?10, ?11)",
+            intent_original, additivity_decl, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'open', ?6, ?7, ?8, ?9, ?10, ?11,
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![
             title,
             expectation,
@@ -113,7 +114,7 @@ pub fn get(db: &Db, id: i64) -> Result<Option<MatterRow>> {
 pub fn set_status(db: &Db, id: i64, status: &str) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE matters SET status = ?2, updated_at = datetime('now') WHERE id = ?1",
+        "UPDATE matters SET status = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
         rusqlite::params![id, status],
     )?;
     Ok(())
@@ -123,8 +124,8 @@ pub fn set_status(db: &Db, id: i64, status: &str) -> Result<()> {
 pub fn mark_finished(db: &Db, id: i64, status: &str, death_reason: &str) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE matters SET status = ?2, death_reason = ?3, finished_at = datetime('now'),
-                updated_at = datetime('now')
+        "UPDATE matters SET status = ?2, death_reason = ?3, finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE id = ?1",
         rusqlite::params![id, status, death_reason],
     )?;
@@ -135,8 +136,8 @@ pub fn mark_finished(db: &Db, id: i64, status: &str, death_reason: &str) -> Resu
 pub fn mark_started(db: &Db, id: i64) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE matters SET status = 'in_progress', started_at = datetime('now'),
-                updated_at = datetime('now')
+        "UPDATE matters SET status = 'in_progress', started_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE id = ?1",
         rusqlite::params![id],
     )?;
@@ -148,7 +149,7 @@ pub fn set_evidence(db: &Db, id: i64, evidence: &str) -> Result<()> {
     let conn = db.conn();
     conn.execute(
         "UPDATE matters SET status = 'awaiting_verification', evidence = ?2,
-                updated_at = datetime('now')
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE id = ?1",
         rusqlite::params![id, evidence],
     )?;
@@ -171,7 +172,7 @@ pub fn set_delegation(db: &Db, id: i64, point: &str, allowed: bool) -> Result<()
         }
     };
     let sql =
-        format!("UPDATE matters SET {column} = ?2, updated_at = datetime('now') WHERE id = ?1");
+        format!("UPDATE matters SET {column} = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1");
     let conn = db.conn();
     conn.execute(&sql, rusqlite::params![id, allowed as i64])?;
     Ok(())
@@ -181,7 +182,7 @@ pub fn set_delegation(db: &Db, id: i64, point: &str, allowed: bool) -> Result<()
 pub fn set_signals(db: &Db, id: i64, signals: &str) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE matters SET signals = ?2, updated_at = datetime('now') WHERE id = ?1",
+        "UPDATE matters SET signals = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
         rusqlite::params![id, signals],
     )?;
     Ok(())
@@ -191,7 +192,7 @@ pub fn set_signals(db: &Db, id: i64, signals: &str) -> Result<()> {
 pub fn set_self_verified(db: &Db, id: i64, v: bool) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE matters SET self_verified = ?2, updated_at = datetime('now') WHERE id = ?1",
+        "UPDATE matters SET self_verified = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1",
         rusqlite::params![id, v as i64],
     )?;
     Ok(())
@@ -223,8 +224,8 @@ pub fn insert_event(
     let conn = db.conn();
     conn.execute(
         "INSERT INTO matter_events
-           (matter_id, event_type, from_status, to_status, reason, actor)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+           (matter_id, event_type, from_status, to_status, reason, actor, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![matter_id, event_type, from_status, to_status, reason, actor],
     )?;
     Ok(())
@@ -256,10 +257,10 @@ pub fn list_events(db: &Db, matter_id: i64) -> Result<Vec<MatterEvent>> {
     Ok(out)
 }
 
-/// SQLite 当前 UTC 时间（"YYYY-MM-DD HH:MM:SS"），供信号台账打时间戳。
+/// SQLite 当前 UTC 时间（UTC-Z 毫秒），供信号台账打时间戳。
 pub fn now_utc(db: &Db) -> Result<String> {
     let conn = db.conn();
-    let s: String = conn.query_row("SELECT datetime('now')", [], |r| r.get(0))?;
+    let s: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')", [], |r| r.get(0))?;
     Ok(s)
 }
 

@@ -168,7 +168,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           label       TEXT DEFAULT '',
           delivery_status TEXT NOT NULL DEFAULT '',
           timestamp   TEXT    NOT NULL,
-          created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+          created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS memories (
@@ -187,7 +187,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           timestamp   TEXT    NOT NULL,
           parent_id   INTEGER REFERENCES memories(id),
           embedding   BLOB,
-          created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+          created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           visibility  INTEGER NOT NULL DEFAULT 1,
           hidden_at   TEXT,
           merged_into TEXT,
@@ -198,14 +198,14 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS config (
           key         TEXT    PRIMARY KEY,
           value       TEXT    NOT NULL,
-          updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+          updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS entities (
           id          TEXT    PRIMARY KEY,
           label       TEXT,
           last_seen   TEXT    NOT NULL,
-          created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+          created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS user_profiles (
@@ -387,7 +387,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           task              TEXT    NOT NULL,
           system_message    TEXT    NOT NULL,
           status            TEXT    NOT NULL DEFAULT 'pending',
-          created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+          created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           fired_at          TEXT,
           cancelled_at      TEXT,
           source            TEXT    DEFAULT '',
@@ -403,8 +403,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           ttl_minutes INTEGER NOT NULL DEFAULT 60,
           tags        TEXT    DEFAULT '[]',
           enabled     INTEGER NOT NULL DEFAULT 1,
-          created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-          updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+          created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          updated_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS prefetch_cache (
@@ -414,7 +414,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           fetched_at TEXT    NOT NULL,
           expires_at TEXT    NOT NULL,
           tags       TEXT    DEFAULT '[]',
-          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+          created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS ui_signals (
@@ -424,7 +424,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           payload    TEXT    NOT NULL DEFAULT '{}',
           ts         INTEGER NOT NULL,
           consumed   INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+          created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS media_history (
@@ -434,8 +434,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           title      TEXT    NOT NULL DEFAULT '',
           video_id   TEXT,
           platform   TEXT,
-          played_at  TEXT    NOT NULL DEFAULT (datetime('now')),
-          created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+          played_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS music_library (
@@ -448,7 +448,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           lrc        TEXT    NOT NULL DEFAULT '',
           cover      TEXT    NOT NULL DEFAULT '',
           source_url TEXT    NOT NULL DEFAULT '',
-          added_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+          added_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS known_agents (
@@ -464,7 +464,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           docs_url          TEXT,
           docs_search_query TEXT,
           detected_at       TEXT NOT NULL,
-          updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
+          updated_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS user_identities (
@@ -472,7 +472,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           channel      TEXT NOT NULL,
           external_id  TEXT NOT NULL,
           alias        TEXT DEFAULT '',
-          bound_at     TEXT NOT NULL DEFAULT (datetime('now')),
+          bound_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           PRIMARY KEY (channel, external_id)
         );
 
@@ -484,7 +484,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           last_seen_tick INTEGER NOT NULL,
           hit_count     INTEGER NOT NULL DEFAULT 1,
           conclusions   TEXT    NOT NULL DEFAULT '[]',
-          updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+          updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS threads (
@@ -500,7 +500,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           last_event_tick INTEGER NOT NULL DEFAULT 0,
           hit_count       INTEGER NOT NULL DEFAULT 1,
           last_summary_at TEXT NOT NULL DEFAULT '',
-          updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+          updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS commitments (
@@ -521,12 +521,12 @@ pub fn initialize(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS wechat_clawbot_tokens (
           from_user_id  TEXT    PRIMARY KEY,
           context_token TEXT    NOT NULL,
-          updated_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+          updated_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS recall_audit (
           id              INTEGER PRIMARY KEY AUTOINCREMENT,
-          created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+          created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           turn_label      TEXT,
           from_id         TEXT,
           channel         TEXT,
@@ -541,7 +541,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
 
         CREATE TABLE IF NOT EXISTS extract_audit (
           id                INTEGER PRIMARY KEY AUTOINCREMENT,
-          created_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+          created_at        TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           turn_label        TEXT,
           from_id           TEXT,
           channel           TEXT,
@@ -669,7 +669,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           last_error     TEXT    NOT NULL DEFAULT '',
           fallback_used  INTEGER NOT NULL DEFAULT 0,
           context_bytes  INTEGER,
-          created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+          created_at     TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_llm_calls_request_id ON llm_calls(request_id);
 
@@ -684,7 +684,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           status        TEXT    NOT NULL DEFAULT 'ok',
           duration_ms   INTEGER NOT NULL DEFAULT 0,
           delegated_from TEXT   NOT NULL DEFAULT '',
-          created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+          created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           UNIQUE(request_id, round, attempt, tool_name, args_json)
         );
 
@@ -700,7 +700,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           ttft_sum_ms     INTEGER NOT NULL DEFAULT 0,
           ttft_count      INTEGER NOT NULL DEFAULT 0,
           duration_sum_ms INTEGER NOT NULL DEFAULT 0,
-          updated_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+          updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         CREATE TABLE IF NOT EXISTS llm_context_sections (
@@ -708,7 +708,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           request_id TEXT    NOT NULL,
           section    TEXT    NOT NULL,
           bytes      INTEGER NOT NULL DEFAULT 0,
-          created_at TEXT    NOT NULL DEFAULT (datetime('now')),
+          created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           UNIQUE(request_id, section)
         );
 
@@ -721,7 +721,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           sections_hit  INTEGER,
           context_bytes INTEGER,
           calls         INTEGER NOT NULL DEFAULT 0,
-          created_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+          created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
 
         -- Phase 1：显式 Turn 状态机（turn_state 表）。
@@ -741,7 +741,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           last_error      TEXT    NOT NULL DEFAULT '',
           recover_policy  TEXT    NOT NULL DEFAULT 'retry',
           started_at      TEXT    NOT NULL,
-          updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+          updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           finished_at     TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_turn_state_state ON turn_state(state);
@@ -782,8 +782,8 @@ pub fn initialize(conn: &Connection) -> Result<()> {
           death_reason TEXT    NOT NULL DEFAULT '',
           started_at   TEXT,
           finished_at  TEXT,
-          created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
-          updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+          created_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+          updated_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         );
         CREATE INDEX IF NOT EXISTS idx_matters_status ON matters(status);
         CREATE INDEX IF NOT EXISTS idx_matters_parent ON matters(parent_id);
@@ -859,7 +859,7 @@ pub fn initialize(conn: &Connection) -> Result<()> {
             to_status   TEXT    NOT NULL DEFAULT '',
             reason      TEXT    NOT NULL DEFAULT '',
             actor       TEXT    NOT NULL DEFAULT '',
-            created_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+            created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         )",
     )?;
     conn.execute_batch(
@@ -944,7 +944,7 @@ fn migrate_canonical_user(conn: &Connection) -> Result<()> {
     }
 
     conn.execute(
-        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, datetime('now'))",
+        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         (
             "migration_canonical_user_v1",
             chrono::Utc::now().to_rfc3339(),
@@ -997,7 +997,7 @@ fn migrate_llm_tool_calls_unique_args(conn: &Connection) -> Result<()> {
           status        TEXT    NOT NULL DEFAULT 'ok',
           duration_ms   INTEGER NOT NULL DEFAULT 0,
           delegated_from TEXT   NOT NULL DEFAULT '',
-          created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+          created_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
           UNIQUE(request_id, round, attempt, tool_name, args_json)
         );
         "#,
@@ -1059,7 +1059,7 @@ fn migrate_timestamps_v1(conn: &Connection) -> Result<()> {
         }
     }
     tx.execute(
-        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, datetime('now'))",
+        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         params!["migration_timestamps_v1", chrono::Utc::now().to_rfc3339()],
     )?;
     tx.commit()?;
@@ -1130,7 +1130,7 @@ fn migrate_created_at_v1(conn: &Connection) -> Result<()> {
         }
     }
     tx.execute(
-        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, datetime('now'))",
+        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         params!["migration_created_at_v1", chrono::Utc::now().to_rfc3339()],
     )?;
     tx.commit()?;
@@ -1400,7 +1400,7 @@ mod tests {
             "CREATE TABLE conversations (
                id INTEGER PRIMARY KEY AUTOINCREMENT,
                role TEXT NOT NULL, from_id TEXT NOT NULL, content TEXT NOT NULL,
-               timestamp TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now'))
+               timestamp TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              );",
         )
         .unwrap();
@@ -1473,7 +1473,7 @@ mod tests {
               timestamp TEXT NOT NULL,
               parent_id INTEGER,
               embedding BLOB,
-              created_at TEXT NOT NULL DEFAULT (datetime('now')),
+              created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
               visibility INTEGER NOT NULL DEFAULT 1,
               hidden_at TEXT,
               merged_into TEXT

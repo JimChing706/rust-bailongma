@@ -72,8 +72,9 @@ pub fn insert_memory(db: &Db, m: &NewMemory) -> Result<InsertMemoryOutcome> {
             INSERT INTO memories
               (event_type, content, detail, title, mem_id, entities, concepts, tags,
                links, salience, source_ref, timestamp, parent_id, embedding,
-               embedding_dim, embedding_model)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+               embedding_dim, embedding_model, created_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             "#,
             params![
                 m.event_type,

@@ -80,8 +80,8 @@ pub fn insert_reminder(
 ) -> Result<i64> {
     let conn = db.conn();
     conn.execute(
-        "INSERT INTO reminders (user_id, due_at, task, system_message, status, source)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+        "INSERT INTO reminders (user_id, due_at, task, system_message, status, source, created_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
         rusqlite::params![user_id, due_at, task, format!("sys:{task}"), source],
     )?;
     Ok(conn.last_insert_rowid())

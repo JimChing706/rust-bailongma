@@ -49,8 +49,9 @@ pub fn create_turn(
     let n = conn.execute(
         "INSERT INTO turn_state
            (state, round, attempt, idempotency_key, conversation_id, channel, from_id,
-            input_snapshot, recover_policy, started_at)
-         VALUES ('received', 0, 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            input_snapshot, recover_policy, started_at, updated_at)
+         VALUES ('received', 0, 1, ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+                 strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          ON CONFLICT(idempotency_key) WHERE idempotency_key != '' DO NOTHING",
         rusqlite::params![
             idempotency_key,
@@ -72,7 +73,7 @@ pub fn create_turn(
 pub fn set_state(db: &Db, turn_id: i64, state: &str) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE turn_state SET state = ?2, updated_at = datetime('now') WHERE turn_id = ?1",
+        "UPDATE turn_state SET state = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE turn_id = ?1",
         rusqlite::params![turn_id, state],
     )?;
     Ok(())
@@ -82,7 +83,7 @@ pub fn set_state(db: &Db, turn_id: i64, state: &str) -> Result<()> {
 pub fn set_round(db: &Db, turn_id: i64, round: i64) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE turn_state SET round = ?2, updated_at = datetime('now') WHERE turn_id = ?1",
+        "UPDATE turn_state SET round = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE turn_id = ?1",
         rusqlite::params![turn_id, round],
     )?;
     Ok(())
@@ -92,7 +93,7 @@ pub fn set_round(db: &Db, turn_id: i64, round: i64) -> Result<()> {
 pub fn set_error(db: &Db, turn_id: i64, error: &str) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE turn_state SET last_error = ?2, updated_at = datetime('now') WHERE turn_id = ?1",
+        "UPDATE turn_state SET last_error = ?2, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE turn_id = ?1",
         rusqlite::params![turn_id, error],
     )?;
     Ok(())
@@ -102,7 +103,7 @@ pub fn set_error(db: &Db, turn_id: i64, error: &str) -> Result<()> {
 pub fn bump_attempt(db: &Db, turn_id: i64) -> Result<i64> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE turn_state SET attempt = attempt + 1, updated_at = datetime('now') WHERE turn_id = ?1",
+        "UPDATE turn_state SET attempt = attempt + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE turn_id = ?1",
         rusqlite::params![turn_id],
     )?;
     let attempt: i64 = conn.query_row(
@@ -117,7 +118,7 @@ pub fn bump_attempt(db: &Db, turn_id: i64) -> Result<i64> {
 pub fn mark_finished(db: &Db, turn_id: i64, state: &str, finished_at: &str) -> Result<()> {
     let conn = db.conn();
     conn.execute(
-        "UPDATE turn_state SET state = ?2, finished_at = ?3, updated_at = datetime('now')
+        "UPDATE turn_state SET state = ?2, finished_at = ?3, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
          WHERE turn_id = ?1",
         rusqlite::params![turn_id, state, finished_at],
     )?;

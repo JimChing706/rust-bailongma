@@ -8,7 +8,7 @@ use crate::error::Result;
 
 const UPSERT_SQL: &str = r#"
 INSERT INTO config (key, value) VALUES (?1, ?2)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 "#;
 
 /// 读取单个配置项（不存在时返回 None）。

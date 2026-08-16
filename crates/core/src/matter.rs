@@ -408,14 +408,21 @@ pub fn shelve(db: &Db, id: i64, actor: &str) -> Result<()> {
     })
 }
 
-/// 幽灵检测：把「最后活动早于 stale_before（ISO 字符串比较）」的非终态事项标记为 expired。
+/// 归一任意时间戳（Z / +offset / space-naive）为 UTC Z 毫秒，供字符串比较（字典序=时序）。
+fn normalize_ts_for_compare(ts: &str) -> String {
+    crate::db::models::normalize_to_utc_z(ts)
+        .or_else(|| crate::db::models::normalize_space_naive_to_utc_z(ts))
+        .unwrap_or_else(|| ts.to_string())
+}
+
+/// 幽灵检测：把「最后活动早于 stale_before」的非终态事项标记为 expired。
 /// 返回本次被处死的事项 id 列表。
 pub fn expire_stale(db: &Db, stale_before: &str) -> Result<Vec<i64>> {
     let mut dead = Vec::new();
     for row in crate::db::repositories::matters::scan_active(db)? {
-        // updated_at 为 SQLite datetime('now')（UTC "YYYY-MM-DD HH:MM:SS"），
-        // stale_before 需按同样格式传入；字符串比较即时序比较。
-        if row.updated_at.as_str() < stale_before {
+        // L17：updated_at 已统一为 UTC Z（写侧 strftime + 迁移归一）；stale_before 可能
+        // 由调用方以 Z / offset / space-naive 传入，两侧归一到 Z 毫秒后再做字符串比较。
+        if normalize_ts_for_compare(&row.updated_at) < normalize_ts_for_compare(stale_before) {
             crate::db::repositories::matters::mark_finished(db, row.id, "expired", "expired")?;
             crate::db::repositories::matters::insert_event(
                 db,
@@ -439,7 +446,7 @@ pub fn detect_ghosts(db: &Db, stale_before: &str) -> Result<Vec<GhostCandidate>>
     let mut ghosts = Vec::new();
     for row in crate::db::repositories::matters::scan_active(db)? {
         let orphan = row.executor_id.is_none();
-        let idle = row.updated_at.as_str() < stale_before;
+        let idle = normalize_ts_for_compare(&row.updated_at) < normalize_ts_for_compare(stale_before);
         let no_criteria = row.acceptance_criteria.trim().is_empty();
         if orphan && idle && no_criteria {
             record_signal(
