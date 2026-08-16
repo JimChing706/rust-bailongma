@@ -112,15 +112,15 @@ pub fn recent_by_party(
 ) -> Result<Vec<Conversation>> {
     let normalized = normalize_conversation_party_id(Some(party)).unwrap_or_default();
     let conn = db.conn();
-    let since_secs = since_ms / 1000;
+    let since_iso = crate::db::models::epoch_ms_to_utc_z(since_ms);
     let mut stmt = conn.prepare(
         "SELECT * FROM conversations
          WHERE (from_id = ?1 OR to_id = ?1)
-           AND strftime('%s', timestamp) >= ?2
+           AND timestamp >= ?2
          ORDER BY timestamp DESC, id DESC
          LIMIT ?3",
     )?;
-    let rows = stmt.query_map(rusqlite::params![normalized, since_secs, limit], |row| {
+    let rows = stmt.query_map(rusqlite::params![normalized, since_iso, limit], |row| {
         Conversation::from_row(row)
     })?;
     let mut out = Vec::new();
@@ -135,14 +135,14 @@ pub fn recent_by_party(
 /// 对齐 getRecentConversationTimeline）。
 pub fn recent_timeline(db: &Db, limit: u32, since_ms: i64) -> Result<Vec<Conversation>> {
     let conn = db.conn();
-    let since_secs = since_ms / 1000;
+    let since_iso = crate::db::models::epoch_ms_to_utc_z(since_ms);
     let mut stmt = conn.prepare(
         "SELECT * FROM conversations
-         WHERE strftime('%s', timestamp) >= ?1
+         WHERE timestamp >= ?1
          ORDER BY timestamp DESC, id DESC
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(rusqlite::params![since_secs, limit], |row| {
+    let rows = stmt.query_map(rusqlite::params![since_iso, limit], |row| {
         Conversation::from_row(row)
     })?;
     let mut out = Vec::new();

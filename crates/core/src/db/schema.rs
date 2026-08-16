@@ -872,6 +872,9 @@ pub fn initialize(conn: &Connection) -> Result<()> {
     // ── H8（审计修复）：llm_tool_calls 唯一键纳入 args_json 维度 ──
     migrate_llm_tool_calls_unique_args(conn)?;
 
+    // ── L17（审计修复，波 1）：时间戳 offset → UTC Z 归一 ──
+    migrate_timestamps_v1(conn)?;
+
     // ── 重建 FTS 索引（覆盖已有历史数据；对老库是幂等全量重建） ──
     // D3（审计修复）：不再每次启动无条件全量 rebuild——大库启动慢（分钟级）且磨损磁盘。
     // 用 config flag 标记重建版本：仅在首次（新库/老库首次升级）重建一次，
@@ -999,6 +1002,60 @@ fn migrate_llm_tool_calls_unique_args(conn: &Connection) -> Result<()> {
     )?;
     tx.execute_batch("DROP TABLE llm_tool_calls_old_arghash;")?;
     tx.commit()?;
+    Ok(())
+}
+
+/// L17（审计修复，波 1）：时间戳归一——`+HH:MM` 偏移 RFC3339 → UTC `Z`。
+///
+/// 目标列（索引关键，被 strftime/datetime 函数化查询命中）：
+/// `conversations.timestamp` / `memories.timestamp` / `reminders.due_at` / `reminders.fired_at`。
+/// 归一后查询可改直接字符串比较（`Z` 字典序 = 时间序），恢复 `idx_conv_timestamp` /
+/// `idx_memories_timestamp` / `idx_reminders_due_at` 索引。space-naive 与不可解析值跳过。
+fn migrate_timestamps_v1(conn: &Connection) -> Result<()> {
+    let done: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM config WHERE key = 'migration_timestamps_v1'",
+            [],
+            |r| r.get(0),
+        )?;
+    if done > 0 {
+        return Ok(());
+    }
+    let targets: &[(&str, &str)] = &[
+        ("conversations", "timestamp"),
+        ("memories", "timestamp"),
+        ("reminders", "due_at"),
+        ("reminders", "fired_at"),
+    ];
+    let mut total = 0usize;
+    let mut skipped = 0usize;
+    let tx = conn.unchecked_transaction()?;
+    for (table, col) in targets {
+        let sql = format!("SELECT id, {col} FROM {table} WHERE {col} IS NOT NULL AND {col} != ''");
+        let mut stmt = tx.prepare(&sql)?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, val) in rows {
+            match crate::db::models::normalize_to_utc_z(&val) {
+                Some(z) if z != val => {
+                    tx.execute(
+                        &format!("UPDATE {table} SET {col} = ?1 WHERE id = ?2"),
+                        params![z, id],
+                    )?;
+                    total += 1;
+                }
+                Some(_) => {}  // 已是 Z，跳过
+                None => skipped += 1,
+            }
+        }
+    }
+    tx.execute(
+        "INSERT OR REPLACE INTO config (key, value, updated_at) VALUES (?1, ?2, datetime('now'))",
+        params!["migration_timestamps_v1", chrono::Utc::now().to_rfc3339()],
+    )?;
+    tx.commit()?;
+    info!("[db schema] 时间戳归一 v1：{total} 行 offset→Z，跳过 {skipped}");
     Ok(())
 }
 
@@ -1151,7 +1208,57 @@ mod tests {
             .unwrap()
             .query_row([], |row| row.get(0))
             .unwrap();
-        assert_eq!(count, 33); // 32 业务表 + sqlite_sequence（matter_events 加入） // 31 业务表 + sqlite_sequence（事项账本 matters 加入）
+        assert_eq!(count, 33); // 32 业务表 + sqlite_sequence
+    }
+
+    #[test]
+    fn migrate_timestamps_v1_normalizes_offset_to_z() {
+        // L17（波 1）：offset 时间戳归一为 UTC Z；已是 Z 的跳过；不可解析跳过。
+        let conn = Connection::open_in_memory().unwrap();
+        initialize(&conn).unwrap();
+        // 清 flag 触发迁移，插入 offset/Z 混合数据模拟老库
+        conn.execute("DELETE FROM config WHERE key = 'migration_timestamps_v1'", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (role, from_id, content, timestamp) VALUES ('user','u','offset','2026-08-10T08:00:00+08:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversations (role, from_id, content, timestamp) VALUES ('user','u','z','2026-08-10T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        migrate_timestamps_v1(&conn).unwrap();
+
+        // offset 行归一为 UTC Z（08:00+08:00 == 00:00Z，毫秒补齐）
+        let ts: String = conn
+            .query_row(
+                "SELECT timestamp FROM conversations WHERE content = 'offset'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts, "2026-08-10T00:00:00.000Z");
+        // 已是 Z 的行保持原样
+        let ts2: String = conn
+            .query_row(
+                "SELECT timestamp FROM conversations WHERE content = 'z'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ts2, "2026-08-10T00:00:00Z");
+        // flag 已写（幂等：二次执行 no-op）
+        let flag: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM config WHERE key = 'migration_timestamps_v1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(flag, 1);
     }
 
     #[test]

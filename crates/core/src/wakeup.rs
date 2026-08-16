@@ -138,6 +138,8 @@ mod tests {
     }
 
     fn insert_reminder(db: &Db, due_at: &str, task: &str) -> i64 {
+        // L17：对齐生产写入侧（set_reminder 归一 Z），测试数据也归一
+        let due_at = crate::db::models::normalize_to_utc_z(due_at).unwrap_or_else(|| due_at.to_string());
         let conn = db.conn();
         conn.execute(
             "INSERT INTO reminders (user_id, due_at, task, system_message, status, source)

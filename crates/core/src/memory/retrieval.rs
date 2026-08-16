@@ -486,6 +486,8 @@ mod tests {
     }
 
     fn insert_raw(db: &Db, event_type: &str, content: &str, ts: &str, sal: i64) {
+        // L17：对齐生产写入侧（now_iso 归一 Z），测试数据也归一，日期范围直接比较才正确
+        let ts = crate::db::models::normalize_to_utc_z(ts).unwrap_or_else(|| ts.to_string());
         insert_memory(
             db,
             &NewMemory {

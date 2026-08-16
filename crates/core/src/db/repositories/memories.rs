@@ -423,13 +423,15 @@ pub fn get_by_date_range(
     query: &DateRangeQuery,
 ) -> Result<Vec<Memory>> {
     let conn = db.conn();
+    // L17（波 1）：timestamp 经迁移归一为 UTC Z，from/to 归一为 Z 后直接字符串比较（走索引）
+    let from_z = crate::db::models::normalize_to_utc_z(from).unwrap_or_else(|| from.to_string());
+    let to_z = crate::db::models::normalize_to_utc_z(to).unwrap_or_else(|| to.to_string());
     let mut conditions = vec![
-        "strftime('%s', timestamp) >= strftime('%s', ?1)".to_string(),
-        "strftime('%s', timestamp) <  strftime('%s', ?2)".to_string(),
+        "timestamp >= ?1".to_string(),
+        "timestamp <  ?2".to_string(),
         format!("{}", Memory::visible_clause()),
     ];
-    let mut params: Vec<rusqlite::types::Value> =
-        vec![from.to_string().into(), to.to_string().into()];
+    let mut params: Vec<rusqlite::types::Value> = vec![from_z.into(), to_z.into()];
     if let Some(types) = query.types {
         if !types.is_empty() {
             let ph: Vec<String> = types
@@ -814,7 +816,10 @@ mod tests {
                     links: Vec::new(),
                     salience: sal,
                     source_ref: None,
-                    timestamp: ts.into(),
+                    // L17：对齐生产写入侧（now_iso 归一 Z），测试数据也归一
+                    timestamp: crate::db::models::normalize_to_utc_z(ts)
+                        .unwrap_or_else(|| ts.to_string())
+                        .into(),
                     parent_id: None,
                     embedding: None,
                     embedding_dim: None,

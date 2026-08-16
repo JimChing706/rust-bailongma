@@ -37,6 +37,28 @@ pub fn now_iso() -> String {
     Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
+/// L17（波 1）：将 RFC3339 时间戳（`Z` 或 `+HH:MM` 偏移）归一为 UTC `Z` 毫秒格式。
+/// 已是 `Z` 后缀则原样返回；不可解析（space-naive/其他）返回 None（调用方跳过）。
+/// 归一后所有时间戳同格式，字典序 = 时间序，可走索引直接比较。
+pub fn normalize_to_utc_z(ts: &str) -> Option<String> {
+    if ts.ends_with('Z') {
+        return Some(ts.to_string());
+    }
+    let dt = chrono::DateTime::parse_from_rfc3339(ts).ok()?;
+    Some(
+        dt.with_timezone(&chrono::Utc)
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string(),
+    )
+}
+
+/// L17（波 1）：epoch 毫秒 → UTC `Z` 毫秒 ISO（时间窗口查询的直接比较下界）。
+pub fn epoch_ms_to_utc_z(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+        .unwrap_or_default()
+}
+
 /// JSON 数组列 ↔ `Vec<String>`。
 fn decode_json_vec(v: Option<&str>) -> Vec<String> {
     match v {
@@ -412,6 +434,32 @@ mod tests {
         let ts = now_iso();
         assert!(ts.ends_with('Z'), "应为 UTC 后缀: {ts}");
         assert!(ts.len() >= 24, "应含毫秒: {ts}");
+    }
+
+    #[test]
+    fn normalize_to_utc_z_handles_offset_z_and_invalid() {
+        // L17（波 1）：offset → Z；已是 Z 保持；不可解析 → None。
+        assert_eq!(
+            normalize_to_utc_z("2026-08-10T08:00:00+08:00").as_deref(),
+            Some("2026-08-10T00:00:00.000Z")
+        );
+        assert_eq!(
+            normalize_to_utc_z("2026-08-10T00:00:00Z").as_deref(),
+            Some("2026-08-10T00:00:00Z")
+        );
+        assert_eq!(
+            normalize_to_utc_z("2026-08-10T01:00:00+09:00").as_deref(),
+            Some("2026-08-09T16:00:00.000Z")
+        );
+        assert_eq!(normalize_to_utc_z("不是日期"), None);
+        assert_eq!(normalize_to_utc_z("2026-08-10 08:00:00"), None); // space-naive 不在此函数范围
+    }
+
+    #[test]
+    fn epoch_ms_to_utc_z_roundtrips() {
+        // epoch 0 = 1970-01-01T00:00:00Z
+        assert_eq!(epoch_ms_to_utc_z(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(epoch_ms_to_utc_z(86_400_000), "1970-01-02T00:00:00.000Z");
     }
 
     #[test]

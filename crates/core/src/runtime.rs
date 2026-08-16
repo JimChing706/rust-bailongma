@@ -489,6 +489,9 @@ mod tests {
 
     /// 写入一条用户会话行（模拟 pushMessage 落库；run_user_turn 本身不写对话）。
     fn push_user_message(db: &Db, from_id: &str, content: &str, ts: &str) {
+        // L17：落库前归一化时间戳为 UTC-Z，与新查询的 `timestamp >= ?` 直接比较一致
+        // （迁移 migrate_timestamps_v1 对存量数据做同样的归一）。
+        let ts = crate::db::models::normalize_to_utc_z(ts).unwrap_or_else(|| ts.to_string());
         insert_conversation(
             db,
             &crate::db::models::NewConversation {
@@ -496,7 +499,7 @@ mod tests {
                 from_id: from_id.into(),
                 to_id: None,
                 content: content.into(),
-                timestamp: ts.into(),
+                timestamp: ts,
                 channel: "TUI".into(),
                 external_party_id: String::new(),
                 focus_topic: String::new(),
@@ -1029,6 +1032,14 @@ mod tests {
     async fn run_user_turn_full_pipeline_multi_turn_e2e() {
         // ── 预置 DB ──
         let db = test_db();
+        // L17：会话窗口按「真实 now - 24h」过滤（injector::now_ms），硬编码日期会随墙钟漂移失配；
+        // 用相对当前时刻的时间戳，保证预置历史与 T1 落库行都落在窗口内。
+        let now = chrono::Local::now();
+        let ts_hist = (now - chrono::Duration::minutes(30))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let ts_t1 = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
+        let ts_t2 = (now + chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, false);
         // 授权 + claude-code agent → system prompt 自动生成时注入 AI Collaborators 块
         crate::db::repositories::agents::grant_delegation(&db).unwrap();
         crate::db::repositories::agents::upsert_agents(
@@ -1061,7 +1072,7 @@ mod tests {
             &db,
             "ID:000001",
             "帮我看下部署脚本的问题",
-            "2026-08-09T09:00:00+08:00",
+            &ts_hist,
         );
 
         let mut state = init(&db).unwrap();
@@ -1089,13 +1100,15 @@ mod tests {
             weather_runtime_text: None,
             enable_weather_prefeed: false,
         };
-        let t1_input =
-            "[ID:000001] 2026-08-09T10:00:00+08:00 [TUI] 让 claude code 帮我写个部署脚本，顺便看下今天上海天气";
+        let t1_input = format!(
+            "[ID:000001] {} [TUI] 让 claude code 帮我写个部署脚本，顺便看下今天上海天气",
+            ts_t1
+        );
         let t1 = run_user_turn(TurnRequest {
             db: &db,
             embedder: &embedder,
             state: &mut state,
-            input: t1_input,
+            input: &t1_input,
             channel: "TUI",
             input_hint: "",
             ctx: &ctx,
@@ -1184,15 +1197,19 @@ mod tests {
             &db,
             "ID:000001",
             "让 claude code 帮我写个部署脚本，顺便看下今天上海天气",
-            "2026-08-09T10:00:00+08:00",
+            &ts_t1,
         );
 
         // ── T2：同主题延续（归属 continued + 历史轮进入 LLM 消息） ──
+        let t2_input = format!(
+            "[ID:000001] {} [TUI] 天气先放放，写个部署脚本的测试",
+            ts_t2
+        );
         let t2 = run_user_turn(TurnRequest {
             db: &db,
             embedder: &embedder,
             state: &mut state,
-            input: "[ID:000001] 2026-08-09T10:05:00+08:00 [TUI] 天气先放放，写个部署脚本的测试",
+            input: &t2_input,
             channel: "TUI",
             input_hint: "",
             ctx: &ctx,
