@@ -1124,6 +1124,7 @@ mod tests {
             "2026-08-10T09:00:00+08:00",
             &today,
         );
+        w.started_at = chrono::Local::now().to_rfc3339();
         w.stage = "wakeup".into();
         w.finish_reason = "done".into();
         w.total_tokens = Some(8_000);

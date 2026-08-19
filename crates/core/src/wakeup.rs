@@ -131,6 +131,7 @@ pub fn coalesced_wakeup(
 mod tests {
     use super::*;
     use crate::db::open_database;
+    use chrono::Local;
 
     fn test_db() -> Db {
         let dir = tempfile::tempdir().unwrap();
@@ -239,7 +240,7 @@ mod tests {
     #[test]
     fn budget_gate_allows_within_budget() {
         let db = test_db();
-        insert_wakeup_call(&db, "w1", "2026-08-09T09:00:00+08:00", 30_000);
+        insert_wakeup_call(&db, "w1", &Local::now().to_rfc3339(), 30_000);
         let d = wakeup_budget_gate(&db, 7, 100_000).unwrap();
         assert_eq!(
             d,
@@ -253,7 +254,7 @@ mod tests {
     #[test]
     fn budget_gate_blocks_when_over_budget() {
         let db = test_db();
-        insert_wakeup_call(&db, "w1", "2026-08-09T09:00:00+08:00", 120_000);
+        insert_wakeup_call(&db, "w1", &Local::now().to_rfc3339(), 120_000);
         let d = wakeup_budget_gate(&db, 7, 100_000).unwrap();
         assert_eq!(
             d,
@@ -267,7 +268,7 @@ mod tests {
     #[test]
     fn budget_gate_zero_budget_disabled() {
         let db = test_db();
-        insert_wakeup_call(&db, "w1", "2026-08-09T09:00:00+08:00", 999_999);
+        insert_wakeup_call(&db, "w1", &Local::now().to_rfc3339(), 999_999);
         let d = wakeup_budget_gate(&db, 7, 0).unwrap();
         assert!(matches!(d, GateDecision::Allow { .. }), "0 预算 = 闸门关闭");
     }
@@ -276,7 +277,7 @@ mod tests {
     fn coalesced_wakeup_blocked_keeps_reminders_pending() {
         let db = test_db();
         let id = insert_reminder(&db, "2026-08-10T08:00:00+08:00", "被闸门拦截");
-        insert_wakeup_call(&db, "w1", "2026-08-09T09:00:00+08:00", 200_000);
+        insert_wakeup_call(&db, "w1", &Local::now().to_rfc3339(), 200_000);
 
         let out = coalesced_wakeup(&db, "2026-08-10T08:00:00+08:00", 7, 100_000).unwrap();
         assert!(out.is_none(), "超预算不应唤醒");
@@ -330,7 +331,7 @@ mod tests {
         // 审计 A2：闸门拦截时查询同样不消费（与 coalesced_wakeup 语义一致）
         let db = test_db();
         let id = insert_reminder(&db, "2026-08-10T08:00:00+08:00", "被闸门拦截");
-        insert_wakeup_call(&db, "w1", "2026-08-09T09:00:00+08:00", 200_000);
+        insert_wakeup_call(&db, "w1", &Local::now().to_rfc3339(), 200_000);
 
         let out = due_wakeup(&db, "2026-08-10T08:00:00+08:00", 7, 100_000).unwrap();
         assert!(out.is_none(), "超预算不应返回唤醒");
