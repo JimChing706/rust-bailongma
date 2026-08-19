@@ -821,6 +821,105 @@
     .settings-state.ok { color: var(--ok); }
     .settings-state.err { color: var(--danger); }
 
+    /* ===== 二级弹出窗口 (Modal) ===== */
+    .modal-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 1000;
+      background: rgba(0, 0, 0, 0.55);
+      backdrop-filter: blur(6px);
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      opacity: 0;
+      transition: opacity 0.22s ease;
+    }
+    .modal-overlay.open {
+      display: flex;
+      opacity: 1;
+    }
+    .modal {
+      position: relative;
+      width: 100%;
+      max-width: 960px;
+      max-height: 88vh;
+      border-radius: 20px;
+      border: 1px solid var(--line);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015)),
+        var(--panel-2);
+      box-shadow: 0 32px 80px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,.06);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      animation: modalSlideUp 0.25s ease;
+    }
+    @keyframes modalSlideUp {
+      from { transform: translateY(24px) scale(0.97); opacity: 0; }
+      to   { transform: translateY(0) scale(1); opacity: 1; }
+    }
+    .modal.modal-wide { max-width: 1120px; }
+    .modal-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 18px 22px;
+      border-bottom: 1px solid var(--line);
+      flex-shrink: 0;
+    }
+    .modal-head h2 {
+      margin: 0;
+      font-size: 18px;
+      color: var(--text);
+    }
+    .modal-head .modal-subtitle {
+      font-size: 13px;
+      color: var(--muted);
+      margin-top: 3px;
+    }
+    .modal-close {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,.05);
+      color: var(--muted);
+      font-size: 18px;
+      cursor: pointer;
+      display: grid;
+      place-items: center;
+      transition: 0.15s ease;
+      flex-shrink: 0;
+    }
+    .modal-close:hover {
+      background: rgba(255,108,141,.15);
+      border-color: rgba(255,108,141,.4);
+      color: var(--danger);
+    }
+    .modal-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 22px;
+      scrollbar-width: thin;
+      scrollbar-color: rgba(255,255,255,.12) transparent;
+    }
+    .modal-body::-webkit-scrollbar { width: 6px; }
+    .modal-body::-webkit-scrollbar-track { background: transparent; }
+    .modal-body::-webkit-scrollbar-thumb { background: rgba(255,255,255,.12); border-radius: 3px; }
+    /* 弹窗内的 panel 样式重置（去掉外层间距） */
+    .modal-body .panel { margin: 0; border-radius: 14px; }
+    .modal-body .settings-grid { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+    .modal-body .endpoints { margin: 0; }
+    /* 兼容入口 iframe */
+    .modal-body .compat-frame {
+      width: 100%;
+      height: 60vh;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #0a0f1a;
+    }
+
 </style>
 </head>
 <body>
@@ -836,10 +935,10 @@
       <nav class="nav">
         <a href="#scene">场景面板</a>
         <a href="#workspace">工作台</a>
-        <a href="#events">事件中心</a>
-        <a href="#apis">接口面板</a>
-        <a href="#settings">系统设置</a>
-        <a href="/brain-ui">兼容入口</a>
+        <a href="#" onclick="openModal('events');return false;">事件中心</a>
+        <a href="#" onclick="openModal('apis');return false;">接口面板</a>
+        <a href="#" onclick="openModal('settings');return false;">系统设置</a>
+        <a href="#" onclick="openModal('compat');return false;">兼容入口</a>
       </nav>
     </header>
 
@@ -977,91 +1076,13 @@
         </article>
       </div>
 
-      <div class="stack" id="events">
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <h2 class="panel-title">实时事件流</h2>
-              <div class="panel-subtitle">自动连接 `GET /events`，用于观察当前页面看到的最新事件。</div>
-            </div>
-            <div class="badge-row">
-              <span class="badge mono">GET /events</span>
-              <span class="badge" id="streamState">未连接</span>
-              <button class="btn-secondary" id="connectBtn">连接</button>
-              <button class="btn-secondary" id="disconnectBtn">断开</button>
-            </div>
-          </div>
-          <div class="timeline" id="liveEventList">
-            <div class="empty">等待实时事件...</div>
-          </div>
-        </article>
+      <!-- 事件中心已移至 Modal 弹窗 -->
 
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <h2 class="panel-title">历史时间线</h2>
-              <div class="panel-subtitle">从 `GET /events/history?path=all&limit=12` 拉取近期事件，模拟正式产品里的历史轨迹视图。</div>
-            </div>
-            <div class="badge-row">
-              <span class="badge mono">GET /events/history</span>
-              <span class="badge" id="historyState">等待加载</span>
-            </div>
-          </div>
-          <div class="timeline" id="historyList">
-            <div class="empty">等待历史记录...</div>
-          </div>
-        </article>
-      </div>
     </section>
 
-    <section class="endpoints" id="apis">
-      <article class="endpoint-card">
-        <div class="endpoint-method">GET</div>
-        <div class="endpoint-path mono">/status</div>
-        <div class="endpoint-desc">返回服务运行状态与 `memory_count`，适合首页健康检查和启动自检。</div>
-          <span class="ep-badge"><span class="ep-dot" id="probe-status"></span><span id="probe-status-text">未探测</span></span>
-      </article>
-      <article class="endpoint-card">
-        <div class="endpoint-method">POST</div>
-        <div class="endpoint-path mono">/message</div>
-        <div class="endpoint-desc">处理入站消息并广播 `message_in`。当前 Rust 版本已具备联调占位能力。</div>
-          <span class="ep-badge"><span class="ep-dot" id="probe-message"></span><span id="probe-message-text">未探测</span></span>
-      </article>
-      <article class="endpoint-card">
-        <div class="endpoint-method">GET</div>
-        <div class="endpoint-path mono">/events</div>
-        <div class="endpoint-desc">SSE 实时流。页面可据此实现通知、事件中心、状态推送和日志窗格。</div>
-          <span class="ep-badge"><span class="ep-dot" id="probe-events"></span><span id="probe-events-text">未探测</span></span>
-      </article>
-      <article class="endpoint-card">
-        <div class="endpoint-method">WS</div>
-        <div class="endpoint-path mono">/scene</div>
-        <div class="endpoint-desc">Agent 场景通道：surface 卡片渲染 + intent 回传闭环，已在本页面上方实时消费。</div>
-          <span class="ep-badge"><span class="ep-dot" id="probe-scene"></span><span id="probe-scene-text">未探测</span></span>
-      </article>
-    </section>
+    <!-- 接口面板已移至 Modal 弹窗 -->
 
-    <section class="panel settings-panel" id="settings">
-      <div class="panel-head">
-        <div>
-          <h2 class="panel-title">系统设置</h2>
-          <div class="panel-subtitle">在线查看与修改 <span class="mono">config.json</span> 的关键配置；密钥字段已脱敏，保存后即时写回文件（网络/安全等部分项需重启服务生效）。</div>
-        </div>
-        <div class="badge-row">
-          <span class="badge mono">GET /settings</span>
-          <span class="badge mono">POST /settings</span>
-          <span class="badge" id="settingsState">未加载</span>
-        </div>
-      </div>
-      <div class="settings-grid" id="settingsGrid">
-        <div class="empty">加载配置中…</div>
-      </div>
-      <div class="settings-actions">
-        <button class="btn-primary" id="saveSettingsBtn">保存配置</button>
-        <button class="btn-secondary" id="reloadSettingsBtn">重新加载</button>
-        <span class="settings-state" id="settingsSaveState"></span>
-      </div>
-    </section>
+    <!-- 系统设置已移至 Modal 弹窗 -->
 
     <section class="panel wx-panel" id="wechat">
       <h2 class="panel-title">微信桥接观测</h2>
@@ -1071,9 +1092,185 @@
       </div>
       <div id="wxList"><div class="wx-empty">正在拉取最近微信对话…</div></div>
     </section>
+
+    <!-- ===== Modal 弹窗：事件中心 ===== -->
+    <div class="modal-overlay" id="overlay-events" onclick="if(event.target===this)closeModal('events')">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <div>
+            <h2>事件中心</h2>
+            <div class="modal-subtitle">实时事件流（SSE）+ 历史时间线 — 一站式监控系统事件动态</div>
+          </div>
+          <button class="modal-close" onclick="closeModal('events')" title="关闭">✕</button>
+        </div>
+        <div class="modal-body">
+          <article class="panel" style="margin-bottom:16px;">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">实时事件流</h2>
+                <div class="panel-subtitle">自动连接 GET /events，实时观察最新事件。</div>
+              </div>
+              <div class="badge-row">
+                <span class="badge mono">GET /events</span>
+                <span class="badge" id="streamState">未连接</span>
+                <button class="btn-secondary" id="connectBtn">连接</button>
+                <button class="btn-secondary" id="disconnectBtn">断开</button>
+              </div>
+            </div>
+            <div class="timeline" id="liveEventList">
+              <div class="empty">等待实时事件...</div>
+            </div>
+          </article>
+          <article class="panel">
+            <div class="panel-head">
+              <div>
+                <h2 class="panel-title">历史时间线</h2>
+                <div class="panel-subtitle">从 GET /events/history 拉取近期事件轨迹。</div>
+              </div>
+              <div class="badge-row">
+                <span class="badge mono">GET /events/history</span>
+                <span class="badge" id="historyState">等待加载</span>
+              </div>
+            </div>
+            <div class="timeline" id="historyList">
+              <div class="empty">等待历史记录...</div>
+            </div>
+          </article>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Modal 弹窗：接口面板 ===== -->
+    <div class="modal-overlay" id="overlay-apis" onclick="if(event.target===this)closeModal('apis')">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <div>
+            <h2>接口面板</h2>
+            <div class="modal-subtitle">实时探测所有 API 端点的在线状态与响应延迟</div>
+          </div>
+          <button class="modal-close" onclick="closeModal('apis')" title="关闭">✕</button>
+        </div>
+        <div class="modal-body">
+          <section class="endpoints" id="apis">
+            <article class="endpoint-card">
+              <div class="endpoint-method">GET</div>
+              <div class="endpoint-path mono">/status</div>
+              <div class="endpoint-desc">返回服务运行状态与 memory_count，适合首页健康检查和启动自检。</div>
+              <span class="ep-badge"><span class="ep-dot" id="probe-status"></span><span id="probe-status-text">未探测</span></span>
+            </article>
+            <article class="endpoint-card">
+              <div class="endpoint-method">POST</div>
+              <div class="endpoint-path mono">/message</div>
+              <div class="endpoint-desc">处理入站消息并广播 message_in。当前 Rust 版本已具备联调占位能力。</div>
+              <span class="ep-badge"><span class="ep-dot" id="probe-message"></span><span id="probe-message-text">未探测</span></span>
+            </article>
+            <article class="endpoint-card">
+              <div class="endpoint-method">GET</div>
+              <div class="endpoint-path mono">/events</div>
+              <div class="endpoint-desc">SSE 实时流。页面可据此实现通知、事件中心、状态推送和日志窗格。</div>
+              <span class="ep-badge"><span class="ep-dot" id="probe-events"></span><span id="probe-events-text">未探测</span></span>
+            </article>
+            <article class="endpoint-card">
+              <div class="endpoint-method">WS</div>
+              <div class="endpoint-path mono">/scene</div>
+              <div class="endpoint-desc">Agent 场景通道：surface 卡片渲染 + intent 回传闭环。</div>
+              <span class="ep-badge"><span class="ep-dot" id="probe-scene"></span><span id="probe-scene-text">未探测</span></span>
+            </article>
+            <article class="endpoint-card">
+              <div class="endpoint-method">GET</div>
+              <div class="endpoint-path mono">/settings</div>
+              <div class="endpoint-desc">在线查看与修改 config.json 配置项。</div>
+              <span class="ep-badge"><span class="ep-dot" id="probe-settings"></span><span id="probe-settings-text">未探测</span></span>
+            </article>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Modal 弹窗：系统设置 ===== -->
+    <div class="modal-overlay" id="overlay-settings" onclick="if(event.target===this)closeModal('settings')">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <div>
+            <h2>系统设置</h2>
+            <div class="modal-subtitle">在线查看与修改 config.json 的关键配置；密钥字段已脱敏，保存后即时写回文件</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <div class="badge-row">
+              <span class="badge mono">GET /settings</span>
+              <span class="badge mono">POST /settings</span>
+              <span class="badge" id="settingsState">未加载</span>
+            </div>
+            <button class="modal-close" onclick="closeModal('settings')" title="关闭">✕</button>
+          </div>
+        </div>
+        <div class="modal-body">
+          <section class="panel settings-panel" id="settings">
+            <div class="settings-grid" id="settingsGrid">
+              <div class="empty">加载配置中…</div>
+            </div>
+            <div class="settings-actions">
+              <button class="btn-primary" id="saveSettingsBtn">保存配置</button>
+              <button class="btn-secondary" id="reloadSettingsBtn">重新加载</button>
+              <span class="settings-state" id="settingsSaveState"></span>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== Modal 弹窗：兼容入口 ===== -->
+    <div class="modal-overlay" id="overlay-compat" onclick="if(event.target===this)closeModal('compat')">
+      <div class="modal modal-wide">
+        <div class="modal-head">
+          <div>
+            <h2>兼容入口</h2>
+            <div class="modal-subtitle">brain-ui 兼容面板 — 保留旧版前端交互入口</div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <button class="btn-secondary" onclick="window.open('/brain-ui','_blank')" title="在新标签页打开">↗ 新窗口打开</button>
+            <button class="modal-close" onclick="closeModal('compat')" title="关闭">✕</button>
+          </div>
+        </div>
+        <div class="modal-body" style="padding:0;">
+          <iframe class="compat-frame" src="/brain-ui" sandbox="allow-same-origin allow-scripts allow-forms" loading="lazy"></iframe>
+        </div>
+      </div>
+    </div>
   </div>
 
   <script>
+    // ===== Modal 弹窗管理 =====
+    function openModal(name) {
+      const overlay = document.getElementById('overlay-' + name);
+      if (!overlay) return;
+      overlay.classList.add('open');
+      document.body.style.overflow = 'hidden';
+      // 打开事件中心时加载历史
+      if (name === 'events') loadHistory();
+      // 打开系统设置时加载配置
+      if (name === 'settings') loadSettings();
+    }
+    function closeModal(name) {
+      const overlay = document.getElementById('overlay-' + name);
+      if (!overlay) return;
+      overlay.classList.remove('open');
+      // 如果没有其他弹窗打开，恢复滚动
+      if (!document.querySelector('.modal-overlay.open')) {
+        document.body.style.overflow = '';
+      }
+    }
+    // ESC 键关闭当前打开的弹窗
+    document.addEventListener('keydown', function(e) {
+      if (e.key === 'Escape') {
+        const openOverlay = document.querySelector('.modal-overlay.open');
+        if (openOverlay) {
+          const name = openOverlay.id.replace('overlay-', '');
+          closeModal(name);
+        }
+      }
+    });
+
     const statusDot = document.getElementById('statusDot');
     const heroDot = document.getElementById('heroDot');
     const statusText = document.getElementById('statusText');
