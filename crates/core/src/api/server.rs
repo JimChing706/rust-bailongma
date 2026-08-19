@@ -117,6 +117,7 @@ impl ApiServer {
             .route("/events", get(handle_sse))
             .route("/events/history", get(routes::get_events_history))
             .route("/message", post(routes::post_message))
+            .route("/settings", get(routes::get_settings).post(routes::post_settings))
             .route("/status", get(routes::get_status))
             .route("/health", get(routes::get_health))
             .route("/conversations", get(routes::get_conversations))

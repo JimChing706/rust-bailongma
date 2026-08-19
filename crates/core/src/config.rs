@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 use crate::error::{CoreError, Result};
 use crate::prelude::LogLevel;
@@ -295,6 +296,217 @@ fn validate(cfg: &Config) -> Result<()> {
     if !cfg.provider.is_empty() && cfg.provider.len() > 64 {
         return Err(CoreError::Config("provider 名称过长".into()));
     }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+// UI settings 面板：公开读写（密钥脱敏）
+// ─────────────────────────────────────────────────────────────
+
+/// 返回 UI 可安全展示的配置 JSON；密钥字段脱敏为 "__SET__"（已设置）或 null。
+pub fn to_public_value(cfg: &Config) -> Value {
+    let mut v = serde_json::to_value(cfg).unwrap_or_else(|_| json!({}));
+    let Some(obj) = v.as_object_mut() else {
+        return v;
+    };
+
+    let mask = |opt: &Option<String>| {
+        if opt.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+            json!("__SET__")
+        } else {
+            Value::Null
+        }
+    };
+
+    obj.insert("apiKey".into(), mask(&cfg.api_key));
+    obj.insert("minimaxApiKey".into(), mask(&cfg.minimax_api_key));
+
+    if let Some(security) = obj.get_mut("security").and_then(|v| v.as_object_mut()) {
+        security.insert("updatedAt".into(), cfg.security.updated_at.clone().map(Value::String).unwrap_or(Value::Null));
+    }
+    if let Some(network) = obj.get_mut("network").and_then(|v| v.as_object_mut()) {
+        network.insert("updatedAt".into(), cfg.network.updated_at.clone().map(Value::String).unwrap_or(Value::Null));
+    }
+
+    let tts_mask = |tts: &mut serde_json::Map<String, Value>| {
+        tts.insert("doubaoKey".into(), mask(&cfg.tts.doubao_key));
+        tts.insert("volcanoToken".into(), mask(&cfg.tts.volcano_token));
+        tts.insert("volcanoAppId".into(), mask(&cfg.tts.volcano_app_id));
+        tts.insert("doubaoAppId".into(), mask(&cfg.tts.doubao_app_id));
+    };
+    if let Some(tts) = obj.get_mut("tts").and_then(|v| v.as_object_mut()) {
+        tts_mask(tts);
+    }
+
+    if let Some(clawbot) = obj.get_mut("clawbot").and_then(|v| v.as_object_mut()) {
+        clawbot.insert("botToken".into(), mask(&cfg.clawbot.as_ref().and_then(|c| Some(c.bot_token.clone()))));
+        clawbot.insert("accountId".into(), cfg.clawbot.as_ref().map(|c| json!(c.account_id.clone())).unwrap_or(Value::Null));
+    }
+
+    v
+}
+
+/// UI settings 面板中需要特殊输入处理的密钥字段路径。
+pub fn secret_keys() -> Vec<&'static str> {
+    vec![
+        "apiKey",
+        "minimaxApiKey",
+        "tts.doubaoKey",
+        "tts.volcanoToken",
+        "tts.volcanoAppId",
+        "tts.doubaoAppId",
+        "clawbot.botToken",
+    ]
+}
+
+/// UI 提交的配置更新（所有字段可选；null / "__SET__" 表示保持原值）。
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PublicConfigUpdate {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub fast_model: Option<String>,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub thinking: Option<bool>,
+    pub temperature: Option<f32>,
+    pub security: Option<SecurityPublicUpdate>,
+    pub network: Option<NetworkPublicUpdate>,
+    pub tts: Option<TtsPublicUpdate>,
+    pub minimax_api_key: Option<String>,
+    pub clawbot: Option<ClawbotPublicUpdate>,
+    pub intervention: Option<InterventionPublicUpdate>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SecurityPublicUpdate {
+    pub file_sandbox: Option<bool>,
+    pub exec_sandbox: Option<bool>,
+    pub blocked_tools: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct NetworkPublicUpdate {
+    pub allow_lan_access: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct TtsPublicUpdate {
+    pub tts_provider: Option<String>,
+    pub tts_voice_id: Option<String>,
+    pub doubao_speech_rate: Option<String>,
+    pub doubao_key: Option<String>,
+    pub volcano_token: Option<String>,
+    pub volcano_app_id: Option<String>,
+    pub doubao_app_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ClawbotPublicUpdate {
+    pub account_id: Option<String>,
+    pub bot_token: Option<String>,
+    pub base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+pub struct InterventionPublicUpdate {
+    pub enabled: Option<bool>,
+}
+
+fn now_utc_z() -> String {
+    crate::db::models::now_iso()
+}
+
+fn update_secret(target: &mut Option<String>, value: &Option<String>) {
+    match value.as_deref() {
+        None | Some("__SET__") => {}
+        Some("") => *target = None,
+        Some(s) if !s.is_empty() => *target = Some(s.to_string()),
+        _ => {}
+    }
+}
+
+/// 将 UI 提交的更新应用到 Config（不触碰未知 / extra 字段）。
+pub fn apply_public_update(cfg: &mut Config, update: &PublicConfigUpdate) -> Result<()> {
+    if let Some(v) = &update.provider {
+        cfg.provider = v.clone();
+    }
+    if let Some(v) = &update.model {
+        cfg.model = Some(v.clone());
+    }
+    if let Some(v) = &update.fast_model {
+        cfg.fast_model = Some(v.clone());
+    }
+    update_secret(&mut cfg.api_key, &update.api_key);
+    if let Some(v) = &update.base_url {
+        cfg.base_url = Some(v.clone());
+    }
+    if let Some(v) = update.thinking {
+        cfg.thinking = v;
+    }
+    if let Some(v) = update.temperature {
+        cfg.temperature = Some(v);
+    }
+
+    if let Some(u) = &update.security {
+        let changed = u.file_sandbox.is_some() || u.exec_sandbox.is_some() || u.blocked_tools.is_some();
+        if let Some(v) = u.file_sandbox { cfg.security.file_sandbox = v; }
+        if let Some(v) = u.exec_sandbox { cfg.security.exec_sandbox = v; }
+        if let Some(v) = u.blocked_tools.clone() { cfg.security.blocked_tools = v; }
+        if changed {
+            cfg.security.updated_at = Some(now_utc_z());
+        }
+    }
+
+    if let Some(u) = &update.network {
+        if let Some(v) = u.allow_lan_access {
+            cfg.network.allow_lan_access = v;
+            cfg.network.updated_at = Some(now_utc_z());
+        }
+    }
+
+    if let Some(u) = &update.tts {
+        if let Some(v) = &u.tts_provider { cfg.tts.tts_provider = v.clone(); }
+        if let Some(v) = &u.tts_voice_id { cfg.tts.tts_voice_id = v.clone(); }
+        if let Some(v) = &u.doubao_speech_rate { cfg.tts.doubao_speech_rate = v.clone(); }
+        update_secret(&mut cfg.tts.doubao_key, &u.doubao_key);
+        update_secret(&mut cfg.tts.volcano_token, &u.volcano_token);
+        update_secret(&mut cfg.tts.volcano_app_id, &u.volcano_app_id);
+        update_secret(&mut cfg.tts.doubao_app_id, &u.doubao_app_id);
+    }
+
+    update_secret(&mut cfg.minimax_api_key, &update.minimax_api_key);
+
+    if let Some(u) = &update.clawbot {
+        let mut cb = cfg.clawbot.clone().unwrap_or_default();
+        if let Some(v) = &u.account_id { cb.account_id = v.clone(); }
+        if let Some(v) = &u.bot_token {
+            match v.as_str() {
+                "__SET__" => {}
+                "" => {}
+                s => cb.bot_token = s.to_string(),
+            }
+        }
+        if let Some(v) = &u.base_url { cb.base_url = v.clone(); }
+        if !cb.account_id.is_empty() || !cb.bot_token.is_empty() || !cb.base_url.is_empty() {
+            cfg.clawbot = Some(cb);
+        } else {
+            cfg.clawbot = None;
+        }
+    }
+
+    if let Some(u) = &update.intervention {
+        if let Some(v) = u.enabled {
+            cfg.intervention.enabled = v;
+        }
+    }
+
+    validate(cfg)?;
     Ok(())
 }
 

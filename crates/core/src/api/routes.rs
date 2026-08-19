@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 
 use super::events::{iso_now, EventBus};
 use super::security::RateLimiter;
+use crate::config::{apply_public_update, to_public_value, Config, PublicConfigUpdate, secret_keys};
 use crate::db::repositories::{brain_ui_events, llm_metrics};
 use crate::db::Db;
 use crate::intervention::InterventionGate;
@@ -200,6 +201,9 @@ pub struct ApiState {
     pub guard: Guard,
     /// M25（审计修复）：人工介入硬通道（默认禁用；app 层注入真实门）
     pub intervention: Arc<InterventionGate>,
+    /// UI 系统设置：config.json 读写路径与当前配置（脱敏后返回给前端）。
+    pub config_dir: Option<std::path::PathBuf>,
+    pub config: Option<Arc<tokio::sync::Mutex<Config>>>,
     deduper: Arc<Mutex<Deduper>>,
 }
 
@@ -239,6 +243,8 @@ impl ApiState {
             scene: SceneStore::new(),
             guard: Guard::default(),
             intervention: Arc::new(InterventionGate::new(false)),
+            config_dir: None,
+            config: None,
             deduper: Arc::new(Mutex::new(Deduper::new())),
         }
     }
@@ -250,6 +256,12 @@ impl ApiState {
 
     pub fn with_intervention(mut self, gate: Arc<InterventionGate>) -> Self {
         self.intervention = gate;
+        self
+    }
+
+    pub fn with_config(mut self, config_dir: std::path::PathBuf, cfg: Config) -> Self {
+        self.config_dir = Some(config_dir);
+        self.config = Some(Arc::new(tokio::sync::Mutex::new(cfg)));
         self
     }
 
@@ -639,6 +651,81 @@ pub async fn get_conversations(
     }
 }
 
+/// GET /settings —— 返回当前 config.json 的公开视图（密钥脱敏）。
+pub async fn get_settings(State(state): State<ApiState>) -> (StatusCode, Json<Value>) {
+    match &state.config {
+        Some(cfg) => {
+            let cfg = cfg.lock().await;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "ok": true,
+                    "config": to_public_value(&*cfg),
+                    "secrets": secret_keys(),
+                })),
+            )
+        }
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": "settings not available" })),
+        ),
+    }
+}
+
+/// POST /settings —— 部分更新配置，原子写回 config.json。
+pub async fn post_settings(
+    State(state): State<ApiState>,
+    Json(update): Json<PublicConfigUpdate>,
+) -> (StatusCode, Json<Value>) {
+    let Some(config_dir) = state.config_dir.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": "settings not available" })),
+        );
+    };
+    let Some(config_arc) = &state.config else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "ok": false, "error": "settings not available" })),
+        );
+    };
+
+    let snapshot = {
+        let mut cfg = config_arc.lock().await;
+        if let Err(e) = apply_public_update(&mut *cfg, &update) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e.to_string() })),
+            );
+        }
+        cfg.clone()
+    };
+
+    match tokio::task::spawn_blocking({
+        let snapshot_for_save = snapshot.clone();
+        move || crate::config::save_config(&config_dir, &snapshot_for_save)
+    })
+    .await
+    {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "config": to_public_value(&snapshot),
+                "secrets": secret_keys(),
+            })),
+        ),
+        Ok(Err(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        ),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": "save config task failed" })),
+        ),
+    }
+}
+
 /// GET /status —— 状态快照（对齐 memory.js /status + 扩展字段）。
 pub async fn get_status(State(state): State<ApiState>) -> Json<Value> {
     // 基础字段：memories 数量（表不存在时静默为 0）
@@ -732,6 +819,25 @@ mod tests {
             Arc::new(|| "小白龙".into()),
             Arc::new(|| json!({ "running": true })),
         )
+    }
+
+    fn test_state_with_config(cfg: Config) -> (ApiState, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(dir.path().join("test.db")).unwrap();
+        let bus = EventBus::new(Arc::new(|_, _, _, _| {}));
+        let state = ApiState::new(
+            db,
+            bus,
+            Arc::new(|m| {
+                Some(InboundQueued {
+                    conversation_id: m.content.len() as i64,
+                })
+            }),
+            Arc::new(|| "小白龙".into()),
+            Arc::new(|| json!({ "running": true })),
+        )
+        .with_config(dir.path().to_path_buf(), cfg);
+        (state, dir)
     }
 
     #[test]
@@ -1010,5 +1116,64 @@ mod tests {
         assert!((body["avg_ttft_ms"].as_f64().unwrap() - 2_000.0).abs() < 1e-9);
         assert!((body["avg_duration_ms"].as_f64().unwrap() - 8_000.0).abs() < 1e-9);
         assert_eq!(body["wakeup"]["calls"], 0, "无唤醒轮数据");
+    }
+
+    #[tokio::test]
+    async fn get_settings_without_config_returns_503() {
+        let state = test_state();
+        let (status, Json(body)) = get_settings(State(state)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn get_settings_masks_secrets() {
+        let mut cfg = Config::default();
+        cfg.provider = "deepseek".into();
+        cfg.api_key = Some("secret-123".into());
+        cfg.tts.doubao_key = Some("doubao-secret".into());
+        let (state, _dir) = test_state_with_config(cfg);
+        let (status, Json(body)) = get_settings(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        let config = &body["config"];
+        assert_eq!(config["provider"], "deepseek");
+        assert_eq!(config["apiKey"], "__SET__");
+        assert_eq!(config["tts"]["doubaoKey"], "__SET__");
+        let secrets = body["secrets"].as_array().unwrap();
+        assert!(secrets.iter().any(|s| s == "apiKey"));
+    }
+
+    #[tokio::test]
+    async fn post_settings_updates_and_persists() {
+        let mut cfg = Config::default();
+        cfg.provider = "openai".into();
+        cfg.api_key = Some("old-key".into());
+        cfg.security.file_sandbox = true;
+        let (state, dir) = test_state_with_config(cfg);
+
+        let update = PublicConfigUpdate {
+            provider: Some("deepseek".into()),
+            model: Some("deepseek-v4-pro".into()),
+            api_key: Some("__SET__".into()), // 保持旧值
+            security: Some(crate::config::SecurityPublicUpdate {
+                file_sandbox: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let (status, Json(body)) = post_settings(State(state.clone()), Json(update)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["config"]["provider"], "deepseek");
+        assert_eq!(body["config"]["model"], "deepseek-v4-pro");
+        assert_eq!(body["config"]["apiKey"], "__SET__");
+        assert_eq!(body["config"]["security"]["fileSandbox"], false);
+
+        // 重新加载文件确认持久化
+        let reloaded = crate::config::load_config(dir.path()).unwrap();
+        assert_eq!(reloaded.provider, "deepseek");
+        assert_eq!(reloaded.api_key.as_deref(), Some("old-key"));
+        assert_eq!(reloaded.security.file_sandbox, false);
     }
 }

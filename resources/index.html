@@ -755,6 +755,72 @@
     .wx-text { font-size:13px; color:#e8f0ff; margin-top:4px; word-break:break-word; white-space:pre-wrap; max-height:96px; overflow:hidden; }
     .wx-empty { color:var(--muted); font-size:13px; padding:12px; }
 
+    /* ===== 系统设置面板 ===== */
+    .settings-panel { scroll-margin-top: 84px; }
+    .settings-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+    .setting-group {
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 18px;
+      background:
+        linear-gradient(180deg, rgba(255,255,255,.04), rgba(255,255,255,.015)),
+        var(--panel);
+    }
+    .setting-group h3 {
+      margin: 0 0 16px;
+      font-size: 15px;
+      color: #dce8ff;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .form-row { display: grid; gap: 7px; margin-bottom: 14px; }
+    .form-row:last-child { margin-bottom: 0; }
+    .form-row label { font-size: 13px; color: var(--muted); font-weight: 600; }
+    .form-row input[type="text"],
+    .form-row input[type="password"],
+    .form-row input[type="number"],
+    .form-row select {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(7, 14, 27, 0.86);
+      color: var(--text);
+      font: inherit;
+      font-size: 13px;
+      outline: none;
+    }
+    .form-row input:focus,
+    .form-row select:focus {
+      border-color: rgba(118, 168, 255, 0.5);
+      box-shadow: 0 0 0 3px rgba(118, 168, 255, 0.12);
+    }
+    .form-row input::placeholder { color: rgba(154, 172, 203, .55); }
+    .check-row {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 12px;
+      background: rgba(255,255,255,.03);
+      border: 1px solid var(--line);
+      cursor: pointer;
+      font-size: 13px;
+      color: var(--text);
+    }
+    .check-row input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+    .form-hint { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .settings-actions { display: flex; gap: 12px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+    .settings-state { font-size: 13px; color: var(--muted); }
+    .settings-state.ok { color: var(--ok); }
+    .settings-state.err { color: var(--danger); }
+
 </style>
 </head>
 <body>
@@ -772,6 +838,7 @@
         <a href="#workspace">工作台</a>
         <a href="#events">事件中心</a>
         <a href="#apis">接口面板</a>
+        <a href="#settings">系统设置</a>
         <a href="/brain-ui">兼容入口</a>
       </nav>
     </header>
@@ -972,6 +1039,28 @@
         <div class="endpoint-desc">Agent 场景通道：surface 卡片渲染 + intent 回传闭环，已在本页面上方实时消费。</div>
           <span class="ep-badge"><span class="ep-dot" id="probe-scene"></span><span id="probe-scene-text">未探测</span></span>
       </article>
+    </section>
+
+    <section class="panel settings-panel" id="settings">
+      <div class="panel-head">
+        <div>
+          <h2 class="panel-title">系统设置</h2>
+          <div class="panel-subtitle">在线查看与修改 <span class="mono">config.json</span> 的关键配置；密钥字段已脱敏，保存后即时写回文件（网络/安全等部分项需重启服务生效）。</div>
+        </div>
+        <div class="badge-row">
+          <span class="badge mono">GET /settings</span>
+          <span class="badge mono">POST /settings</span>
+          <span class="badge" id="settingsState">未加载</span>
+        </div>
+      </div>
+      <div class="settings-grid" id="settingsGrid">
+        <div class="empty">加载配置中…</div>
+      </div>
+      <div class="settings-actions">
+        <button class="btn-primary" id="saveSettingsBtn">保存配置</button>
+        <button class="btn-secondary" id="reloadSettingsBtn">重新加载</button>
+        <span class="settings-state" id="settingsSaveState"></span>
+      </div>
     </section>
 
     <section class="panel wx-panel" id="wechat">
@@ -1628,6 +1717,198 @@
       if (sseWatchdog) { clearInterval(sseWatchdog); sseWatchdog = null; }
     }
 
+    // ===== 系统设置面板 =====
+    const SETTING_GROUPS = [
+      {
+        title: '模型 LLM',
+        icon: '🧠',
+        fields: [
+          { key: 'provider', label: 'Provider', type: 'text', hint: '例如 deepseek / openai / qwen' },
+          { key: 'model', label: 'Model', type: 'text', hint: '主模型名，如 deepseek-v4-pro' },
+          { key: 'fastModel', label: 'Fast Model', type: 'text', hint: '轻量模型名' },
+          { key: 'apiKey', label: 'API Key', type: 'password', secret: true, hint: '密钥已脱敏；留空保持原值，输入新值覆盖' },
+          { key: 'baseUrl', label: 'Base URL', type: 'text', hint: '可选自定义 endpoint' },
+          { key: 'thinking', label: '启用 Thinking', type: 'checkbox', hint: '是否让模型启用 reasoning' },
+          { key: 'temperature', label: 'Temperature', type: 'number', step: '0.1', hint: '采样温度，推荐 0~1' },
+        ]
+      },
+      {
+        title: '安全与网络',
+        icon: '🛡️',
+        fields: [
+          { key: 'security.fileSandbox', label: '文件沙箱', type: 'checkbox', hint: '文件工具走 sandbox 子进程执行' },
+          { key: 'security.execSandbox', label: '执行沙箱', type: 'checkbox', hint: 'exec_command 走 sandbox 子进程执行' },
+          { key: 'network.allowLanAccess', label: '允许 LAN 访问', type: 'checkbox', hint: '开启后需配置 BAILONGMA_API_TOKEN（需重启生效）' },
+        ]
+      },
+      {
+        title: '语音 TTS',
+        icon: '🔊',
+        fields: [
+          { key: 'tts.ttsProvider', label: 'TTS Provider', type: 'text', hint: '例如 doubao / volcano / minimax' },
+          { key: 'tts.ttsVoiceId', label: 'Voice ID', type: 'text', hint: '音色 ID' },
+          { key: 'tts.doubaoSpeechRate', label: 'Doubao Speech Rate', type: 'text', hint: '语速参数' },
+          { key: 'tts.doubaoKey', label: 'Doubao Key', type: 'password', secret: true, hint: '留空保持原值' },
+          { key: 'tts.volcanoToken', label: 'Volcano Token', type: 'password', secret: true, hint: '留空保持原值' },
+          { key: 'tts.volcanoAppId', label: 'Volcano AppId', type: 'password', secret: true, hint: '留空保持原值' },
+          { key: 'tts.doubaoAppId', label: 'Doubao AppId', type: 'password', secret: true, hint: '留空保持原值' },
+        ]
+      },
+      {
+        title: '微信桥接',
+        icon: '💬',
+        fields: [
+          { key: 'clawbot.accountId', label: 'Account ID', type: 'text', hint: '微信机器人账号' },
+          { key: 'clawbot.botToken', label: 'Bot Token', type: 'password', secret: true, hint: '留空保持原值' },
+          { key: 'clawbot.baseUrl', label: 'Base URL', type: 'text', hint: '微信网关地址' },
+        ]
+      },
+      {
+        title: '其他',
+        icon: '⚙️',
+        fields: [
+          { key: 'minimaxApiKey', label: 'Minimax API Key', type: 'password', secret: true, hint: '留空保持原值' },
+          { key: 'intervention.enabled', label: '启用人工介入', type: 'checkbox', hint: '开启后高风险工具调用需人工确认' },
+        ]
+      },
+    ];
+
+    function getByKey(obj, key) {
+      return key.split('.').reduce((o, k) => (o == null ? undefined : o[k]), obj);
+    }
+
+    function setByKey(obj, key, value) {
+      const parts = key.split('.');
+      let target = obj;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (!target[parts[i]] || typeof target[parts[i]] !== 'object') target[parts[i]] = {};
+        target = target[parts[i]];
+      }
+      target[parts[parts.length - 1]] = value;
+    }
+
+    function renderSettingInput(field, value, isSecret) {
+      const safe = (v) => escapeHtml(String(v ?? ''));
+      if (field.type === 'checkbox') {
+        const checked = value === true ? 'checked' : '';
+        return `<label class="check-row"><input type="checkbox" data-key="${field.key}" ${checked}> ${safe(field.label)}</label>`;
+      }
+      const placeholder = isSecret
+        ? (value === '__SET__' ? '已设置，留空保持原值' : '未设置')
+        : '';
+      const inputValue = isSecret && value === '__SET__' ? '' : safe(value ?? '');
+      const dataOriginal = isSecret ? ` data-original="${safe(value ?? '')}"` : '';
+      const step = field.step ? ` step="${field.step}"` : '';
+      const typeAttr = field.type === 'password' ? 'password' : field.type;
+      return `<label>${safe(field.label)}</label><input type="${typeAttr}" data-key="${field.key}" value="${inputValue}"${dataOriginal} placeholder="${placeholder}"${step}>`;
+    }
+
+    function renderSettings(config, secrets) {
+      const grid = document.getElementById('settingsGrid');
+      grid.innerHTML = '';
+      for (const group of SETTING_GROUPS) {
+        const card = document.createElement('div');
+        card.className = 'setting-group';
+        let html = `<h3>${group.icon} ${escapeHtml(group.title)}</h3>`;
+        for (const field of group.fields) {
+          const value = getByKey(config, field.key);
+          const isSecret = field.secret || secrets.includes(field.key);
+          html += `<div class="form-row">${renderSettingInput(field, value, isSecret)}<div class="form-hint">${escapeHtml(field.hint)}</div></div>`;
+        }
+        card.innerHTML = html;
+        grid.appendChild(card);
+      }
+    }
+
+    async function loadSettings() {
+      const stateEl = document.getElementById('settingsState');
+      const saveState = document.getElementById('settingsSaveState');
+      stateEl.textContent = '加载中';
+      saveState.textContent = '';
+      try {
+        const res = await fetch('/settings');
+        const json = await res.json();
+        if (json.ok && json.config) {
+          renderSettings(json.config, json.secrets || []);
+          stateEl.textContent = '已加载';
+        } else {
+          document.getElementById('settingsGrid').innerHTML = `<div class="empty">配置加载失败：${escapeHtml(json.error || '未知错误')}</div>`;
+          stateEl.textContent = '失败';
+        }
+      } catch (e) {
+        document.getElementById('settingsGrid').innerHTML = `<div class="empty">配置加载失败：${escapeHtml(String(e))}</div>`;
+        stateEl.textContent = '失败';
+      }
+    }
+
+    function gatherSettingsUpdate() {
+      const update = {};
+      document.querySelectorAll('#settingsGrid input[data-key]').forEach((input) => {
+        const key = input.dataset.key;
+        const original = input.dataset.original;
+        let value;
+        if (input.type === 'checkbox') {
+          value = input.checked;
+        } else if (input.type === 'number') {
+          const v = input.value.trim();
+          value = v === '' ? null : parseFloat(v);
+        } else if (input.type === 'password') {
+          const v = input.value.trim();
+          value = v === '' ? null : v;
+        } else {
+          value = input.value;
+        }
+        setByKey(update, key, value);
+      });
+      return update;
+    }
+
+    async function saveSettings() {
+      const saveState = document.getElementById('settingsSaveState');
+      const btn = document.getElementById('saveSettingsBtn');
+      saveState.className = 'settings-state';
+      saveState.textContent = '保存中…';
+      btn.disabled = true;
+      try {
+        const update = gatherSettingsUpdate();
+        const res = await fetch('/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(update)
+        });
+        const json = await res.json();
+        if (json.ok && json.config) {
+          renderSettings(json.config, json.secrets || []);
+          saveState.textContent = '保存成功';
+          saveState.classList.add('ok');
+        } else {
+          saveState.textContent = `保存失败：${json.error || '未知错误'}`;
+          saveState.classList.add('err');
+        }
+      } catch (e) {
+        saveState.textContent = `保存失败：${e}`;
+        saveState.classList.add('err');
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    // ===== /settings 探测加入接口面板 =====
+    endpointProbes.push({
+      name: 'settings',
+      check: async () => {
+        const t0 = performance.now();
+        try {
+          const r = await fetch('/settings');
+          const j = await r.json().catch(() => ({}));
+          const ms = Math.round(performance.now() - t0);
+          return { ok: r.ok && j.ok === true, ms, note: `HTTP ${r.status}` };
+        } catch (e) {
+          return { ok: false, ms: 0, note: '不可达' };
+        }
+      }
+    });
+
     document.getElementById('wxRefresh')?.addEventListener('click', loadWechat);
 
     refreshBtn.addEventListener('click', loadStatus);
@@ -1637,12 +1918,15 @@
     disconnectBtn.addEventListener('click', disconnectEvents);
     sceneConnectBtn.addEventListener('click', connectScene);
     sceneDisconnectBtn.addEventListener('click', disconnectScene);
+    document.getElementById('saveSettingsBtn')?.addEventListener('click', saveSettings);
+    document.getElementById('reloadSettingsBtn')?.addEventListener('click', loadSettings);
 
     loadStatus();
     loadHistory();
     connectEvents();
     connectScene();
     loadWechat();
+    loadSettings();
     runProbes();
     setInterval(loadWechat, 30000);
     setInterval(runProbes, 15000);

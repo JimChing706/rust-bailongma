@@ -183,7 +183,8 @@ pub async fn run_api_server_on(port: u16) -> Result<()> {
         Arc::new(move || agent_name.clone()),
         status,
     )
-    .with_intervention(runtime.intervention.clone());
+    .with_intervention(runtime.intervention.clone())
+    .with_config(user_dir.clone(), runtime.cfg.clone());
     if token_configured {
         tracing::info!("[API] BAILONGMA_API_TOKEN 已配置：/message 强制 token 校验");
     } else {
